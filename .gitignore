@@ -5,6 +5,8 @@
 /public/storage
 /storage/*.key
 /storage/app/public
+/app/bigquery/service-account.json
+/config/client_secret_*.json
 /vendor
 .env
 .env.backup
