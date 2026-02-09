@@ -184,6 +184,13 @@ Route::middleware('auth')->prefix('audiobooks')->name('audiobooks.')->group(func
 
     // Scrape chapters from book URL
     Route::post('scrape-chapters', [AudioBookController::class, 'scrapeChapters'])->name('scrape.chapters');
+
+    // Auto Publish to YouTube Routes
+    Route::get('{audioBook}/publish/data', [AudioBookController::class, 'getPublishData'])->name('publish.data');
+    Route::post('{audioBook}/publish/generate-meta', [AudioBookController::class, 'generateVideoMeta'])->name('publish.generate.meta');
+    Route::post('{audioBook}/publish/generate-playlist-meta', [AudioBookController::class, 'generatePlaylistMeta'])->name('publish.generate.playlist.meta');
+    Route::post('{audioBook}/publish/upload', [AudioBookController::class, 'uploadToYoutube'])->name('publish.upload');
+    Route::post('{audioBook}/publish/create-playlist', [AudioBookController::class, 'createPlaylistAndUpload'])->name('publish.create.playlist');
 });
 
 // Projects CRUD Routes

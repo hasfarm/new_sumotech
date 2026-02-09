@@ -61,7 +61,22 @@ class AudioBookController extends Controller
     public function create()
     {
         $youtubeChannels = YoutubeChannel::all();
-        return view('audiobooks.create', compact('youtubeChannels'));
+        $authorBooks = collect();
+        $authorName = trim((string) old('author', request('author')));
+        if ($authorName !== '') {
+            $authorBooks = AudioBook::query()
+                ->where('author', $authorName)
+                ->orderBy('title')
+                ->get();
+        }
+        $categoryOptions = AudioBook::query()
+            ->whereNotNull('category')
+            ->where('category', '!=', '')
+            ->distinct()
+            ->orderBy('category')
+            ->pluck('category');
+
+        return view('audiobooks.create', compact('youtubeChannels', 'authorBooks', 'categoryOptions'));
     }
 
     /**
@@ -72,15 +87,23 @@ class AudioBookController extends Controller
         $data = $request->validate([
             'youtube_channel_id' => 'required|exists:youtube_channels,id',
             'title' => 'required|string|max:255',
-            'book_type' => 'nullable|string|max:50',
+            'book_type' => 'nullable|string|max:100',
+            'book_type_custom' => 'nullable|string|max:100',
+            'author' => 'nullable|string|max:255',
+            'category' => 'nullable|string|max:255',
+            'category_custom' => 'nullable|string|max:255',
             'description' => 'nullable|string',
             'cover_image' => 'nullable|image|max:2048',
             'language' => 'required|string|in:vi,en,es,fr,de,ja,ko'
         ]);
 
-        $bookTypeCustom = $request->input('book_type_custom');
-        if (!empty($bookTypeCustom) && ($data['book_type'] ?? '') === 'khac') {
-            $data['book_type'] = $bookTypeCustom;
+        if (($data['book_type'] ?? '') === 'custom') {
+            $customBookType = trim((string) ($data['book_type_custom'] ?? ''));
+            $data['book_type'] = $customBookType !== '' ? $customBookType : null;
+        }
+        if (($data['category'] ?? '') === 'custom') {
+            $customCategory = trim((string) ($data['category_custom'] ?? ''));
+            $data['category'] = $customCategory !== '' ? $customCategory : null;
         }
         if (empty($data['book_type'])) {
             $data['book_type'] = 'sach';
@@ -120,7 +143,24 @@ class AudioBookController extends Controller
     public function edit(AudioBook $audioBook)
     {
         $youtubeChannels = YoutubeChannel::all();
-        return view('audiobooks.edit', compact('audioBook', 'youtubeChannels'));
+        $authorBooks = collect();
+
+        if (!empty($audioBook->author)) {
+            $authorBooks = AudioBook::query()
+                ->where('author', $audioBook->author)
+                ->where('id', '!=', $audioBook->id)
+                ->orderBy('title')
+                ->get();
+        }
+
+        $categoryOptions = AudioBook::query()
+            ->whereNotNull('category')
+            ->where('category', '!=', '')
+            ->distinct()
+            ->orderBy('category')
+            ->pluck('category');
+
+        return view('audiobooks.edit', compact('audioBook', 'youtubeChannels', 'authorBooks', 'categoryOptions'));
     }
 
     /**
@@ -131,15 +171,23 @@ class AudioBookController extends Controller
         $data = $request->validate([
             'youtube_channel_id' => 'required|exists:youtube_channels,id',
             'title' => 'required|string|max:255',
-            'book_type' => 'nullable|string|max:50',
+            'book_type' => 'nullable|string|max:100',
+            'book_type_custom' => 'nullable|string|max:100',
+            'author' => 'nullable|string|max:255',
+            'category' => 'nullable|string|max:255',
+            'category_custom' => 'nullable|string|max:255',
             'description' => 'nullable|string',
             'cover_image' => 'nullable|image|max:2048',
             'language' => 'required|string|in:vi,en,es,fr,de,ja,ko'
         ]);
 
-        $bookTypeCustom = $request->input('book_type_custom');
-        if (!empty($bookTypeCustom) && ($data['book_type'] ?? '') === 'khac') {
-            $data['book_type'] = $bookTypeCustom;
+        if (($data['book_type'] ?? '') === 'custom') {
+            $customBookType = trim((string) ($data['book_type_custom'] ?? ''));
+            $data['book_type'] = $customBookType !== '' ? $customBookType : null;
+        }
+        if (($data['category'] ?? '') === 'custom') {
+            $customCategory = trim((string) ($data['category_custom'] ?? ''));
+            $data['category'] = $customCategory !== '' ? $customCategory : null;
         }
         if (empty($data['book_type'])) {
             $data['book_type'] = 'sach';
@@ -545,6 +593,15 @@ class AudioBookController extends Controller
         $currentDesc = $request->input('current_description', '');
         $channelName = $request->input('channel_name', '');
 
+        $openingStyles = [
+            'Mo bang bang cau hoi goi mo va dan vao tac pham.',
+            'Mo bang mot khoanh khac cam xuc hoac ky niem gan voi viec doc sach.',
+            'Mo bang mot nhan dinh nhe ve the loai hoac chu de chinh.',
+            'Mo bang loi chao gon va gioi thieu ngay diem hap dan cua tac pham.',
+            'Mo bang mot cau trich dan ngan (khong can ghi nguon) de tao khong khi.'
+        ];
+        $openingStyle = $openingStyles[array_rand($openingStyles)];
+
         // Build prompt
         $prompt = "Bạn là một chuyên gia viết nội dung cho kênh audiobook YouTube. Hãy viết một bài giới thiệu hấp dẫn và chuyên nghiệp cho audiobook với thông tin sau:\n\n";
         $prompt .= "📚 TÊN TÁC PHẨM: {$title}\n";
@@ -554,6 +611,8 @@ class AudioBookController extends Controller
         if ($currentDesc) $prompt .= "\n📝 MÔ TẢ GỐC (dùng để tham khảo nội dung):\n{$currentDesc}\n";
 
         $prompt .= "\n=== YÊU CẦU CẤU TRÚC BÀI VIẾT ===\n\n";
+        $prompt .= "- Yeu cau mo dau: {$openingStyle}\n";
+        $prompt .= "- Khong duoc lap lai 2 doan dau hoac cach mo dau trong mo ta goc; neu can tham khao, chi lay thong tin va dien dat lai theo cach moi.\n\n";
 
         $prompt .= "1. LỜI CHÀO CÁ NHÂN (3-4 câu) - RẤT QUAN TRỌNG:\n";
         $prompt .= "   - Bắt đầu bằng lời chào thân mật, ấm áp như đang nói chuyện trực tiếp với khán giả\n";
@@ -2946,5 +3005,551 @@ class AudioBookController extends Controller
         }
 
         rmdir($dir);
+    }
+
+    // ========== Auto Publish to YouTube Methods ==========
+
+    /**
+     * Get publish data: available videos and thumbnails for the audiobook.
+     */
+    public function getPublishData(AudioBook $audioBook)
+    {
+        $videos = [];
+
+        // Description video
+        if ($audioBook->description_scene_video) {
+            $path = storage_path('app/public/' . $audioBook->description_scene_video);
+            if (file_exists($path)) {
+                $videos[] = [
+                    'id' => 'desc_scene',
+                    'type' => 'description',
+                    'label' => 'Video giới thiệu (Scene)',
+                    'path' => $audioBook->description_scene_video,
+                    'duration' => $audioBook->description_scene_video_duration,
+                ];
+            }
+        }
+
+        if ($audioBook->description_lipsync_video) {
+            $path = storage_path('app/public/' . $audioBook->description_lipsync_video);
+            if (file_exists($path)) {
+                $videos[] = [
+                    'id' => 'desc_lipsync',
+                    'type' => 'description',
+                    'label' => 'Video giới thiệu (Lipsync)',
+                    'path' => $audioBook->description_lipsync_video,
+                    'duration' => $audioBook->description_lipsync_duration,
+                ];
+            }
+        }
+
+        // Chapter videos
+        foreach ($audioBook->chapters as $chapter) {
+            if ($chapter->video_path) {
+                $path = storage_path('app/public/' . $chapter->video_path);
+                if (file_exists($path)) {
+                    $videos[] = [
+                        'id' => 'chapter_' . $chapter->id,
+                        'type' => 'chapter',
+                        'label' => 'Chương ' . $chapter->chapter_number . ': ' . $chapter->title,
+                        'path' => $chapter->video_path,
+                        'duration' => $chapter->total_duration,
+                    ];
+                }
+            }
+        }
+
+        // Thumbnails from media gallery
+        $media = $this->imageService->getExistingMedia($audioBook->id);
+        $thumbnails = $media['thumbnails'] ?? [];
+
+        return response()->json([
+            'success' => true,
+            'videos' => $videos,
+            'thumbnails' => $thumbnails,
+        ]);
+    }
+
+    /**
+     * Generate YouTube video title or description using AI (Gemini).
+     */
+    public function generateVideoMeta(Request $request, AudioBook $audioBook)
+    {
+        $request->validate([
+            'type' => 'required|string|in:title,description',
+        ]);
+
+        $type = $request->input('type');
+        $channelName = $audioBook->youtubeChannel?->title ?? '';
+
+        try {
+            $client = new \GuzzleHttp\Client();
+            $apiKey = config('services.gemini.api_key');
+
+            if ($type === 'title') {
+                $prompt = "Bạn là chuyên gia YouTube SEO. Hãy viết MỘT tiêu đề YouTube hấp dẫn, tối ưu SEO cho video audiobook/sách nói sau:\n\n";
+                $prompt .= "Tên sách: {$audioBook->title}\n";
+                if ($audioBook->author) $prompt .= "Tác giả: {$audioBook->author}\n";
+                if ($audioBook->category) $prompt .= "Thể loại: {$audioBook->category}\n";
+                if ($channelName) $prompt .= "Kênh: {$channelName}\n";
+                $prompt .= "\nYêu cầu:\n";
+                $prompt .= "- Tiêu đề tiếng Việt, hấp dẫn, tối đa 100 ký tự\n";
+                $prompt .= "- Bao gồm từ khóa: sách nói, audiobook, tên sách, tên tác giả\n";
+                $prompt .= "- Gợi cảm xúc tò mò, muốn nghe\n";
+                $prompt .= "- Chỉ trả về tiêu đề, không giải thích\n";
+                $prompt .= "\nNgoài ra hãy gợi ý tags (tối đa 10 tags, phân cách bằng dấu phẩy) ở dòng thứ 2.";
+
+                $response = $client->post("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={$apiKey}", [
+                    'headers' => ['Content-Type' => 'application/json'],
+                    'json' => [
+                        'contents' => [['parts' => [['text' => $prompt]]]],
+                        'generationConfig' => ['temperature' => 0.8, 'maxOutputTokens' => 300]
+                    ],
+                    'timeout' => 30
+                ]);
+
+                $result = json_decode($response->getBody()->getContents(), true);
+                $text = trim($result['candidates'][0]['content']['parts'][0]['text'] ?? '');
+                $lines = array_filter(array_map('trim', explode("\n", $text)));
+                $title = array_shift($lines) ?? $audioBook->title;
+                $tags = implode(', ', array_slice($lines, 0, 1)) ?: "audiobook, sách nói, {$audioBook->author}, {$audioBook->category}";
+
+                return response()->json(['success' => true, 'title' => $title, 'tags' => $tags]);
+            } else {
+                $prompt = "Bạn là chuyên gia YouTube SEO. Hãy viết mô tả YouTube chuyên nghiệp cho video audiobook/sách nói sau:\n\n";
+                $prompt .= "Tên sách: {$audioBook->title}\n";
+                if ($audioBook->author) $prompt .= "Tác giả: {$audioBook->author}\n";
+                if ($audioBook->category) $prompt .= "Thể loại: {$audioBook->category}\n";
+                if ($channelName) $prompt .= "Kênh: {$channelName}\n";
+                if ($audioBook->description) $prompt .= "\nMô tả gốc (tham khảo):\n" . mb_substr($audioBook->description, 0, 500) . "\n";
+                $prompt .= "\nYêu cầu:\n";
+                $prompt .= "- Viết bằng tiếng Việt, tối đa 300 từ\n";
+                $prompt .= "- Bao gồm: giới thiệu ngắn sách, lý do nên nghe, CTA (đăng ký, like, bình luận)\n";
+                $prompt .= "- Thêm timestamps giả (00:00 Giới thiệu, ...)\n";
+                $prompt .= "- Thêm hashtag ở cuối (#audiobook #sachnoiviet ...)\n";
+                $prompt .= "- Chỉ trả về nội dung mô tả, không giải thích";
+
+                $response = $client->post("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={$apiKey}", [
+                    'headers' => ['Content-Type' => 'application/json'],
+                    'json' => [
+                        'contents' => [['parts' => [['text' => $prompt]]]],
+                        'generationConfig' => ['temperature' => 0.7, 'maxOutputTokens' => 800]
+                    ],
+                    'timeout' => 30
+                ]);
+
+                $result = json_decode($response->getBody()->getContents(), true);
+                $description = trim($result['candidates'][0]['content']['parts'][0]['text'] ?? '');
+
+                return response()->json(['success' => true, 'description' => $description]);
+            }
+        } catch (\Exception $e) {
+            return response()->json(['success' => false, 'error' => 'Lỗi AI: ' . $e->getMessage()], 500);
+        }
+    }
+
+    /**
+     * Generate playlist child meta: convert main title/description into versions for each chapter.
+     */
+    public function generatePlaylistMeta(Request $request, AudioBook $audioBook)
+    {
+        $request->validate([
+            'title' => 'required|string|max:500',
+            'description' => 'nullable|string',
+            'chapters' => 'required|array|min:2',
+            'chapters.*.id' => 'required|string',
+            'chapters.*.label' => 'required|string',
+        ]);
+
+        $mainTitle = $request->input('title');
+        $mainDesc = $request->input('description', '');
+        $chapters = $request->input('chapters');
+
+        $chapterList = collect($chapters)->map(fn($c, $i) => ($i + 1) . ". {$c['label']}")->implode("\n");
+
+        $prompt = "Bạn là chuyên gia YouTube SEO. Tôi có 1 playlist audiobook/sách nói với tiêu đề chung và mô tả chung. Hãy tạo phiên bản tiêu đề và mô tả riêng cho từng video trong playlist.\n\n";
+        $prompt .= "TIÊU ĐỀ CHUNG: {$mainTitle}\n";
+        $prompt .= "MÔ TẢ CHUNG: {$mainDesc}\n\n";
+        $prompt .= "DANH SÁCH VIDEO:\n{$chapterList}\n\n";
+        $prompt .= "YÊU CẦU:\n";
+        $prompt .= "- Mỗi video cần 1 tiêu đề riêng (tối đa 100 ký tự) và 1 mô tả ngắn (2-3 câu)\n";
+        $prompt .= "- Tiêu đề phải bao gồm tên sách + số chương/phần\n";
+        $prompt .= "- Mô tả ngắn gọn, hấp dẫn, có CTA\n";
+        $prompt .= "- Trả về JSON array, mỗi phần tử có 'title' và 'description'\n";
+        $prompt .= "- Chỉ trả về JSON, không giải thích\n";
+        $prompt .= "Ví dụ: [{\"title\": \"...\", \"description\": \"...\"}]";
+
+        try {
+            $client = new \GuzzleHttp\Client();
+            $apiKey = config('services.gemini.api_key');
+
+            $response = $client->post("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={$apiKey}", [
+                'headers' => ['Content-Type' => 'application/json'],
+                'json' => [
+                    'contents' => [['parts' => [['text' => $prompt]]]],
+                    'generationConfig' => ['temperature' => 0.7, 'maxOutputTokens' => 2000]
+                ],
+                'timeout' => 60
+            ]);
+
+            $result = json_decode($response->getBody()->getContents(), true);
+            $text = trim($result['candidates'][0]['content']['parts'][0]['text'] ?? '');
+
+            // Extract JSON from response (may be wrapped in ```json ... ```)
+            if (preg_match('/\[.*\]/s', $text, $matches)) {
+                $items = json_decode($matches[0], true);
+            } else {
+                $items = json_decode($text, true);
+            }
+
+            if (!is_array($items)) {
+                throw new \Exception('AI không trả về JSON hợp lệ');
+            }
+
+            // Map back to chapters
+            $mapped = [];
+            foreach ($chapters as $i => $chapter) {
+                $mapped[] = [
+                    'id' => $chapter['id'],
+                    'source_label' => $chapter['label'],
+                    'title' => $items[$i]['title'] ?? "{$mainTitle} - Phần " . ($i + 1),
+                    'description' => $items[$i]['description'] ?? $mainDesc,
+                ];
+            }
+
+            return response()->json(['success' => true, 'items' => $mapped]);
+        } catch (\Exception $e) {
+            return response()->json(['success' => false, 'error' => 'Lỗi AI: ' . $e->getMessage()], 500);
+        }
+    }
+
+    /**
+     * Upload a single video to YouTube (also handles Shorts).
+     */
+    public function uploadToYoutube(Request $request, AudioBook $audioBook)
+    {
+        $request->validate([
+            'video_id' => 'required|string',
+            'video_type' => 'required|string|in:description,chapter',
+            'title' => 'required|string|max:100',
+            'description' => 'nullable|string',
+            'tags' => 'nullable|string',
+            'privacy' => 'required|string|in:public,unlisted,private',
+            'thumbnail_path' => 'nullable|string',
+            'is_shorts' => 'nullable|boolean',
+        ]);
+
+        $channel = $audioBook->youtubeChannel;
+        if (!$channel) {
+            return response()->json(['success' => false, 'error' => 'Audiobook chưa được gán kênh YouTube.'], 400);
+        }
+
+        $accessToken = YouTubeChannelController::getValidAccessToken($channel);
+        if (!$accessToken) {
+            return response()->json(['success' => false, 'error' => 'Không có access token YouTube. Vui lòng kết nối lại OAuth.'], 401);
+        }
+
+        // Resolve video file path
+        $videoPath = $this->resolveVideoPath($audioBook, $request->input('video_id'), $request->input('video_type'));
+        if (!$videoPath || !file_exists($videoPath)) {
+            return response()->json(['success' => false, 'error' => 'Không tìm thấy file video.'], 404);
+        }
+
+        $title = $request->input('title');
+        $description = $request->input('description', '');
+        $tags = array_map('trim', explode(',', $request->input('tags', '')));
+        $tags = array_filter($tags);
+        $privacy = $request->input('privacy', 'private');
+        $isShorts = $request->boolean('is_shorts');
+
+        if ($isShorts && !str_contains($title, '#Shorts')) {
+            $title .= ' #Shorts';
+        }
+
+        try {
+            $videoId = $this->youtubeUploadVideo($accessToken, $videoPath, $title, $description, $tags, $privacy);
+
+            // Upload thumbnail if selected
+            $thumbnailPath = $request->input('thumbnail_path');
+            if ($thumbnailPath) {
+                $fullThumbPath = storage_path('app/public/' . $thumbnailPath);
+                if (file_exists($fullThumbPath)) {
+                    $this->youtubeSetThumbnail($accessToken, $videoId, $fullThumbPath);
+                }
+            }
+
+            $videoUrl = "https://www.youtube.com/watch?v={$videoId}";
+            if ($isShorts) {
+                $videoUrl = "https://www.youtube.com/shorts/{$videoId}";
+            }
+
+            return response()->json([
+                'success' => true,
+                'video_id' => $videoId,
+                'video_url' => $videoUrl,
+            ]);
+        } catch (\Exception $e) {
+            Log::error('YouTube upload failed', ['error' => $e->getMessage(), 'audiobook' => $audioBook->id]);
+            return response()->json(['success' => false, 'error' => 'Upload thất bại: ' . $e->getMessage()], 500);
+        }
+    }
+
+    /**
+     * Create a YouTube playlist and upload multiple videos into it.
+     */
+    public function createPlaylistAndUpload(Request $request, AudioBook $audioBook)
+    {
+        $request->validate([
+            'playlist_name' => 'required|string|max:150',
+            'playlist_description' => 'nullable|string',
+            'privacy' => 'required|string|in:public,unlisted,private',
+            'thumbnail_path' => 'nullable|string',
+            'tags' => 'nullable|string',
+            'items' => 'required|array|min:1',
+            'items.*.video_id' => 'required|string',
+            'items.*.video_type' => 'required|string|in:description,chapter',
+            'items.*.title' => 'required|string|max:100',
+            'items.*.description' => 'nullable|string',
+        ]);
+
+        $channel = $audioBook->youtubeChannel;
+        if (!$channel) {
+            return response()->json(['success' => false, 'error' => 'Audiobook chưa được gán kênh YouTube.'], 400);
+        }
+
+        $accessToken = YouTubeChannelController::getValidAccessToken($channel);
+        if (!$accessToken) {
+            return response()->json(['success' => false, 'error' => 'Không có access token YouTube. Vui lòng kết nối lại OAuth.'], 401);
+        }
+
+        $privacy = $request->input('privacy', 'private');
+        $tags = array_filter(array_map('trim', explode(',', $request->input('tags', ''))));
+        $thumbnailPath = $request->input('thumbnail_path');
+        $fullThumbPath = $thumbnailPath ? storage_path('app/public/' . $thumbnailPath) : null;
+
+        try {
+            // Step 1: Create playlist
+            $playlistId = $this->youtubeCreatePlaylist(
+                $accessToken,
+                $request->input('playlist_name'),
+                $request->input('playlist_description', ''),
+                $privacy
+            );
+
+            // Step 2: Upload each video and add to playlist
+            $uploadedVideos = [];
+            foreach ($request->input('items') as $item) {
+                $videoPath = $this->resolveVideoPath($audioBook, $item['video_id'], $item['video_type']);
+                if (!$videoPath || !file_exists($videoPath)) {
+                    Log::warning("Skipping video - file not found", ['video_id' => $item['video_id']]);
+                    continue;
+                }
+
+                $videoId = $this->youtubeUploadVideo(
+                    $accessToken,
+                    $videoPath,
+                    $item['title'],
+                    $item['description'] ?? '',
+                    $tags,
+                    $privacy
+                );
+
+                // Set thumbnail
+                if ($fullThumbPath && file_exists($fullThumbPath)) {
+                    $this->youtubeSetThumbnail($accessToken, $videoId, $fullThumbPath);
+                }
+
+                // Add to playlist
+                $this->youtubeAddToPlaylist($accessToken, $playlistId, $videoId);
+
+                $uploadedVideos[] = [
+                    'title' => $item['title'],
+                    'video_id' => $videoId,
+                    'url' => "https://www.youtube.com/watch?v={$videoId}",
+                ];
+            }
+
+            return response()->json([
+                'success' => true,
+                'playlist_id' => $playlistId,
+                'playlist_url' => "https://www.youtube.com/playlist?list={$playlistId}",
+                'uploaded_videos' => $uploadedVideos,
+            ]);
+        } catch (\Exception $e) {
+            Log::error('YouTube playlist creation failed', ['error' => $e->getMessage(), 'audiobook' => $audioBook->id]);
+            return response()->json(['success' => false, 'error' => 'Lỗi tạo playlist: ' . $e->getMessage()], 500);
+        }
+    }
+
+    // ---- YouTube API Helper Methods ----
+
+    /**
+     * Resolve the absolute file path for a video source.
+     */
+    private function resolveVideoPath(AudioBook $audioBook, string $videoId, string $videoType): ?string
+    {
+        if ($videoType === 'description') {
+            if ($videoId === 'desc_scene' && $audioBook->description_scene_video) {
+                return storage_path('app/public/' . $audioBook->description_scene_video);
+            }
+            if ($videoId === 'desc_lipsync' && $audioBook->description_lipsync_video) {
+                return storage_path('app/public/' . $audioBook->description_lipsync_video);
+            }
+        }
+
+        if ($videoType === 'chapter') {
+            $chapterId = str_replace('chapter_', '', $videoId);
+            $chapter = AudioBookChapter::where('audio_book_id', $audioBook->id)
+                ->where('id', $chapterId)
+                ->first();
+            if ($chapter && $chapter->video_path) {
+                return storage_path('app/public/' . $chapter->video_path);
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Upload a video to YouTube using resumable upload.
+     */
+    private function youtubeUploadVideo(string $accessToken, string $filePath, string $title, string $description, array $tags, string $privacy): string
+    {
+        $client = new \GuzzleHttp\Client();
+        $fileSize = filesize($filePath);
+        $mimeType = mime_content_type($filePath) ?: 'video/mp4';
+
+        // Step 1: Initiate resumable upload
+        $metadata = [
+            'snippet' => [
+                'title' => mb_substr($title, 0, 100),
+                'description' => mb_substr($description, 0, 5000),
+                'tags' => array_slice($tags, 0, 30),
+                'categoryId' => '22', // People & Blogs
+                'defaultLanguage' => 'vi',
+            ],
+            'status' => [
+                'privacyStatus' => $privacy,
+                'selfDeclaredMadeForKids' => false,
+            ],
+        ];
+
+        $initResponse = $client->post('https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status', [
+            'headers' => [
+                'Authorization' => "Bearer {$accessToken}",
+                'Content-Type' => 'application/json; charset=UTF-8',
+                'X-Upload-Content-Length' => $fileSize,
+                'X-Upload-Content-Type' => $mimeType,
+            ],
+            'json' => $metadata,
+            'timeout' => 30,
+        ]);
+
+        $uploadUrl = $initResponse->getHeader('Location')[0] ?? null;
+        if (!$uploadUrl) {
+            throw new \Exception('Không nhận được upload URL từ YouTube.');
+        }
+
+        // Step 2: Upload the file
+        $uploadResponse = $client->put($uploadUrl, [
+            'headers' => [
+                'Authorization' => "Bearer {$accessToken}",
+                'Content-Type' => $mimeType,
+                'Content-Length' => $fileSize,
+            ],
+            'body' => fopen($filePath, 'r'),
+            'timeout' => 600, // 10 minutes for large files
+        ]);
+
+        $uploadResult = json_decode($uploadResponse->getBody()->getContents(), true);
+        $videoId = $uploadResult['id'] ?? null;
+
+        if (!$videoId) {
+            throw new \Exception('YouTube không trả về video ID.');
+        }
+
+        return $videoId;
+    }
+
+    /**
+     * Set thumbnail for a YouTube video.
+     */
+    private function youtubeSetThumbnail(string $accessToken, string $videoId, string $thumbnailPath): void
+    {
+        try {
+            $client = new \GuzzleHttp\Client();
+            $mimeType = mime_content_type($thumbnailPath) ?: 'image/jpeg';
+
+            $client->post("https://www.googleapis.com/upload/youtube/v3/thumbnails/set?videoId={$videoId}", [
+                'headers' => [
+                    'Authorization' => "Bearer {$accessToken}",
+                    'Content-Type' => $mimeType,
+                ],
+                'body' => fopen($thumbnailPath, 'r'),
+                'timeout' => 30,
+            ]);
+        } catch (\Exception $e) {
+            Log::warning('Failed to set YouTube thumbnail', ['videoId' => $videoId, 'error' => $e->getMessage()]);
+        }
+    }
+
+    /**
+     * Create a YouTube playlist.
+     */
+    private function youtubeCreatePlaylist(string $accessToken, string $title, string $description, string $privacy): string
+    {
+        $client = new \GuzzleHttp\Client();
+
+        $response = $client->post('https://www.googleapis.com/youtube/v3/playlists?part=snippet,status', [
+            'headers' => [
+                'Authorization' => "Bearer {$accessToken}",
+                'Content-Type' => 'application/json',
+            ],
+            'json' => [
+                'snippet' => [
+                    'title' => mb_substr($title, 0, 150),
+                    'description' => mb_substr($description, 0, 5000),
+                    'defaultLanguage' => 'vi',
+                ],
+                'status' => [
+                    'privacyStatus' => $privacy,
+                ],
+            ],
+            'timeout' => 30,
+        ]);
+
+        $result = json_decode($response->getBody()->getContents(), true);
+        $playlistId = $result['id'] ?? null;
+
+        if (!$playlistId) {
+            throw new \Exception('YouTube không trả về playlist ID.');
+        }
+
+        return $playlistId;
+    }
+
+    /**
+     * Add a video to a YouTube playlist.
+     */
+    private function youtubeAddToPlaylist(string $accessToken, string $playlistId, string $videoId): void
+    {
+        $client = new \GuzzleHttp\Client();
+
+        $client->post('https://www.googleapis.com/youtube/v3/playlistItems?part=snippet', [
+            'headers' => [
+                'Authorization' => "Bearer {$accessToken}",
+                'Content-Type' => 'application/json',
+            ],
+            'json' => [
+                'snippet' => [
+                    'playlistId' => $playlistId,
+                    'resourceId' => [
+                        'kind' => 'youtube#video',
+                        'videoId' => $videoId,
+                    ],
+                ],
+            ],
+            'timeout' => 30,
+        ]);
     }
 }

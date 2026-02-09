@@ -46,31 +46,108 @@
                             @enderror
                         </div>
 
+                        <!-- Author -->
+                        <div class="mb-6">
+                            <label class="block text-sm font-medium text-gray-700 mb-2">Tác giả</label>
+                            <input type="text" name="author"
+                                class="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm @error('author') border-red-500 @enderror"
+                                placeholder="Nhập tên tác giả" value="{{ old('author') }}">
+                            @error('author')
+                                <p class="text-red-500 text-xs mt-1">{{ $message }}</p>
+                            @enderror
+                            <div class="mt-2 text-xs text-gray-500">
+                                Các sách cùng tác giả sẽ hiển thị sau khi lưu.
+                            </div>
+                        </div>
+
+                        <!-- Same Author Books -->
+                        @if (!empty($authorBooks) && $authorBooks->count() > 0)
+                            <div class="mb-6">
+                                <label class="block text-sm font-medium text-gray-700 mb-2">Sách cùng tác giả</label>
+                                <div class="bg-gray-50 border border-gray-200 rounded-lg p-3 text-sm">
+                                    <ul class="list-disc pl-5 space-y-1">
+                                        @foreach ($authorBooks as $book)
+                                            <li>
+                                                <a href="{{ route('audiobooks.show', $book) }}"
+                                                    class="text-blue-600 hover:text-blue-800">
+                                                    {{ $book->title }}
+                                                </a>
+                                            </li>
+                                        @endforeach
+                                    </ul>
+                                </div>
+                            </div>
+                        @endif
+
                         <!-- Book Type -->
                         <div class="mb-6">
                             <label class="block text-sm font-medium text-gray-700 mb-2">Phân loại</label>
-                            <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                                <select name="book_type" id="bookTypeSelect"
-                                    class="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm @error('book_type') border-red-500 @enderror">
-                                    <option value="sach" {{ old('book_type', 'sach') == 'sach' ? 'selected' : '' }}>Sách
+                            @php
+                                $bookTypeOptions = [
+                                    'sach' => 'Sách',
+                                    'truyen' => 'Truyện',
+                                    'tieu_thuyet' => 'Tiểu thuyết',
+                                    'truyen_ngan' => 'Truyện ngắn',
+                                ];
+                                $selectedBookType = old('book_type', 'sach');
+                                $bookTypeIsCustom =
+                                    $selectedBookType && !array_key_exists($selectedBookType, $bookTypeOptions);
+                            @endphp
+                            <select name="book_type" id="bookTypeSelect"
+                                class="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm @error('book_type') border-red-500 @enderror">
+                                @foreach ($bookTypeOptions as $value => $label)
+                                    <option value="{{ $value }}"
+                                        {{ $selectedBookType == $value ? 'selected' : '' }}>
+                                        {{ $label }}
                                     </option>
-                                    <option value="truyen" {{ old('book_type') == 'truyen' ? 'selected' : '' }}>Truyện
-                                    </option>
-                                    <option value="tieu_thuyet" {{ old('book_type') == 'tieu_thuyet' ? 'selected' : '' }}>
-                                        Tiểu thuyết</option>
-                                    <option value="truyen_ngan" {{ old('book_type') == 'truyen_ngan' ? 'selected' : '' }}>
-                                        Truyện ngắn</option>
-                                    <option value="khac"
-                                        {{ old('book_type') && !in_array(old('book_type'), ['sach', 'truyen', 'tieu_thuyet', 'truyen_ngan']) ? 'selected' : '' }}>
-                                        Khác (tự nhập)</option>
-                                </select>
+                                @endforeach
+                                <option value="custom" {{ $bookTypeIsCustom ? 'selected' : '' }}>Khác (tự nhập)</option>
+                            </select>
+                            <div id="bookTypeCustomWrap" class="mt-2 {{ $bookTypeIsCustom ? '' : 'hidden' }}">
                                 <input type="text" name="book_type_custom" id="bookTypeCustom"
                                     class="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm"
                                     placeholder="Nhập phân loại..."
-                                    value="{{ old('book_type') && !in_array(old('book_type'), ['sach', 'truyen', 'tieu_thuyet', 'truyen_ngan']) ? old('book_type') : '' }}">
+                                    value="{{ $bookTypeIsCustom ? $selectedBookType : '' }}">
                             </div>
-                            <p class="text-xs text-gray-500 mt-2">Nếu chọn "Khác", hãy nhập phân loại ở ô bên cạnh.</p>
+                            <p class="text-xs text-gray-500 mt-2">Chọn từ danh sách hoặc tự nhập phân loại mới.</p>
                             @error('book_type')
+                                <p class="text-red-500 text-xs mt-1">{{ $message }}</p>
+                            @enderror
+                            @error('book_type_custom')
+                                <p class="text-red-500 text-xs mt-1">{{ $message }}</p>
+                            @enderror
+                        </div>
+
+                        <!-- Category -->
+                        <div class="mb-6">
+                            <label class="block text-sm font-medium text-gray-700 mb-2">Thể loại</label>
+                            @php
+                                $selectedCategory = old('category', '');
+                                $categoryIsCustom =
+                                    $selectedCategory !== '' && !$categoryOptions->contains($selectedCategory);
+                            @endphp
+                            <select name="category" id="categorySelect"
+                                class="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm @error('category') border-red-500 @enderror">
+                                <option value="">-- Chọn thể loại --</option>
+                                @foreach ($categoryOptions as $category)
+                                    <option value="{{ $category }}"
+                                        {{ $selectedCategory == $category ? 'selected' : '' }}>
+                                        {{ $category }}
+                                    </option>
+                                @endforeach
+                                <option value="custom" {{ $categoryIsCustom ? 'selected' : '' }}>Khác (tự nhập)</option>
+                            </select>
+                            <div id="categoryCustomWrap" class="mt-2 {{ $categoryIsCustom ? '' : 'hidden' }}">
+                                <input type="text" name="category_custom" id="categoryCustom"
+                                    class="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm"
+                                    placeholder="Nhập thể loại..."
+                                    value="{{ $categoryIsCustom ? $selectedCategory : '' }}">
+                            </div>
+                            <p class="text-xs text-gray-500 mt-2">Chọn từ danh sách hoặc tự nhập thể loại mới.</p>
+                            @error('category')
+                                <p class="text-red-500 text-xs mt-1">{{ $message }}</p>
+                            @enderror
+                            @error('category_custom')
                                 <p class="text-red-500 text-xs mt-1">{{ $message }}</p>
                             @enderror
                         </div>
@@ -131,4 +208,30 @@
             </div>
         </div>
     </div>
+    <script>
+        (function() {
+            const bookTypeSelect = document.getElementById('bookTypeSelect');
+            const bookTypeCustomWrap = document.getElementById('bookTypeCustomWrap');
+            const categorySelect = document.getElementById('categorySelect');
+            const categoryCustomWrap = document.getElementById('categoryCustomWrap');
+
+            function toggleCustom(selectEl, wrapEl) {
+                if (!selectEl || !wrapEl) return;
+                if (selectEl.value === 'custom') {
+                    wrapEl.classList.remove('hidden');
+                } else {
+                    wrapEl.classList.add('hidden');
+                }
+            }
+
+            if (bookTypeSelect) {
+                bookTypeSelect.addEventListener('change', () => toggleCustom(bookTypeSelect, bookTypeCustomWrap));
+                toggleCustom(bookTypeSelect, bookTypeCustomWrap);
+            }
+            if (categorySelect) {
+                categorySelect.addEventListener('change', () => toggleCustom(categorySelect, categoryCustomWrap));
+                toggleCustom(categorySelect, categoryCustomWrap);
+            }
+        })();
+    </script>
 @endsection

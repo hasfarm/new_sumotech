@@ -247,6 +247,11 @@ class NhaSachMienPhiScraper
                 return '';
             }
 
+            $domContent = $this->extractChapterContentFromDom($html);
+            if ($domContent !== '') {
+                return $domContent;
+            }
+
             // Pattern 1: nhasachmienphi.com specific - div.pd-lr-30 (primary content container)
             if (preg_match('/<div[^>]*class=["\'][^"\']*pd-lr-30[^"\']*["\'][^>]*>(.*?)<\/div>/is', $html, $matches)) {
                 return $this->cleanContent($matches[1]);
@@ -338,6 +343,66 @@ class NhaSachMienPhiScraper
         $text = trim($text);
 
         return $text;
+    }
+
+    /**
+     * Extract chapter content using DOM to avoid regex truncation with nested divs.
+     */
+    protected function extractChapterContentFromDom($html)
+    {
+        $doc = new \DOMDocument();
+        libxml_use_internal_errors(true);
+        $doc->loadHTML(mb_convert_encoding($html, 'HTML-ENTITIES', 'UTF-8'));
+        libxml_clear_errors();
+
+        $xpath = new \DOMXPath($doc);
+        $queries = [
+            "//*[contains(concat(' ', normalize-space(@class), ' '), ' pd-lr-30 ')]",
+            "//*[contains(concat(' ', normalize-space(@class), ' '), ' box_cont ')]",
+            "//div[contains(translate(@class,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'chapter') or contains(translate(@class,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'story')]",
+            "//section[contains(translate(@class,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'chapter') or contains(translate(@class,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'story')]",
+            "//article[contains(translate(@class,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'chapter') or contains(translate(@class,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'story')]",
+            "//*[@id and (contains(translate(@id,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'chapter') or contains(translate(@id,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'story'))]"
+        ];
+
+        $bestContent = '';
+        $bestLen = 0;
+
+        foreach ($queries as $query) {
+            $nodes = $xpath->query($query);
+            if (!$nodes) {
+                continue;
+            }
+
+            foreach ($nodes as $node) {
+                $innerHtml = $this->getInnerHtml($node);
+                if ($innerHtml === '') {
+                    continue;
+                }
+
+                $cleaned = $this->cleanContent($innerHtml);
+                $len = mb_strlen($cleaned, 'UTF-8');
+
+                if ($len > $bestLen) {
+                    $bestLen = $len;
+                    $bestContent = $cleaned;
+                }
+            }
+        }
+
+        return $bestLen > 0 ? $bestContent : '';
+    }
+
+    /**
+     * Get inner HTML from a DOM node.
+     */
+    protected function getInnerHtml(\DOMNode $node)
+    {
+        $html = '';
+        foreach ($node->childNodes as $child) {
+            $html .= $node->ownerDocument->saveHTML($child);
+        }
+        return $html;
     }
 
     /**
