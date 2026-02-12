@@ -23,7 +23,27 @@ class YouTubeChannelController extends Controller
             $perPage = 20;
         }
 
-        $channels = YoutubeChannel::orderByDesc('created_at')->paginate($perPage);
+        $channels = YoutubeChannel::withCount([
+                'audioBooks as total_videos' => function ($q) {
+                    $q->whereHas('chapters', fn($c) => $c->whereNotNull('video_path'));
+                },
+                'audioBooks as published_videos' => function ($q) {
+                    $q->whereHas('chapters', fn($c) => $c->whereNotNull('youtube_video_id'));
+                },
+            ])
+            ->orderByDesc('created_at')
+            ->paginate($perPage);
+
+        // Calculate durations per channel
+        foreach ($channels as $channel) {
+            $chapters = \App\Models\AudioBookChapter::whereIn(
+                'audio_book_id', $channel->audioBooks()->pluck('id')
+            );
+            $channel->total_duration_seconds = (clone $chapters)->sum('total_duration');
+            $channel->published_duration_seconds = (clone $chapters)
+                ->whereNotNull('youtube_video_id')
+                ->sum('total_duration');
+        }
 
         return view('youtube_channels.index', compact('channels'));
     }

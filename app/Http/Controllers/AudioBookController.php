@@ -2099,70 +2099,148 @@ class AudioBookController extends Controller
             }
             $outputPath = $outputDir . '/' . $outputFilename;
 
-            // Build FFmpeg command for logo overlay
-            $ffmpegPath = env('FFMPEG_PATH', 'ffmpeg');
+            // Use PHP GD to create circular logo with border and shadow
             $scaleRatio = $logoScale / 100;
-            $opacityValue = $opacity / 100;
+            $opacityFactor = $opacity / 100;
 
-            // Position mapping
-            switch ($position) {
-                case 'top-left':
-                    $overlayPos = "x={$margin}:y={$margin}";
-                    break;
-                case 'top-right':
-                    $overlayPos = "x=W-w-{$margin}:y={$margin}";
-                    break;
-                case 'bottom-left':
-                    $overlayPos = "x={$margin}:y=H-h-{$margin}";
-                    break;
-                case 'center':
-                    $overlayPos = "x=(W-w)/2:y=(H-h)/2";
-                    break;
-                case 'bottom-right':
-                default:
-                    $overlayPos = "x=W-w-{$margin}:y=H-h-{$margin}";
-                    break;
-            }
+            // Load source image
+            $sourceInfo = getimagesize($sourcePath);
+            $sourceImg = $this->gdLoadImage($sourcePath, $sourceInfo[2]);
+            $srcW = imagesx($sourceImg);
+            $srcH = imagesy($sourceImg);
 
-            // FFmpeg filter: scale logo relative to source image width using scale2ref, apply opacity, overlay
-            $filterComplex = "[1:v][0:v]scale2ref=iw*{$scaleRatio}:-1:flags=lanczos[logo][bg];[logo]format=rgba,colorchannelmixer=aa={$opacityValue}[logoA];[bg][logoA]overlay={$overlayPos}";
-
-            $command = sprintf(
-                '%s -y -i %s -i %s -filter_complex "%s" -q:v 2 %s 2>&1',
-                escapeshellarg($ffmpegPath),
-                escapeshellarg($sourcePath),
-                escapeshellarg($logoPath),
-                $filterComplex,
-                escapeshellarg($outputPath)
-            );
-
-            Log::info('FFmpeg add logo overlay command', ['command' => $command]);
-
-            exec($command, $output, $returnCode);
+            // Load logo image
+            $logoImg = $this->gdLoadImage($logoPath, null);
 
             // Clean up temp logo file
             if ($tempLogoPath && file_exists($tempLogoPath)) {
                 unlink($tempLogoPath);
             }
 
-            if ($returnCode !== 0) {
-                Log::error('FFmpeg add logo overlay failed', [
-                    'output' => implode("\n", $output),
-                    'return_code' => $returnCode
-                ]);
-                return response()->json([
-                    'success' => false,
-                    'error' => 'FFmpeg logo overlay failed: ' . implode("\n", array_slice($output, -3))
-                ], 500);
+            // Calculate sizes
+            $logoSize = max(20, (int) round($srcW * $scaleRatio)); // circle diameter
+            $borderW = max(3, (int) round($logoSize * 0.07));      // white border width
+            $totalSize = $logoSize + $borderW * 2;                  // total with border
+            $shadowOff = max(2, (int) round($logoSize * 0.04));     // shadow offset
+            $canvasSize = $totalSize + $shadowOff + 4;              // canvas with shadow room
+
+            // Create transparent canvas for the composite
+            $composite = imagecreatetruecolor($canvasSize, $canvasSize);
+            imagesavealpha($composite, true);
+            imagealphablending($composite, false);
+            $trans = imagecolorallocatealpha($composite, 0, 0, 0, 127);
+            imagefill($composite, 0, 0, $trans);
+            imagealphablending($composite, true);
+
+            $cx = (int) floor($canvasSize / 2);
+            $cy = $cx;
+
+            // 1. Draw shadow (dark circle, slightly offset)
+            $shadowColor = imagecolorallocatealpha($composite, 0, 0, 0, 85);
+            imagefilledellipse($composite, $cx + $shadowOff, $cy + $shadowOff, $totalSize, $totalSize, $shadowColor);
+            // Soften shadow with a second slightly larger, more transparent ellipse
+            $shadowSoft = imagecolorallocatealpha($composite, 0, 0, 0, 105);
+            imagefilledellipse($composite, $cx + $shadowOff, $cy + $shadowOff, $totalSize + 4, $totalSize + 4, $shadowSoft);
+
+            // 2. Draw white border circle
+            $white = imagecolorallocate($composite, 255, 255, 255);
+            imagefilledellipse($composite, $cx, $cy, $totalSize - 1, $totalSize - 1, $white);
+
+            // 3. Scale logo to square and apply circular mask
+            $scaledLogo = imagecreatetruecolor($logoSize, $logoSize);
+            imagesavealpha($scaledLogo, true);
+            imagealphablending($scaledLogo, false);
+            imagefill($scaledLogo, 0, 0, $trans);
+            imagealphablending($scaledLogo, true);
+            imagecopyresampled($scaledLogo, $logoImg, 0, 0, 0, 0, $logoSize, $logoSize, imagesx($logoImg), imagesy($logoImg));
+
+            // Circular mask: remove pixels outside the circle
+            $r = $logoSize / 2;
+            imagealphablending($scaledLogo, false);
+            for ($x = 0; $x < $logoSize; $x++) {
+                for ($y = 0; $y < $logoSize; $y++) {
+                    if (sqrt(pow($x - $r + 0.5, 2) + pow($y - $r + 0.5, 2)) > $r) {
+                        imagesetpixel($scaledLogo, $x, $y, $trans);
+                    }
+                }
+            }
+            imagealphablending($scaledLogo, true);
+
+            // 4. Paste circular logo centered on the white border circle
+            $logoOffX = $cx - (int) floor($logoSize / 2);
+            $logoOffY = $cy - (int) floor($logoSize / 2);
+            imagecopy($composite, $scaledLogo, $logoOffX, $logoOffY, 0, 0, $logoSize, $logoSize);
+
+            // 5. Apply opacity if needed
+            if ($opacity < 100) {
+                imagealphablending($composite, false);
+                for ($x = 0; $x < $canvasSize; $x++) {
+                    for ($y = 0; $y < $canvasSize; $y++) {
+                        $rgba = imagecolorat($composite, $x, $y);
+                        $a = ($rgba >> 24) & 0x7F; // GD alpha: 0=opaque, 127=transparent
+                        if ($a < 127) {
+                            $newA = (int) min(127, 127 - (127 - $a) * $opacityFactor);
+                            $rc = ($rgba >> 16) & 0xFF;
+                            $gc = ($rgba >> 8) & 0xFF;
+                            $bc = $rgba & 0xFF;
+                            imagesetpixel($composite, $x, $y, imagecolorallocatealpha($composite, $rc, $gc, $bc, $newA));
+                        }
+                    }
+                }
+                imagealphablending($composite, true);
             }
 
-            $relativePath = 'books/' . $audioBook->id . '/thumbnails/' . $outputFilename;
+            // 6. Calculate position on source image
+            $compSize = $canvasSize;
+            switch ($position) {
+                case 'top-left':
+                    $posX = $margin;
+                    $posY = $margin;
+                    break;
+                case 'top-right':
+                    $posX = $srcW - $compSize - $margin;
+                    $posY = $margin;
+                    break;
+                case 'bottom-left':
+                    $posX = $margin;
+                    $posY = $srcH - $compSize - $margin;
+                    break;
+                case 'center':
+                    $posX = (int) floor(($srcW - $compSize) / 2);
+                    $posY = (int) floor(($srcH - $compSize) / 2);
+                    break;
+                case 'bottom-right':
+                default:
+                    $posX = $srcW - $compSize - $margin;
+                    $posY = $srcH - $compSize - $margin;
+                    break;
+            }
 
-            Log::info("Added logo overlay to image for audiobook {$audioBook->id}", [
+            // 7. Overlay composite on source
+            imagecopy($sourceImg, $composite, max(0, $posX), max(0, $posY), 0, 0, $compSize, $compSize);
+
+            // 8. Save output (PNG for quality, or JPEG if source was JPEG)
+            if ($sourceInfo[2] === IMAGETYPE_JPEG) {
+                imagejpeg($sourceImg, $outputPath, 95);
+            } else {
+                imagepng($sourceImg, $outputPath, 2);
+            }
+
+            // Clean up GD resources
+            imagedestroy($sourceImg);
+            imagedestroy($logoImg);
+            imagedestroy($scaledLogo);
+            imagedestroy($composite);
+
+            Log::info("Added circular logo overlay for audiobook {$audioBook->id}", [
                 'source' => $sourceImage,
                 'output' => $outputFilename,
-                'position' => $position
+                'position' => $position,
+                'logo_size' => $logoSize,
+                'border_width' => $borderW,
             ]);
+
+            $relativePath = 'books/' . $audioBook->id . '/thumbnails/' . $outputFilename;
 
             return response()->json([
                 'success' => true,
@@ -2178,6 +2256,31 @@ class AudioBookController extends Controller
                 'error' => $e->getMessage()
             ], 500);
         }
+    }
+
+    /**
+     * Load an image file into a GD resource.
+     */
+    private function gdLoadImage(string $path, ?int $type): \GdImage
+    {
+        if ($type === null) {
+            $info = getimagesize($path);
+            $type = $info ? $info[2] : 0;
+        }
+
+        $img = match ($type) {
+            IMAGETYPE_PNG => imagecreatefrompng($path),
+            IMAGETYPE_JPEG => imagecreatefromjpeg($path),
+            IMAGETYPE_GIF => imagecreatefromgif($path),
+            IMAGETYPE_WEBP => imagecreatefromwebp($path),
+            default => imagecreatefromstring(file_get_contents($path)),
+        };
+
+        if (!$img) {
+            throw new \RuntimeException("Failed to load image: {$path}");
+        }
+
+        return $img;
     }
 
     /**
@@ -4137,12 +4240,33 @@ class AudioBookController extends Controller
             $responseBody = $e->getResponse() ? $e->getResponse()->getBody()->getContents() : '';
             $errorData = json_decode($responseBody, true);
             $errorMessage = $errorData['error']['message'] ?? $e->getMessage();
+            $statusCode = $e->getResponse() ? $e->getResponse()->getStatusCode() : 500;
 
             Log::error('YouTube upload failed - Client Error', [
                 'error' => $errorMessage,
+                'status' => $statusCode,
                 'audiobook' => $audioBook->id,
                 'response' => $responseBody
             ]);
+
+            // 401 Unauthorized — force refresh token
+            if ($statusCode === 401) {
+                $newToken = YouTubeChannelController::refreshAccessToken($channel);
+                if ($newToken) {
+                    return response()->json([
+                        'success' => false,
+                        'error' => '❌ Token YouTube đã hết hạn, đã tự động refresh. Vui lòng thử lại.',
+                        'token_refreshed' => true,
+                    ], 401);
+                } else {
+                    $channel->update(['youtube_connected' => false]);
+                    return response()->json([
+                        'success' => false,
+                        'error' => '❌ Token YouTube không hợp lệ. Vui lòng kết nối lại OAuth trong trang kênh YouTube.',
+                        'need_reconnect' => true,
+                    ], 401);
+                }
+            }
 
             // Check for specific YouTube errors
             if (str_contains($errorMessage, 'exceeded the number of videos')) {
@@ -4173,9 +4297,9 @@ class AudioBookController extends Controller
 
             return response()->json([
                 'success' => false,
-                'error' => '❌ Upload thất bại',
+                'error' => '❌ Upload thất bại: ' . $errorMessage,
                 'details' => $errorMessage
-            ], $e->getResponse() ? $e->getResponse()->getStatusCode() : 500);
+            ], $statusCode);
 
         } catch (\Exception $e) {
             Log::error('YouTube upload failed', ['error' => $e->getMessage(), 'audiobook' => $audioBook->id]);
@@ -4313,13 +4437,35 @@ class AudioBookController extends Controller
             $responseBody = $e->getResponse() ? $e->getResponse()->getBody()->getContents() : '';
             $errorData = json_decode($responseBody, true);
             $errorMessage = $errorData['error']['message'] ?? $e->getMessage();
+            $statusCode = $e->getResponse() ? $e->getResponse()->getStatusCode() : 500;
 
             Log::error('YouTube playlist creation failed - Client Error', [
                 'error' => $errorMessage,
+                'status' => $statusCode,
                 'audiobook' => $audioBook->id,
                 'response' => $responseBody,
                 'uploaded_videos' => $uploadedVideos ?? []
             ]);
+
+            // 401 Unauthorized — token invalid, try force refresh
+            if ($statusCode === 401) {
+                Log::info('YouTube: Token invalid, attempting force refresh', ['audiobook' => $audioBook->id]);
+                $newToken = YouTubeChannelController::refreshAccessToken($channel);
+                if ($newToken) {
+                    return response()->json([
+                        'success' => false,
+                        'error' => '❌ Token YouTube đã hết hạn, đã tự động refresh. Vui lòng thử lại.',
+                        'token_refreshed' => true,
+                    ], 401);
+                } else {
+                    $channel->update(['youtube_connected' => false]);
+                    return response()->json([
+                        'success' => false,
+                        'error' => '❌ Token YouTube không hợp lệ. Vui lòng kết nối lại OAuth trong trang kênh YouTube.',
+                        'need_reconnect' => true,
+                    ], 401);
+                }
+            }
 
             // Check for specific YouTube errors
             if (str_contains($errorMessage, 'exceeded the number of videos')) {
@@ -4355,11 +4501,11 @@ class AudioBookController extends Controller
 
             return response()->json([
                 'success' => false,
-                'error' => '❌ Lỗi tạo playlist',
+                'error' => '❌ Lỗi tạo playlist: ' . $errorMessage,
                 'details' => $errorMessage,
                 'uploaded_count' => count($uploadedVideos ?? []),
                 'uploaded_videos' => $uploadedVideos ?? []
-            ], $e->getResponse() ? $e->getResponse()->getStatusCode() : 500);
+            ], $statusCode);
 
         } catch (\Exception $e) {
             Log::error('YouTube playlist creation failed', ['error' => $e->getMessage(), 'audiobook' => $audioBook->id]);
@@ -4526,19 +4672,39 @@ class AudioBookController extends Controller
             $responseBody = $e->getResponse() ? $e->getResponse()->getBody()->getContents() : '';
             $errorData = json_decode($responseBody, true);
             $errorMessage = $errorData['error']['message'] ?? $e->getMessage();
+            $statusCode = $e->getResponse() ? $e->getResponse()->getStatusCode() : 500;
 
             Log::error('YouTube add to playlist failed', [
                 'error' => $errorMessage,
+                'status' => $statusCode,
                 'audiobook' => $audioBook->id,
                 'uploaded_videos' => $uploadedVideos ?? []
             ]);
+
+            if ($statusCode === 401) {
+                $newToken = YouTubeChannelController::refreshAccessToken($channel);
+                if ($newToken) {
+                    return response()->json([
+                        'success' => false,
+                        'error' => '❌ Token YouTube đã hết hạn, đã tự động refresh. Vui lòng thử lại.',
+                        'token_refreshed' => true,
+                    ], 401);
+                } else {
+                    $channel->update(['youtube_connected' => false]);
+                    return response()->json([
+                        'success' => false,
+                        'error' => '❌ Token YouTube không hợp lệ. Vui lòng kết nối lại OAuth trong trang kênh YouTube.',
+                        'need_reconnect' => true,
+                    ], 401);
+                }
+            }
 
             return response()->json([
                 'success' => false,
                 'error' => '❌ Lỗi upload vào playlist: ' . $errorMessage,
                 'uploaded_count' => count($uploadedVideos ?? []),
                 'uploaded_videos' => $uploadedVideos ?? []
-            ], $e->getResponse() ? $e->getResponse()->getStatusCode() : 500);
+            ], $statusCode);
         } catch (\Exception $e) {
             Log::error('YouTube add to playlist failed', ['error' => $e->getMessage(), 'audiobook' => $audioBook->id]);
             return response()->json([

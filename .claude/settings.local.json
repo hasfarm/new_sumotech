@@ -15,7 +15,8 @@
       "Bash(echo:*)",
       "Bash(crontab:*)",
       "Bash(printf:*)",
-      "Bash(1 CRON crontab -l)"
+      "Bash(1 CRON crontab -l)",
+      "Bash(ls:*)"
     ]
   }
 }

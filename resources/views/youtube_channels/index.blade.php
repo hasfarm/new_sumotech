@@ -51,47 +51,50 @@
                                     <thead class="bg-gray-50">
                                         <tr>
                                             <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">
-                                                Channel ID</th>
-                                            <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">
                                                 Content Type</th>
                                             <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">
-                                                Title</th>
-                                            <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">
-                                                Custom URL</th>
-                                            <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">
-                                                Subscribers</th>
-                                            <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">
+                                                Channel</th>
+                                            <th class="px-4 py-3 text-center text-xs font-medium text-gray-500 uppercase">
                                                 Videos</th>
-                                            <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">
-                                                Views</th>
+                                            <th class="px-4 py-3 text-center text-xs font-medium text-gray-500 uppercase">
+                                                Published</th>
+                                            <th class="px-4 py-3 text-center text-xs font-medium text-gray-500 uppercase">
+                                                Total Duration</th>
+                                            <th class="px-4 py-3 text-center text-xs font-medium text-gray-500 uppercase">
+                                                Published Duration</th>
                                             <th class="px-4 py-3 text-right text-xs font-medium text-gray-500 uppercase">
                                                 Actions</th>
                                         </tr>
                                     </thead>
                                     <tbody class="bg-white divide-y divide-gray-200">
                                         @foreach ($channels as $channel)
-                                            <tr>
-                                                <td class="px-4 py-3 text-sm text-gray-900">{{ $channel->channel_id }}</td>
+                                            @php
+                                                $totalSec = $channel->total_duration_seconds ?? 0;
+                                                $pubSec = $channel->published_duration_seconds ?? 0;
+                                                $fmtDuration = function($s) {
+                                                    if ($s <= 0) return '—';
+                                                    $h = floor($s / 3600);
+                                                    $m = floor(($s % 3600) / 60);
+                                                    return $h > 0 ? "{$h}h {$m}m" : "{$m}m";
+                                                };
+                                                $ytUrl = $channel->custom_url
+                                                    ? (str_starts_with($channel->custom_url, 'http')
+                                                        ? $channel->custom_url
+                                                        : 'https://youtube.com/' . $channel->custom_url)
+                                                    : null;
+                                            @endphp
+                                            <tr class="hover:bg-gray-50">
                                                 <td class="px-4 py-3 text-sm">
                                                     @if($channel->content_type === 'audiobook')
                                                         <span class="inline-flex items-center gap-1 px-2 py-1 bg-green-100 text-green-700 text-xs font-medium rounded-full">
-                                                            <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253" />
-                                                            </svg>
                                                             Audiobook
                                                         </span>
                                                     @elseif($channel->content_type === 'dub')
                                                         <span class="inline-flex items-center gap-1 px-2 py-1 bg-purple-100 text-purple-700 text-xs font-medium rounded-full">
-                                                            <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
-                                                            </svg>
                                                             Dub
                                                         </span>
                                                     @elseif($channel->content_type === 'self_creative')
                                                         <span class="inline-flex items-center gap-1 px-2 py-1 bg-orange-100 text-orange-700 text-xs font-medium rounded-full">
-                                                            <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" />
-                                                            </svg>
                                                             Creative
                                                         </span>
                                                     @else
@@ -105,38 +108,57 @@
                                                         @if ($channel->thumbnail_url)
                                                             <img src="{{ str_starts_with($channel->thumbnail_url, 'http') ? $channel->thumbnail_url : asset('storage/' . $channel->thumbnail_url) }}"
                                                                 alt="Thumbnail"
-                                                                class="w-10 h-10 rounded object-cover border">
+                                                                class="w-10 h-10 rounded-full object-cover border">
                                                         @else
-                                                            <div
-                                                                class="w-10 h-10 rounded bg-gray-100 flex items-center justify-center text-gray-400">
-                                                                <i class="ri-image-line"></i>
+                                                            <div class="w-10 h-10 rounded-full bg-gray-100 flex items-center justify-center text-gray-400">
+                                                                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"/>
+                                                                </svg>
                                                             </div>
                                                         @endif
-                                                        <span>{{ $channel->title }}</span>
+                                                        <div>
+                                                            <a href="{{ route('youtube-channels.show', $channel) }}" class="font-medium text-gray-900 hover:text-blue-600">
+                                                                {{ $channel->title }}
+                                                            </a>
+                                                            @if($ytUrl)
+                                                                <a href="{{ $ytUrl }}" target="_blank" class="block text-xs text-red-500 hover:underline">
+                                                                    {{ $channel->custom_url }}
+                                                                </a>
+                                                            @endif
+                                                        </div>
                                                     </div>
                                                 </td>
-                                                <td class="px-4 py-3 text-sm text-gray-600">
-                                                    {{ $channel->custom_url ?? '—' }}
+                                                <td class="px-4 py-3 text-sm text-center text-gray-600">
+                                                    <span class="font-semibold">{{ $channel->total_videos ?? 0 }}</span>
                                                 </td>
-                                                <td class="px-4 py-3 text-sm text-gray-600">
-                                                    {{ number_format($channel->subscribers_count ?? 0) }}</td>
-                                                <td class="px-4 py-3 text-sm text-gray-600">
-                                                    {{ number_format($channel->videos_count ?? 0) }}</td>
-                                                <td class="px-4 py-3 text-sm text-gray-600">
-                                                    {{ number_format($channel->views_count ?? 0) }}</td>
+                                                <td class="px-4 py-3 text-sm text-center">
+                                                    @if(($channel->published_videos ?? 0) > 0)
+                                                        <span class="inline-flex items-center px-2 py-0.5 bg-green-100 text-green-700 text-xs font-semibold rounded-full">
+                                                            {{ $channel->published_videos }}
+                                                        </span>
+                                                    @else
+                                                        <span class="text-gray-400">0</span>
+                                                    @endif
+                                                </td>
+                                                <td class="px-4 py-3 text-sm text-center text-gray-600">
+                                                    {{ $fmtDuration($totalSec) }}
+                                                </td>
+                                                <td class="px-4 py-3 text-sm text-center text-gray-600">
+                                                    {{ $fmtDuration($pubSec) }}
+                                                </td>
                                                 <td class="px-4 py-3 text-right text-sm">
                                                     <div class="inline-flex gap-2">
                                                         <a href="{{ route('youtube-channels.show', $channel) }}"
-                                                            class="px-3 py-1.5 bg-gray-100 text-gray-700 rounded hover:bg-gray-200">View</a>
+                                                            class="px-3 py-1.5 bg-gray-100 text-gray-700 rounded hover:bg-gray-200 text-xs">View</a>
                                                         <a href="{{ route('youtube-channels.edit', $channel) }}"
-                                                            class="px-3 py-1.5 bg-blue-600 text-white rounded hover:bg-blue-700">Edit</a>
+                                                            class="px-3 py-1.5 bg-blue-600 text-white rounded hover:bg-blue-700 text-xs">Edit</a>
                                                         <form action="{{ route('youtube-channels.destroy', $channel) }}"
                                                             method="POST"
                                                             onsubmit="return confirm('Delete this channel?');">
                                                             @csrf
                                                             @method('DELETE')
                                                             <button type="submit"
-                                                                class="px-3 py-1.5 bg-red-600 text-white rounded hover:bg-red-700">
+                                                                class="px-3 py-1.5 bg-red-600 text-white rounded hover:bg-red-700 text-xs">
                                                                 Delete
                                                             </button>
                                                         </form>

@@ -1,4 +1,4 @@
-@extends('layouts.app')
+ @extends('layouts.app')
 
 @section('content')
     <div class="py-12">
@@ -2547,38 +2547,30 @@
                         <!-- Position Selector -->
                         <div>
                             <label class="block text-xs font-medium text-gray-700 mb-2">Vị trí logo:</label>
-                            <div class="grid grid-cols-3 gap-2">
-                                <label
-                                    class="flex items-center justify-center p-2 bg-white rounded border cursor-pointer hover:border-yellow-400 text-xs has-[:checked]:border-yellow-500 has-[:checked]:bg-yellow-50">
-                                    <input type="radio" name="logoPosition" value="top-left" class="sr-only">
-                                    <span>&#8598; Trên trái</span>
-                                </label>
-                                <label
-                                    class="flex items-center justify-center p-2 bg-white rounded border cursor-pointer hover:border-yellow-400 text-xs has-[:checked]:border-yellow-500 has-[:checked]:bg-yellow-50">
-                                    <input type="radio" name="logoPosition" value="center" class="sr-only">
-                                    <span>&#9678; Giữa</span>
-                                </label>
-                                <label
-                                    class="flex items-center justify-center p-2 bg-white rounded border cursor-pointer hover:border-yellow-400 text-xs has-[:checked]:border-yellow-500 has-[:checked]:bg-yellow-50">
-                                    <input type="radio" name="logoPosition" value="top-right" class="sr-only">
-                                    <span>&#8599; Trên phải</span>
-                                </label>
-                                <label
-                                    class="flex items-center justify-center p-2 bg-white rounded border cursor-pointer hover:border-yellow-400 text-xs has-[:checked]:border-yellow-500 has-[:checked]:bg-yellow-50">
-                                    <input type="radio" name="logoPosition" value="bottom-left" class="sr-only">
-                                    <span>&#8601; Dưới trái</span>
-                                </label>
-                                <label
-                                    class="flex items-center justify-center p-2 bg-white rounded border cursor-pointer hover:border-yellow-400 text-xs opacity-0 pointer-events-none">
-                                    <span>&nbsp;</span>
-                                </label>
-                                <label
-                                    class="flex items-center justify-center p-2 bg-white rounded border cursor-pointer hover:border-yellow-400 text-xs has-[:checked]:border-yellow-500 has-[:checked]:bg-yellow-50">
-                                    <input type="radio" name="logoPosition" value="bottom-right" checked
-                                        class="sr-only">
-                                    <span>&#8600; Dưới phải</span>
-                                </label>
+                            <div class="grid grid-cols-3 gap-2" id="logoPositionGrid">
+                                <button type="button" data-position="top-left"
+                                    class="logo-pos-btn flex items-center justify-center p-2 rounded border cursor-pointer text-xs transition bg-white border-gray-200 hover:border-orange-500">
+                                    &#8598; Trên trái
+                                </button>
+                                <button type="button" data-position="center"
+                                    class="logo-pos-btn flex items-center justify-center p-2 rounded border cursor-pointer text-xs transition bg-white border-gray-200 hover:border-orange-500">
+                                    &#9678; Giữa
+                                </button>
+                                <button type="button" data-position="top-right"
+                                    class="logo-pos-btn flex items-center justify-center p-2 rounded border cursor-pointer text-xs transition bg-white border-gray-200 hover:border-orange-500">
+                                    &#8599; Trên phải
+                                </button>
+                                <button type="button" data-position="bottom-left"
+                                    class="logo-pos-btn flex items-center justify-center p-2 rounded border cursor-pointer text-xs transition bg-white border-gray-200 hover:border-orange-500">
+                                    &#8601; Dưới trái
+                                </button>
+                                <div></div>
+                                <button type="button" data-position="bottom-right"
+                                    class="logo-pos-btn flex items-center justify-center p-2 rounded border cursor-pointer text-xs transition border-orange-500 bg-orange-50 font-semibold">
+                                    &#8600; Dưới phải
+                                </button>
                             </div>
+                            <input type="hidden" id="logoPositionValue" value="bottom-right">
                         </div>
 
                         <!-- Logo Size -->
@@ -2618,7 +2610,7 @@
             <!-- Actions -->
             <div class="flex gap-3 mt-4">
                 <button type="button" id="applyLogoOverlayBtn" onclick="applyLogoOverlay()"
-                    class="flex-1 bg-yellow-600 hover:bg-yellow-700 text-white py-2.5 rounded-lg font-semibold transition">
+                    class="flex-1 bg-orange-600 hover:bg-orange-700 text-white py-2.5 rounded-lg font-semibold transition">
                     🏷️ Gắn Logo
                 </button>
                 <button type="button" onclick="closeAddLogoModal()"
@@ -5923,6 +5915,19 @@
             selectedLogoFilename = '';
         }
 
+        // Logo position buttons
+        document.querySelectorAll('.logo-pos-btn').forEach(function(btn) {
+            btn.addEventListener('click', function() {
+                document.querySelectorAll('.logo-pos-btn').forEach(function(b) {
+                    b.classList.remove('border-orange-500', 'bg-orange-50', 'font-semibold');
+                    b.classList.add('bg-white', 'border-gray-200');
+                });
+                this.classList.remove('bg-white', 'border-gray-200');
+                this.classList.add('border-orange-500', 'bg-orange-50', 'font-semibold');
+                document.getElementById('logoPositionValue').value = this.dataset.position;
+            });
+        });
+
         // Logo scale slider
         document.getElementById('logoScale')?.addEventListener('input', function() {
             document.getElementById('logoScaleValue').textContent = this.value + '%';
@@ -5943,7 +5948,7 @@
                 return;
             }
 
-            const position = document.querySelector('input[name="logoPosition"]:checked')?.value || 'bottom-right';
+            const position = document.getElementById('logoPositionValue')?.value || 'bottom-right';
             const logoScale = parseInt(document.getElementById('logoScale').value || '15');
             const opacity = parseInt(document.getElementById('logoOpacity').value || '100');
             const margin = parseInt(document.getElementById('logoMargin').value || '20');
