@@ -42,6 +42,7 @@ class AudioBook extends Model
         'wave_type',
         'wave_position',
         'wave_height',
+        'wave_width',
         'wave_color',
         'wave_opacity',
         'youtube_playlist_id',

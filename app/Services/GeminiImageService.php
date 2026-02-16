@@ -843,12 +843,13 @@ class GeminiImageService
      * @param string|null $customPrompt Custom scene description
      * @return array
      */
-    public function generateThumbnail(array $bookInfo, string $style = 'cinematic', ?int $chapterNumber = null, ?string $customPrompt = null): array
+    /**
+     * Build prompt for thumbnail WITHOUT text (background only)
+     */
+    public function buildThumbnailPrompt(array $bookInfo, string $style = 'cinematic', ?string $customPrompt = null): string
     {
         $category = $bookInfo['category'] ?? '';
-        $bookId = $bookInfo['book_id'] ?? 0;
 
-        // Style descriptions for background image ONLY (no text)
         $stylePrompts = [
             'cinematic' => 'cinematic movie scene, dramatic lighting, dark moody atmospheric, film noir aesthetic',
             'anime' => 'anime artwork style, vibrant colors, Japanese animation aesthetic, detailed anime scene',
@@ -864,20 +865,14 @@ class GeminiImageService
 
         $styleDescription = $stylePrompts[$style] ?? $stylePrompts['cinematic'];
 
-        // Build prompt for PURE VISUAL IMAGE - ABSOLUTELY NO TEXT
-        // Do NOT mention book title, author, or any specific text content
         $prompt = "Generate a pure visual artwork image with ABSOLUTELY NO TEXT, NO WORDS, NO LETTERS, NO TYPOGRAPHY.\n\n";
-
         $prompt .= "Art Style: {$styleDescription}\n\n";
 
-        // Add custom visual scene description if provided (but filter out any text mentions)
         if ($customPrompt) {
-            // Clean the custom prompt - remove any quotes or text-like instructions
             $cleanPrompt = preg_replace('/["\'].*?["\']/', '', $customPrompt);
             $prompt .= "Visual Scene: {$cleanPrompt}\n\n";
         }
 
-        // Add genre hint for visual theme only
         if ($category) {
             $prompt .= "Visual Theme: {$category} genre atmosphere\n\n";
         }
@@ -902,6 +897,71 @@ class GeminiImageService
         $prompt .= "- ANY UI elements, buttons, or labels\n";
         $prompt .= "- ANY watermarks or signatures\n";
         $prompt .= "- ANY book covers, posters, or signs with text";
+
+        return $prompt;
+    }
+
+    /**
+     * Build prompt for thumbnail WITH AI-rendered text
+     */
+    public function buildThumbnailWithTextPrompt(array $bookInfo, string $style = 'cinematic', ?int $chapterNumber = null, ?string $customPrompt = null): string
+    {
+        $title = $bookInfo['title'] ?? 'Audiobook';
+        $author = $bookInfo['author'] ?? '';
+        $category = $bookInfo['category'] ?? '';
+
+        $stylePrompts = [
+            'cinematic' => 'cinematic movie poster style with dramatic lighting',
+            'anime' => 'anime style with vibrant colors',
+            'illustration' => 'digital illustration artistic style',
+            'realistic' => 'photorealistic professional photography style',
+            'vintage' => 'vintage retro classic design',
+            'fantasy' => 'epic fantasy art magical atmosphere',
+            'mystery' => 'dark mysterious noir style',
+            'romance' => 'romantic soft lighting elegant design',
+            'modern' => 'modern minimalist clean design',
+            'gradient' => 'beautiful gradient background modern design'
+        ];
+
+        $styleDescription = $stylePrompts[$style] ?? $stylePrompts['cinematic'];
+
+        $prompt = "Generate a YouTube thumbnail image (16:9 aspect ratio) that contains VISIBLE TEXT.\n\n";
+        $prompt .= "CRITICAL: This image MUST display the following text CLEARLY AND LEGIBLY:\n";
+        $prompt .= "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
+        $prompt .= "MAIN TITLE (large, bold, centered): {$title}\n";
+        if ($author) {
+            $prompt .= "SUBTITLE (smaller, below title): {$author}\n";
+        }
+        if ($chapterNumber) {
+            $prompt .= "BADGE/LABEL: Chương {$chapterNumber}\n";
+        }
+        $prompt .= "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n";
+        $prompt .= "DESIGN STYLE: {$styleDescription}\n\n";
+
+        if ($customPrompt) {
+            $prompt .= "BACKGROUND SCENE: {$customPrompt}\n\n";
+        } elseif ($category) {
+            $prompt .= "THEME/GENRE: {$category}\n\n";
+        }
+
+        $prompt .= "TEXT RENDERING REQUIREMENTS:\n";
+        $prompt .= "• The title \"{$title}\" MUST be rendered as ACTUAL TEXT in the image\n";
+        $prompt .= "• Text must be WHITE or YELLOW with BLACK OUTLINE/SHADOW for readability\n";
+        $prompt .= "• Font style: Bold, blocky, movie-poster style\n";
+        $prompt .= "• Text position: Lower third of the image (banner area)\n";
+        $prompt .= "• Text must be perfectly spelled - copy exactly as provided\n";
+        $prompt .= "• Do NOT blur, distort, or partially hide the text\n";
+        $prompt .= "• Make the text the FOCAL POINT of the thumbnail\n\n";
+        $prompt .= "OUTPUT: A professional YouTube thumbnail with the exact text \"{$title}\" prominently displayed and readable.";
+
+        return $prompt;
+    }
+
+    public function generateThumbnail(array $bookInfo, string $style = 'cinematic', ?int $chapterNumber = null, ?string $customPrompt = null, ?string $overridePrompt = null): array
+    {
+        $bookId = $bookInfo['book_id'] ?? 0;
+
+        $prompt = $overridePrompt ?: $this->buildThumbnailPrompt($bookInfo, $style, $customPrompt);
 
         // Generate output path for the background image
         $outputDir = storage_path('app/public/books/' . $bookId . '/thumbnails');
@@ -941,29 +1001,16 @@ class GeminiImageService
      * @param int|null $chapterNumber Chapter number for chapter-specific thumbnails
      * @return array
      */
-    public function generateThumbnailWithText(array $bookInfo, string $style = 'cinematic', ?int $chapterNumber = null, ?string $customPrompt = null): array
+    public function generateThumbnailWithText(array $bookInfo, string $style = 'cinematic', ?int $chapterNumber = null, ?string $customPrompt = null, ?string $overridePrompt = null): array
     {
-        // Use AI to generate text directly in image (no FFmpeg)
-        return $this->generateThumbnailWithAIText($bookInfo, $style, $chapterNumber, $customPrompt);
+        return $this->generateThumbnailWithAIText($bookInfo, $style, $chapterNumber, $customPrompt, $overridePrompt);
     }
 
-    /**
-     * Generate YouTube thumbnail with AI-rendered text directly in the image
-     * AI will create the image AND render the text as part of the image
-     * 
-     * @param array $bookInfo Book information
-     * @param string $style Visual style
-     * @param int|null $chapterNumber Chapter number for chapter-specific thumbnails
-     * @param string|null $customPrompt Custom scene description
-     * @return array
-     */
-    public function generateThumbnailWithAIText(array $bookInfo, string $style = 'cinematic', ?int $chapterNumber = null, ?string $customPrompt = null): array
+    public function generateThumbnailWithAIText(array $bookInfo, string $style = 'cinematic', ?int $chapterNumber = null, ?string $customPrompt = null, ?string $overridePrompt = null): array
     {
         $title = $bookInfo['title'] ?? 'Audiobook';
         $author = $bookInfo['author'] ?? '';
-        $category = $bookInfo['category'] ?? '';
         $bookId = $bookInfo['book_id'] ?? 0;
-        $description = $bookInfo['description'] ?? '';
 
         Log::info('GeminiImageService: generateThumbnailWithAIText called', [
             'title' => $title,
@@ -972,57 +1019,7 @@ class GeminiImageService
             'chapterNumber' => $chapterNumber,
         ]);
 
-        // Style descriptions for the overall visual
-        $stylePrompts = [
-            'cinematic' => 'cinematic movie poster style with dramatic lighting',
-            'anime' => 'anime style with vibrant colors',
-            'illustration' => 'digital illustration artistic style',
-            'realistic' => 'photorealistic professional photography style',
-            'vintage' => 'vintage retro classic design',
-            'fantasy' => 'epic fantasy art magical atmosphere',
-            'mystery' => 'dark mysterious noir style',
-            'romance' => 'romantic soft lighting elegant design',
-            'modern' => 'modern minimalist clean design',
-            'gradient' => 'beautiful gradient background modern design'
-        ];
-
-        $styleDescription = $stylePrompts[$style] ?? $stylePrompts['cinematic'];
-
-        // Build a STRONG prompt that emphasizes text rendering
-        // NOTE: AI image generators often struggle with text, so we make it very explicit
-        $prompt = "Generate a YouTube thumbnail image (16:9 aspect ratio) that contains VISIBLE TEXT.\n\n";
-
-        $prompt .= "CRITICAL: This image MUST display the following text CLEARLY AND LEGIBLY:\n";
-        $prompt .= "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
-        $prompt .= "MAIN TITLE (large, bold, centered): {$title}\n";
-        if ($author) {
-            $prompt .= "SUBTITLE (smaller, below title): {$author}\n";
-        }
-        if ($chapterNumber) {
-            $prompt .= "BADGE/LABEL: Chương {$chapterNumber}\n";
-        }
-        $prompt .= "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n";
-
-        $prompt .= "DESIGN STYLE: {$styleDescription}\n\n";
-
-        // Background context
-        if ($customPrompt) {
-            $prompt .= "BACKGROUND SCENE: {$customPrompt}\n\n";
-        } elseif ($category) {
-            $prompt .= "THEME/GENRE: {$category}\n\n";
-        }
-
-        // Very explicit text rendering instructions
-        $prompt .= "TEXT RENDERING REQUIREMENTS:\n";
-        $prompt .= "• The title \"{$title}\" MUST be rendered as ACTUAL TEXT in the image\n";
-        $prompt .= "• Text must be WHITE or YELLOW with BLACK OUTLINE/SHADOW for readability\n";
-        $prompt .= "• Font style: Bold, blocky, movie-poster style\n";
-        $prompt .= "• Text position: Lower third of the image (banner area)\n";
-        $prompt .= "• Text must be perfectly spelled - copy exactly as provided\n";
-        $prompt .= "• Do NOT blur, distort, or partially hide the text\n";
-        $prompt .= "• Make the text the FOCAL POINT of the thumbnail\n\n";
-
-        $prompt .= "OUTPUT: A professional YouTube thumbnail with the exact text \"{$title}\" prominently displayed and readable.";
+        $prompt = $overridePrompt ?: $this->buildThumbnailWithTextPrompt($bookInfo, $style, $chapterNumber, $customPrompt);
 
         // Generate output path
         $outputDir = storage_path('app/public/books/' . $bookId . '/thumbnails');
@@ -1394,50 +1391,6 @@ class GeminiImageService
         // Escape special characters for FFmpeg drawtext
         $text = str_replace(['\\', "'", ':', '%'], ['\\\\', "\\'", '\\:', '\\%'], $text);
         return $text;
-    }
-
-    /**
-     * Generate a prompt for thumbnail based on book info
-     */
-    public function buildThumbnailPrompt(array $bookInfo, string $style = 'cinematic'): string
-    {
-        $title = $bookInfo['title'] ?? 'Audiobook';
-        $category = $bookInfo['category'] ?? '';
-        $description = $bookInfo['description'] ?? '';
-
-        $stylePrompts = [
-            'realistic' => 'photorealistic, high detail, professional photography, dramatic lighting',
-            'anime' => 'anime style, vibrant colors, Japanese animation aesthetic',
-            'illustration' => 'digital illustration, artistic, detailed artwork, storybook style',
-            'cinematic' => 'cinematic, movie poster style, dramatic atmosphere',
-        ];
-
-        $styleDescription = $stylePrompts[$style] ?? $stylePrompts['cinematic'];
-
-        $prompt = "Create a stunning YouTube thumbnail image. Style: {$styleDescription}. ";
-
-        if ($category) {
-            $prompt .= "Genre: {$category}. ";
-        }
-
-        if ($description) {
-            $shortDesc = mb_substr($description, 0, 300);
-            $prompt .= "Theme: {$shortDesc}. ";
-        }
-
-        $prompt .= "The image should be visually striking, 16:9 aspect ratio, no text or letters, suitable for YouTube thumbnail. ";
-
-        // Clickability guidelines
-        $prompt .= "Make the image instantly clickable on YouTube: ";
-        $prompt .= "Strong emotional hook, sense of mystery and adventure, ";
-        $prompt .= "viewer should feel 'I need to know what happens next'. ";
-
-        // Negative prompt
-        $prompt .= "AVOID: Low contrast, small text, flat illustration, ";
-        $prompt .= "cartoonish childish style (unless requested), too many characters, ";
-        $prompt .= "text overlapping faces, watermarks, logos, UI elements, generic boring compositions.";
-
-        return $prompt;
     }
 
     /**

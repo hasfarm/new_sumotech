@@ -157,7 +157,9 @@ Route::middleware('auth')->prefix('audiobooks')->name('audiobooks.')->group(func
 
     // YouTube Media Generation Routes (AI Image/Video)
     Route::get('{audioBook}/media', [AudioBookController::class, 'getMedia'])->name('media.index');
+    Route::post('{audioBook}/media/preview-thumbnail-prompt', [AudioBookController::class, 'previewThumbnailPrompt'])->name('media.preview.thumbnail.prompt');
     Route::post('{audioBook}/media/generate-thumbnail', [AudioBookController::class, 'generateThumbnail'])->name('media.generate.thumbnail');
+    Route::get('{audioBook}/media/thumbnail-progress', [AudioBookController::class, 'getThumbnailProgress'])->name('media.thumbnail.progress');
     Route::post('{audioBook}/media/add-text-overlay', [AudioBookController::class, 'addTextOverlay'])->name('media.add.text.overlay');
     Route::post('{audioBook}/media/add-logo-overlay', [AudioBookController::class, 'addLogoOverlay'])->name('media.add.logo.overlay');
     Route::post('{audioBook}/media/generate-scenes', [AudioBookController::class, 'generateVideoScenes'])->name('media.generate.scenes');

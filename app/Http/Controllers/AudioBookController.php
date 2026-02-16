@@ -20,6 +20,7 @@ use App\Jobs\GenerateDescriptionVideoJob;
 use App\Jobs\GenerateFullBookVideoJob;
 use App\Jobs\GenerateBatchVideoJob;
 use App\Jobs\PublishYoutubeJob;
+use App\Jobs\GenerateThumbnailJob;
 use App\Models\AudioBookVideoSegment;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Cache;
@@ -837,6 +838,7 @@ class AudioBookController extends Controller
             'wave_type' => 'nullable|string|in:line,p2p,cline,point,bar',
             'wave_position' => 'nullable|string|in:top,center,bottom',
             'wave_height' => 'nullable|integer|min:50|max:300',
+            'wave_width' => 'nullable|integer|min:20|max:100',
             'wave_color' => 'nullable|string|max:20',
             'wave_opacity' => 'nullable|numeric|min:0.1|max:1'
         ]);
@@ -1268,6 +1270,7 @@ class AudioBookController extends Controller
             $waveType = $waveTypeMap[$rawWaveType] ?? 'cline';
             $wavePosition = $audioBook->wave_position ?? 'bottom';
             $waveHeight = (int) ($audioBook->wave_height ?? 100);
+            $waveWidthPercent = (int) ($audioBook->wave_width ?? 100);
             $waveColor = ltrim($audioBook->wave_color ?? '#00ff00', '#');
             $waveOpacity = (float) ($audioBook->wave_opacity ?? 0.8);
 
@@ -1443,6 +1446,8 @@ class AudioBookController extends Controller
 
             // Scale wave height for 1080p (original was for 720p)
             $scaledWaveHeight = (int) ($waveHeight * 1.5);
+            $wavePixelWidth = (int) (1920 * $waveWidthPercent / 100);
+            $waveX = (int) ((1920 - $wavePixelWidth) / 2); // center horizontally
 
             // Video filter with zoompan + wave overlay
             // Input 0: image (looped), Input 1: mixed audio
@@ -1451,14 +1456,16 @@ class AudioBookController extends Controller
                 '[0:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,' .
                     'zoompan=z=\'min(1.06,max(1.0,1+0.02*sin(2*PI*on/(25*20))))\':d=%d:x=\'iw/2-(iw/zoom/2)\':y=\'ih/2-(ih/zoom/2)\':s=1920x1080:fps=25[bg];' .
                     // Wave visualization from mixed audio
-                    '[1:a]showwaves=s=1920x%d:mode=%s:colors=0x%s@%.1f:rate=25[wave];' .
-                    // Overlay wave on video
-                    '[bg][wave]overlay=0:%d:format=auto[out]',
+                    '[1:a]showwaves=s=%dx%d:mode=%s:colors=0x%s@%.1f:rate=25[wave];' .
+                    // Overlay wave on video (centered)
+                    '[bg][wave]overlay=%d:%d:format=auto[out]',
                 $totalFrames,
+                $wavePixelWidth,
                 $scaledWaveHeight,
                 $waveType,
                 $waveColor,
                 $waveOpacity,
+                $waveX,
                 $waveY
             );
 
@@ -1988,6 +1995,44 @@ class AudioBookController extends Controller
     /**
      * Generate thumbnail using Gemini AI
      */
+    public function previewThumbnailPrompt(Request $request, AudioBook $audioBook)
+    {
+        $request->validate([
+            'style' => 'nullable|string',
+            'custom_prompt' => 'nullable|string|max:1000',
+            'chapter_number' => 'nullable|integer|min:1',
+            'with_text' => 'nullable|boolean',
+            'custom_title' => 'nullable|string|max:500',
+            'custom_author' => 'nullable|string|max:200',
+        ]);
+
+        $style = $request->input('style', 'cinematic');
+        $customPrompt = $request->input('custom_prompt');
+        $chapterNumber = $request->input('chapter_number');
+        $withText = $request->input('with_text', true);
+        $customTitle = $request->input('custom_title');
+        $customAuthor = $request->input('custom_author');
+
+        $bookInfo = [
+            'book_id' => $audioBook->id,
+            'title' => $customTitle ?: $audioBook->title,
+            'author' => $customAuthor ?: ($audioBook->author ? 'Tác giả: ' . $audioBook->author : ''),
+            'category' => $audioBook->category,
+            'description' => $audioBook->description,
+        ];
+
+        if ($withText) {
+            $prompt = $this->imageService->buildThumbnailWithTextPrompt($bookInfo, $style, $chapterNumber, $customPrompt);
+        } else {
+            $prompt = $this->imageService->buildThumbnailPrompt($bookInfo, $style, $customPrompt);
+        }
+
+        return response()->json([
+            'success' => true,
+            'prompt' => $prompt,
+        ]);
+    }
+
     public function generateThumbnail(Request $request, AudioBook $audioBook)
     {
         $request->validate([
@@ -1999,79 +2044,47 @@ class AudioBookController extends Controller
             'use_cover_image' => 'nullable|boolean',
             'custom_title' => 'nullable|string|max:500',
             'custom_author' => 'nullable|string|max:200',
-            'text_styling' => 'nullable|array'
+            'text_styling' => 'nullable|array',
+            'override_prompt' => 'nullable|string|max:5000',
         ]);
 
-        $style = $request->input('style', 'cinematic');
-        $customPrompt = $request->input('custom_prompt');
-        $chapterNumber = $request->input('chapter_number');
-        $withText = $request->input('with_text', true); // Default to generating with text
-        $aiResearch = $request->input('ai_research', false); // AI research option
-        $useCoverImage = $request->input('use_cover_image', false); // Use cover image option
-        $customTitle = $request->input('custom_title');
-        $customAuthor = $request->input('custom_author');
-        $textStyling = $request->input('text_styling', []); // Text styling options
+        $options = [
+            'style' => $request->input('style', 'cinematic'),
+            'custom_prompt' => $request->input('custom_prompt'),
+            'chapter_number' => $request->input('chapter_number'),
+            'with_text' => $request->input('with_text', true),
+            'ai_research' => $request->input('ai_research', false),
+            'use_cover_image' => $request->input('use_cover_image', false),
+            'custom_title' => $request->input('custom_title'),
+            'custom_author' => $request->input('custom_author'),
+            'text_styling' => $request->input('text_styling', []),
+            'override_prompt' => $request->input('override_prompt'),
+        ];
 
-        try {
-            $bookInfo = [
-                'book_id' => $audioBook->id,
-                'title' => $customTitle ?: $audioBook->title,
-                'author' => $customAuthor ?: ($audioBook->author ? 'Tác giả: ' . $audioBook->author : ''),
-                'category' => $audioBook->category,
-                'book_type' => null, // Removed book_type from thumbnail
-                'description' => $audioBook->description,
-                'channel_name' => '', // Removed channel name from thumbnail
-                'cover_image' => $audioBook->cover_image,
-                'text_styling' => $textStyling // Pass text styling options
-            ];
+        // Clear old progress
+        Cache::forget("thumbnail_progress_{$audioBook->id}");
 
-            // If using cover image, create thumbnail from cover with text overlay
-            if ($useCoverImage && $audioBook->cover_image) {
-                $result = $this->imageService->createThumbnailFromCover($bookInfo, $chapterNumber);
+        GenerateThumbnailJob::dispatch($audioBook->id, $options);
 
-                if ($result['success']) {
-                    Log::info("Generated thumbnail from cover for audiobook {$audioBook->id}", [
-                        'path' => $result['path'] ?? null
-                    ]);
-                }
+        return response()->json([
+            'success' => true,
+            'queued' => true,
+            'message' => 'Đã đưa vào hàng đợi xử lý',
+        ]);
+    }
 
-                return response()->json($result);
-            }
+    public function getThumbnailProgress(AudioBook $audioBook)
+    {
+        $progress = Cache::get("thumbnail_progress_{$audioBook->id}");
 
-            // If AI research is enabled, let AI research and create enhanced prompt
-            if ($aiResearch) {
-                $researchResult = $this->imageService->researchAndCreatePrompt($bookInfo);
-                if ($researchResult['success']) {
-                    $customPrompt = $researchResult['prompt'];
-                }
-            }
-
-            // Pass custom prompt as additional context to enhance the thumbnail
-            if ($withText) {
-                // Generate thumbnail with text overlay (title, author, chapter)
-                $result = $this->imageService->generateThumbnailWithText($bookInfo, $style, $chapterNumber, $customPrompt);
-            } else {
-                // Generate thumbnail without text (scene only)
-                $result = $this->imageService->generateThumbnail($bookInfo, $style, $chapterNumber);
-            }
-
-            if ($result['success']) {
-                Log::info("Generated thumbnail for audiobook {$audioBook->id}", [
-                    'style' => $style,
-                    'with_text' => $withText,
-                    'path' => $result['path'] ?? null
-                ]);
-            }
-
-            return response()->json($result);
-        } catch (\Exception $e) {
-            Log::error("Generate thumbnail failed for audiobook {$audioBook->id}: " . $e->getMessage());
-
+        if (!$progress) {
             return response()->json([
-                'success' => false,
-                'error' => $e->getMessage()
-            ], 500);
+                'status' => 'pending',
+                'message' => 'Đang chờ xử lý...',
+            ]);
         }
+
+        return response()->json($progress);
     }
 
     /**

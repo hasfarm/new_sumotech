@@ -1077,7 +1077,7 @@ class AudioBookChapterController extends Controller
             }
 
             // Generate silence file if pause_between_chunks > 0
-            $pauseDuration = (float) ($audioBook->pause_between_chunks ?? 1.0);
+            $pauseDuration = (float) ($audioBook->pause_between_chunks ?? 0);
             $silenceFile = null;
             if ($pauseDuration > 0) {
                 $silenceFile = $outputDir . DIRECTORY_SEPARATOR . "silence_{$chapterNum}.mp3";

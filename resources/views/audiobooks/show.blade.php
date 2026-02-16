@@ -626,30 +626,7 @@
                                                          (Nhanh)</option>
                                                  </select>
                                              </div>
-                                             <div>
-                                                 <label class="block text-xs text-gray-500 mb-1">Nghỉ giữa đoạn</label>
-                                                 <select id="pauseBetweenChunksSelect"
-                                                     class="w-full px-2 py-1.5 border border-gray-300 rounded text-sm focus:border-blue-500 focus:outline-none">
-                                                     <option value="0"
-                                                         {{ ($audioBook->pause_between_chunks ?? 1.0) == 0 ? 'selected' : '' }}>
-                                                         0s (Không nghỉ)</option>
-                                                     <option value="0.5"
-                                                         {{ ($audioBook->pause_between_chunks ?? 1.0) == 0.5 ? 'selected' : '' }}>
-                                                         0.5s</option>
-                                                     <option value="1.0"
-                                                         {{ ($audioBook->pause_between_chunks ?? 1.0) == 1.0 ? 'selected' : '' }}>
-                                                         1.0s</option>
-                                                     <option value="1.5"
-                                                         {{ ($audioBook->pause_between_chunks ?? 1.0) == 1.5 ? 'selected' : '' }}>
-                                                         1.5s</option>
-                                                     <option value="2.0"
-                                                         {{ ($audioBook->pause_between_chunks ?? 1.0) == 2.0 ? 'selected' : '' }}>
-                                                         2.0s</option>
-                                                     <option value="3.0"
-                                                         {{ ($audioBook->pause_between_chunks ?? 1.0) == 3.0 ? 'selected' : '' }}>
-                                                         3.0s</option>
-                                                 </select>
-                                             </div>
+                                             <input type="hidden" id="pauseBetweenChunksSelect" value="0">
                                          </div>
                                      </div>
 
@@ -893,15 +870,23 @@
                                                  </div>
                                              </div>
 
-                                             <!-- Wave Height, Color, Opacity -->
+                                             <!-- Wave Height, Width, Color, Opacity -->
                                              <div class="bg-gray-50 p-3 rounded border border-gray-200 mb-3">
-                                                 <div class="grid grid-cols-3 gap-3">
+                                                 <div class="grid grid-cols-4 gap-3">
                                                      <div>
                                                          <label class="block text-xs font-medium text-gray-600 mb-1">Chiều
                                                              cao (px):</label>
                                                          <input type="number" id="waveHeight" min="50"
                                                              max="300" step="10"
                                                              value="{{ $audioBook->wave_height ?? 100 }}"
+                                                             class="w-full px-2 py-1 border border-gray-300 rounded text-sm">
+                                                     </div>
+                                                     <div>
+                                                         <label class="block text-xs font-medium text-gray-600 mb-1">Độ
+                                                             rộng (%):</label>
+                                                         <input type="number" id="waveWidth" min="20"
+                                                             max="100" step="5"
+                                                             value="{{ $audioBook->wave_width ?? 100 }}"
                                                              class="w-full px-2 py-1 border border-gray-300 rounded text-sm">
                                                      </div>
                                                      <div>
@@ -1126,6 +1111,23 @@
                                          💡 <strong>Không chữ:</strong> AI tạo hình nền → bạn thêm text sau bằng FFmpeg<br>
                                          <strong>AI Vẽ Chữ:</strong> AI tạo hình VÀ vẽ chữ trực tiếp vào hình (1 bước)
                                      </p>
+
+                                     <!-- Prompt Preview/Edit Area -->
+                                     <div id="thumbnailPromptArea" class="hidden mt-3">
+                                         <div class="flex items-center justify-between mb-1">
+                                             <label class="text-xs font-medium text-gray-600">Prompt (chỉnh sửa trước khi tạo):</label>
+                                             <button type="button" id="thumbnailPromptToggle" onclick="document.getElementById('thumbnailPromptTextarea').classList.toggle('hidden')" class="text-xs text-blue-600 hover:underline">Thu gọn/Mở rộng</button>
+                                         </div>
+                                         <textarea id="thumbnailPromptTextarea" rows="8" class="w-full px-3 py-2 border border-gray-300 rounded-lg text-xs font-mono focus:border-blue-500 focus:outline-none resize-y" placeholder="Prompt sẽ hiện ở đây..."></textarea>
+                                         <div class="flex gap-2 mt-2">
+                                             <button type="button" id="thumbnailPromptGenerateBtn" class="flex-1 bg-green-600 hover:bg-green-700 text-white py-2 rounded-lg text-sm font-semibold transition">
+                                                 🚀 Tạo với prompt này
+                                             </button>
+                                             <button type="button" id="thumbnailPromptCancelBtn" onclick="document.getElementById('thumbnailPromptArea').classList.add('hidden')" class="px-4 bg-gray-300 hover:bg-gray-400 text-gray-700 py-2 rounded-lg text-sm font-semibold transition">
+                                                 Hủy
+                                             </button>
+                                         </div>
+                                     </div>
 
                                      <div id="thumbnailStatus" class="text-sm"></div>
                                  </div>
@@ -2945,140 +2947,163 @@
              }
          });
 
-         // Generate Background Image (no text) - Step 1
-         document.getElementById('generateThumbnailBtn')?.addEventListener('click', async function() {
-             const btn = this;
+         // Thumbnail polling helper
+         let thumbnailPollTimer = null;
+         function startThumbnailPolling(statusDiv, btn, btnOriginalText, successCallback) {
+             if (thumbnailPollTimer) clearInterval(thumbnailPollTimer);
+
+             thumbnailPollTimer = setInterval(async () => {
+                 try {
+                     const resp = await fetch(`/audiobooks/${audioBookId}/media/thumbnail-progress`, {
+                         headers: { 'Accept': 'application/json', 'X-CSRF-TOKEN': '{{ csrf_token() }}' }
+                     });
+                     const data = await resp.json();
+
+                     if (data.status === 'processing') {
+                         statusDiv.innerHTML = `<span class="text-blue-600">⏳ ${data.message || 'Đang xử lý...'}</span>`;
+                     } else if (data.status === 'completed') {
+                         clearInterval(thumbnailPollTimer);
+                         thumbnailPollTimer = null;
+                         btn.disabled = false;
+                         btn.innerHTML = btnOriginalText;
+                         successCallback(data.result || {});
+                     } else if (data.status === 'error') {
+                         clearInterval(thumbnailPollTimer);
+                         thumbnailPollTimer = null;
+                         btn.disabled = false;
+                         btn.innerHTML = btnOriginalText;
+                         statusDiv.innerHTML = `<span class="text-red-600">❌ ${data.message || 'Lỗi không xác định'}</span>`;
+                     }
+                 } catch (e) {
+                     // Polling error, keep trying
+                 }
+             }, 2000);
+         }
+
+         // === Thumbnail prompt preview + generate logic ===
+         let pendingThumbnailRequest = null; // stores the request body for "Tạo với prompt này"
+
+         async function fetchAndShowThumbnailPrompt(withText) {
              const style = document.querySelector('input[name="thumbnailStyle"]:checked')?.value || 'cinematic';
              const customPrompt = document.getElementById('thumbnailCustomPrompt')?.value.trim();
-             const aiResearch = document.getElementById('aiResearchOption')?.checked || false;
-             const useCoverImage = document.getElementById('useCoverImageOption')?.checked || false;
-             const statusDiv = document.getElementById('thumbnailStatus');
-
-             btn.disabled = true;
-             btn.innerHTML = '⏳ Đang tạo hình nền...';
-
-             if (useCoverImage) {
-                 statusDiv.innerHTML =
-                     '<span class="text-blue-600">🖼️ Đang xử lý ảnh bìa...</span>';
-             } else if (aiResearch) {
-                 statusDiv.innerHTML =
-                     '<span class="text-blue-600">🔍 AI đang tìm kiếm thông tin và tạo hình nền...</span>';
-             } else {
-                 statusDiv.innerHTML =
-                     '<span class="text-blue-600">🎨 AI đang tạo hình nền với Gemini, vui lòng đợi 30-90 giây...</span>';
-             }
-
-             try {
-                 const requestBody = {
-                     style: style,
-                     with_text: false, // No text - just background image
-                     ai_research: aiResearch,
-                     use_cover_image: useCoverImage
-                 };
-
-                 if (customPrompt) {
-                     requestBody.custom_prompt = customPrompt;
-                 }
-
-                 const response = await fetch('/audiobooks/' + audioBookId + '/media/generate-thumbnail', {
-                     method: 'POST',
-                     headers: {
-                         'Content-Type': 'application/json',
-                         'X-CSRF-TOKEN': '{{ csrf_token() }}'
-                     },
-                     body: JSON.stringify(requestBody)
-                 });
-
-                 const result = await safeJson(response);
-
-                 if (result.success) {
-                     statusDiv.innerHTML =
-                         '<span class="text-green-600">✅ Đã tạo hình nền thành công!</span><br><span class="text-xs text-indigo-600">👆 Chọn hình từ gallery bên dưới và nhấn "✏️ Thêm Text" để thêm chữ</span>';
-                     refreshMediaGallery();
-                 } else {
-                     throw new Error(result.error || 'Không thể tạo hình nền');
-                 }
-             } catch (error) {
-                 statusDiv.innerHTML = `<span class="text-red-600">❌ ${error.message}</span>`;
-             } finally {
-                 btn.disabled = false;
-                 btn.innerHTML = '🖼️ Tạo Hình Nền (Không chữ)';
-             }
-         });
-
-         // Generate Thumbnail WITH Text - AI renders text directly in image
-         document.getElementById('generateThumbnailWithTextBtn')?.addEventListener('click', async function() {
-             const btn = this;
-             const style = document.querySelector('input[name="thumbnailStyle"]:checked')?.value || 'cinematic';
-             const customPrompt = document.getElementById('thumbnailCustomPrompt')?.value.trim();
-             const aiResearch = document.getElementById('aiResearchOption')?.checked || false;
-             // IGNORE use_cover_image when generating AI text - we want AI to create image WITH text
-             // const useCoverImage = document.getElementById('useCoverImageOption')?.checked || false;
              const customTitle = document.getElementById('thumbnailTitle')?.value.trim();
              const customAuthor = document.getElementById('thumbnailAuthor')?.value.trim();
              const chapterNumber = document.getElementById('thumbnailChapterNumber')?.value || null;
              const statusDiv = document.getElementById('thumbnailStatus');
+             const promptArea = document.getElementById('thumbnailPromptArea');
+             const promptTextarea = document.getElementById('thumbnailPromptTextarea');
 
-             // Validate title
-             if (!customTitle) {
+             if (withText && !customTitle) {
                  statusDiv.innerHTML = '<span class="text-red-600">❌ Vui lòng nhập tiêu đề sách!</span>';
                  return;
              }
 
-             btn.disabled = true;
-             btn.innerHTML = '⏳ AI đang vẽ thumbnail có chữ...';
-
-             statusDiv.innerHTML =
-                 `<span class="text-blue-600">✨ AI đang tạo hình VÀ vẽ chữ "<strong>${customTitle}</strong>" trực tiếp vào hình...</span><br><span class="text-xs text-gray-500">⚠️ LƯU Ý: AI có thể không vẽ text chính xác 100%. Nếu text sai/xấu, hãy dùng cách tạo hình nền rồi thêm text bằng FFmpeg.</span>`;
+             statusDiv.innerHTML = '<span class="text-blue-600">⏳ Đang tạo prompt...</span>';
 
              try {
-                 const requestBody = {
-                     style: style,
-                     with_text: true, // AI will render text directly
-                     ai_research: aiResearch,
-                     use_cover_image: false, // ALWAYS false for AI text generation
-                     custom_title: customTitle,
-                     custom_author: customAuthor
-                 };
+                 const previewBody = { style, with_text: withText };
+                 if (customPrompt) previewBody.custom_prompt = customPrompt;
+                 if (customTitle) previewBody.custom_title = customTitle;
+                 if (customAuthor) previewBody.custom_author = customAuthor;
+                 if (chapterNumber) previewBody.chapter_number = parseInt(chapterNumber);
 
-                 if (chapterNumber) {
-                     requestBody.chapter_number = parseInt(chapterNumber);
-                 }
-
-                 if (customPrompt) {
-                     requestBody.custom_prompt = customPrompt;
-                 }
-
-                 const response = await fetch(`/audiobooks/${audioBookId}/media/generate-thumbnail`, {
+                 const resp = await fetch(`/audiobooks/${audioBookId}/media/preview-thumbnail-prompt`, {
                      method: 'POST',
-                     headers: {
-                         'Content-Type': 'application/json',
-                         'X-CSRF-TOKEN': '{{ csrf_token() }}'
-                     },
-                     body: JSON.stringify(requestBody)
+                     headers: { 'Content-Type': 'application/json', 'X-CSRF-TOKEN': '{{ csrf_token() }}' },
+                     body: JSON.stringify(previewBody)
                  });
+                 const data = await safeJson(resp);
 
-                 const result = await safeJson(response);
+                 if (data.success && data.prompt) {
+                     promptTextarea.value = data.prompt;
+                     promptArea.classList.remove('hidden');
+                     statusDiv.innerHTML = '<span class="text-gray-600">📝 Xem và chỉnh sửa prompt bên dưới, sau đó nhấn "Tạo với prompt này"</span>';
 
-                 if (result.success) {
-                     let msg = '<span class="text-green-600">✅ Đã tạo thumbnail!</span>';
-                     if (result.ai_text) {
-                         msg +=
-                             '<br><span class="text-xs text-indigo-600">🎨 AI đã cố gắng vẽ chữ vào hình</span>';
-                         msg +=
-                             '<br><span class="text-xs text-orange-600">⚠️ Nếu chữ không đẹp/sai, hãy dùng phương pháp FFmpeg thêm chữ</span>';
-                     }
-                     statusDiv.innerHTML = msg;
-                     refreshMediaGallery();
-                 } else {
-                     throw new Error(result.error || 'Không thể tạo thumbnail');
+                     // Store request params for the generate button
+                     const aiResearch = document.getElementById('aiResearchOption')?.checked || false;
+                     const useCoverImage = document.getElementById('useCoverImageOption')?.checked || false;
+                     pendingThumbnailRequest = {
+                         style, with_text: withText, ai_research: aiResearch,
+                         use_cover_image: withText ? false : useCoverImage,
+                     };
+                     if (customTitle) pendingThumbnailRequest.custom_title = customTitle;
+                     if (customAuthor) pendingThumbnailRequest.custom_author = customAuthor;
+                     if (chapterNumber) pendingThumbnailRequest.chapter_number = parseInt(chapterNumber);
+                     if (customPrompt) pendingThumbnailRequest.custom_prompt = customPrompt;
                  }
              } catch (error) {
                  statusDiv.innerHTML = `<span class="text-red-600">❌ ${error.message}</span>`;
-             } finally {
-                 btn.disabled = false;
-                 btn.innerHTML = '✨ Tạo Thumbnail (AI Vẽ Chữ Luôn)';
              }
+         }
+
+         async function executeThumbnailGenerate() {
+             if (!pendingThumbnailRequest) return;
+             const statusDiv = document.getElementById('thumbnailStatus');
+             const promptArea = document.getElementById('thumbnailPromptArea');
+             const promptTextarea = document.getElementById('thumbnailPromptTextarea');
+             const generateBtn = document.getElementById('thumbnailPromptGenerateBtn');
+             const withText = pendingThumbnailRequest.with_text;
+             const btnOriginalText = withText ? '✨ Tạo Thumbnail (AI Vẽ Chữ Luôn)' : '🖼️ Tạo Hình Nền (Không chữ)';
+             const originalBtn = withText
+                 ? document.getElementById('generateThumbnailWithTextBtn')
+                 : document.getElementById('generateThumbnailBtn');
+
+             generateBtn.disabled = true;
+             generateBtn.innerHTML = '⏳ Đang gửi...';
+
+             const requestBody = { ...pendingThumbnailRequest, override_prompt: promptTextarea.value };
+
+             try {
+                 const response = await fetch(`/audiobooks/${audioBookId}/media/generate-thumbnail`, {
+                     method: 'POST',
+                     headers: { 'Content-Type': 'application/json', 'X-CSRF-TOKEN': '{{ csrf_token() }}' },
+                     body: JSON.stringify(requestBody)
+                 });
+                 const result = await safeJson(response);
+
+                 if (result.queued) {
+                     promptArea.classList.add('hidden');
+                     if (originalBtn) { originalBtn.disabled = true; originalBtn.innerHTML = '⏳ Đang xử lý...'; }
+
+                     const successCb = withText
+                         ? function(jobResult) {
+                             let msg = '<span class="text-green-600">✅ Đã tạo thumbnail!</span>';
+                             if (jobResult.ai_text) {
+                                 msg += '<br><span class="text-xs text-indigo-600">🎨 AI đã cố gắng vẽ chữ vào hình</span>';
+                                 msg += '<br><span class="text-xs text-orange-600">⚠️ Nếu chữ không đẹp/sai, hãy dùng phương pháp FFmpeg thêm chữ</span>';
+                             }
+                             statusDiv.innerHTML = msg;
+                             refreshMediaGallery();
+                         }
+                         : function() {
+                             statusDiv.innerHTML = '<span class="text-green-600">✅ Đã tạo hình nền thành công!</span><br><span class="text-xs text-indigo-600">👆 Chọn hình từ gallery bên dưới và nhấn "✏️ Thêm Text" để thêm chữ</span>';
+                             refreshMediaGallery();
+                         };
+
+                     startThumbnailPolling(statusDiv, originalBtn || generateBtn, btnOriginalText, successCb);
+                 } else {
+                     throw new Error(result.error || 'Không thể tạo');
+                 }
+             } catch (error) {
+                 statusDiv.innerHTML = `<span class="text-red-600">❌ ${error.message}</span>`;
+                 generateBtn.disabled = false;
+                 generateBtn.innerHTML = '🚀 Tạo với prompt này';
+             }
+         }
+
+         // Generate Background Image (no text) - shows prompt preview first
+         document.getElementById('generateThumbnailBtn')?.addEventListener('click', function() {
+             fetchAndShowThumbnailPrompt(false);
+         });
+
+         // Generate Thumbnail WITH Text - shows prompt preview first
+         document.getElementById('generateThumbnailWithTextBtn')?.addEventListener('click', function() {
+             fetchAndShowThumbnailPrompt(true);
+         });
+
+         // "Tạo với prompt này" button
+         document.getElementById('thumbnailPromptGenerateBtn')?.addEventListener('click', function() {
+             executeThumbnailGenerate();
          });
 
          // ========== SCENE GENERATION - 2-STEP FLOW ==========
@@ -3626,12 +3651,40 @@
             `).join('');
          }
 
-         // Create Animation with Kling AI
+         // Create Animation with Kling AI - show prompt dialog first
          window.createAnimation = async function(imageName) {
-             const confirmed = confirm(
-                 `Tạo animation cho ảnh "${imageName}"?\n\nKling AI sẽ tạo hiệu ứng chuyển động nhẹ (khói, ánh sáng, chớp mắt...)\n\nQuá trình này có thể mất 1-3 phút.`
-             );
-             if (!confirmed) return;
+             const defaultPrompt = "Subtle ambient animation with gentle movements: soft smoke or mist drifting slowly, flickering candlelight or lamp glow, slight hair or fabric movement from breeze, gentle eye blinking, subtle breathing motion. Keep the scene peaceful and dreamy, suitable for audiobook background.";
+
+             // Show modal with prompt editor
+             const modal = document.createElement('div');
+             modal.id = 'animationPromptModal';
+             modal.className = 'fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50';
+             modal.innerHTML = `
+                <div class="bg-white rounded-xl shadow-2xl p-6 max-w-lg w-full mx-4">
+                    <h3 class="text-lg font-semibold text-gray-800 mb-2">✨ Animation Prompt</h3>
+                    <p class="text-sm text-gray-500 mb-3">Ảnh: <strong>${imageName}</strong></p>
+                    <textarea id="animationPromptInput" rows="6" class="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm font-mono focus:border-green-500 focus:outline-none resize-y mb-3">${defaultPrompt}</textarea>
+                    <div class="flex gap-2">
+                        <button id="animationPromptStartBtn" class="flex-1 bg-green-600 hover:bg-green-700 text-white py-2.5 rounded-lg font-semibold transition">🚀 Tạo Animation</button>
+                        <button id="animationPromptCancelBtn" class="px-4 bg-gray-300 hover:bg-gray-400 text-gray-700 py-2.5 rounded-lg font-semibold transition">Hủy</button>
+                    </div>
+                    <p class="text-xs text-gray-400 mt-2">⏱️ Quá trình có thể mất 1-3 phút</p>
+                </div>
+            `;
+             document.body.appendChild(modal);
+
+             // Wait for user action
+             const userPrompt = await new Promise((resolve) => {
+                 document.getElementById('animationPromptCancelBtn').addEventListener('click', () => { modal.remove(); resolve(null); });
+                 modal.addEventListener('click', (e) => { if (e.target === modal) { modal.remove(); resolve(null); } });
+                 document.getElementById('animationPromptStartBtn').addEventListener('click', () => {
+                     const val = document.getElementById('animationPromptInput').value.trim();
+                     modal.remove();
+                     resolve(val || defaultPrompt);
+                 });
+             });
+
+             if (!userPrompt) return;
 
              const statusDiv = document.createElement('div');
              statusDiv.id = 'animationStatus';
@@ -3657,7 +3710,8 @@
                          'Accept': 'application/json'
                      },
                      body: JSON.stringify({
-                         image_name: imageName
+                         image_name: imageName,
+                         prompt: userPrompt
                      })
                  });
 
@@ -4569,6 +4623,7 @@
                  wave_position: document.querySelector('input[name="wavePosition"]:checked')?.value ||
                      'bottom',
                  wave_height: parseInt(document.getElementById('waveHeight')?.value || 100),
+                 wave_width: parseInt(document.getElementById('waveWidth')?.value || 100),
                  wave_color: document.getElementById('waveColor')?.value || '#00ff00',
                  wave_opacity: parseFloat(document.getElementById('waveOpacity')?.value || 0.8)
              };

@@ -495,7 +495,10 @@ class FFmpegStandardService
         $waveColor = $settings['color'] ?? 'white';
         $wavePosition = $settings['position'] ?? 'bottom';
         $waveHeight = $settings['height'] ?? 100;
+        $waveWidthPercent = (int) ($settings['width_percent'] ?? 100);
         $opacity = $settings['opacity'] ?? 0.8;
+
+        $wavePixelWidth = (int) ($width * $waveWidthPercent / 100);
 
         // Position calculation
         $y = match ($wavePosition) {
@@ -507,7 +510,7 @@ class FFmpegStandardService
 
         return sprintf(
             "showwaves=s=%dx%d:mode=%s:colors=%s@%.2f:scale=sqrt:y=%s",
-            $width,
+            $wavePixelWidth,
             $waveHeight,
             $waveType,
             $waveColor,

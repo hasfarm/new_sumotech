@@ -351,7 +351,7 @@ class AudiobookAutoProcessor
             }
 
             // Generate silence if configured
-            $pauseDuration = (float) ($audioBook->pause_between_chunks ?? 1.0);
+            $pauseDuration = (float) ($audioBook->pause_between_chunks ?? 0);
             $silenceFile = null;
             if ($pauseDuration > 0) {
                 $silenceFile = $outputDir . DIRECTORY_SEPARATOR . "silence_{$chapterNum}.mp3";
@@ -705,8 +705,12 @@ class AudiobookAutoProcessor
             $waveType = $waveTypeMap[$rawWaveType] ?? 'cline';
             $wavePosition = $audioBook->wave_position ?? 'bottom';
             $waveHeight = $audioBook->wave_height ?? 100;
+            $waveWidthPercent = (int) ($audioBook->wave_width ?? 100);
             $waveColor = ltrim($audioBook->wave_color ?? '#00ff00', '#');
             $waveOpacity = $audioBook->wave_opacity ?? 0.8;
+
+            $wavePixelWidth = (int) ($videoWidth * $waveWidthPercent / 100);
+            $waveX = (int) (($videoWidth - $wavePixelWidth) / 2);
 
             $waveY = match ($wavePosition) {
                 'top' => 20,
@@ -715,8 +719,8 @@ class AudiobookAutoProcessor
             };
 
             $filterComplex = sprintf(
-                '[0:v]%s[bg];[1:a]showwaves=s=%dx%d:mode=%s:colors=0x%s@%.1f:rate=15[wave];[bg][wave]overlay=0:%d:format=auto[out]',
-                $baseFilter, $videoWidth, $waveHeight, $waveType, $waveColor, $waveOpacity, $waveY
+                '[0:v]%s[bg];[1:a]showwaves=s=%dx%d:mode=%s:colors=0x%s@%.1f:rate=15[wave];[bg][wave]overlay=%d:%d:format=auto[out]',
+                $baseFilter, $wavePixelWidth, $waveHeight, $waveType, $waveColor, $waveOpacity, $waveX, $waveY
             );
 
             $command = sprintf(

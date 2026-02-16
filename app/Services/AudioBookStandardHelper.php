@@ -150,6 +150,7 @@ class AudioBookStandardHelper
                 'color' => $audioBook->wave_color ?? 'white',
                 'position' => $audioBook->wave_position ?? 'bottom',
                 'height' => $audioBook->wave_height ?? 100,
+                'width_percent' => $audioBook->wave_width ?? 100,
                 'opacity' => $audioBook->wave_opacity ?? 0.8
             ];
         }
