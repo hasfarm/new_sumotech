@@ -67,11 +67,24 @@
                             <div class="mb-2 text-xs text-gray-600">
                                 ⚠️ Nếu bạn thay đổi nội dung, tất cả các đoạn TTS cũ sẽ bị xóa và phải tạo lại
                             </div>
+
+                            <!-- TTS Preview bar (appears when text is selected) -->
+                            <div id="ttsPreviewBar"
+                                class="hidden mb-2 flex items-center gap-3 bg-yellow-50 border border-yellow-300 rounded-lg px-3 py-2">
+                                <span class="text-xs text-yellow-800">🔊 Đã chọn <strong id="previewSelLen">0</strong> ký tự</span>
+                                <button type="button" id="ttsPreviewBtn" onclick="previewSelectedText()"
+                                    class="bg-yellow-500 hover:bg-yellow-600 text-white text-xs font-semibold px-3 py-1 rounded transition">
+                                    Nghe thử
+                                </button>
+                                <span id="ttsPreviewStatus" class="text-xs text-gray-500 hidden"></span>
+                                <audio id="ttsPreviewAudio" controls class="hidden h-7 flex-1"></audio>
+                            </div>
+
                             <textarea id="contentInput" name="content" rows="15"
                                 class="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm font-mono @error('content') border-red-500 @enderror"
                                 required>{{ $chapter->content }}</textarea>
                             <p class="text-xs text-gray-500 mt-2">
-                                📊 <span id="charCount">0</span> ký tự
+                                📊 <span id="charCount">0</span> ký tự — <span class="text-gray-400">Bôi đen đoạn văn bản để nghe thử TTS</span>
                             </p>
                             @error('content')
                                 <p class="text-red-500 text-xs mt-1">{{ $message }}</p>
@@ -179,5 +192,93 @@
 
         // Trigger on load
         charCount.textContent = contentInput.value.length.toLocaleString('vi-VN');
+
+        // ── TTS Preview on text selection ──────────────────────────────────
+        const previewBar    = document.getElementById('ttsPreviewBar');
+        const previewSelLen = document.getElementById('previewSelLen');
+        const previewStatus = document.getElementById('ttsPreviewStatus');
+        const previewAudio  = document.getElementById('ttsPreviewAudio');
+        const previewBtn    = document.getElementById('ttsPreviewBtn');
+        const MAX_PREVIEW   = 500;
+
+        function updatePreviewBar() {
+            const start = contentInput.selectionStart;
+            const end   = contentInput.selectionEnd;
+            const len   = end - start;
+            if (len > 0) {
+                previewSelLen.textContent = Math.min(len, MAX_PREVIEW);
+                previewBar.classList.remove('hidden');
+                // Reset audio when selection changes
+                previewAudio.classList.add('hidden');
+                previewAudio.src = '';
+                previewStatus.classList.add('hidden');
+                previewBtn.disabled = false;
+                previewBtn.textContent = 'Nghe thử';
+            } else {
+                previewBar.classList.add('hidden');
+            }
+        }
+
+        contentInput.addEventListener('mouseup', updatePreviewBar);
+        contentInput.addEventListener('keyup', function(e) {
+            if (e.shiftKey || e.key === 'End' || e.key === 'Home' || e.key.startsWith('Arrow')) {
+                updatePreviewBar();
+            }
+        });
+
+        async function previewSelectedText() {
+            const start = contentInput.selectionStart;
+            const end   = contentInput.selectionEnd;
+            if (start === end) return;
+
+            const selectedText = contentInput.value.substring(start, end).substring(0, MAX_PREVIEW);
+            const voiceName    = document.querySelector('[name="tts_voice"]')?.value   ?? '{{ $chapter->tts_voice }}';
+            const speedVal     = document.querySelector('[name="tts_speed"]')?.value   ?? '{{ $audioBook->tts_speed ?? 1.0 }}';
+            const provider     = '{{ $audioBook->tts_provider ?? "microsoft" }}';
+            const gender       = '{{ $audioBook->tts_voice_gender ?? "female" }}';
+
+            previewBtn.disabled    = true;
+            previewBtn.textContent = '⏳';
+            previewStatus.textContent = 'Đang tạo audio...';
+            previewStatus.classList.remove('hidden');
+            previewAudio.classList.add('hidden');
+
+            try {
+                const resp = await fetch('{{ route("audiobooks.chapters.tts-preview", [$audioBook, $chapter]) }}', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-CSRF-TOKEN': document.querySelector('meta[name="csrf-token"]').content,
+                        'Accept': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        text:         selectedText,
+                        voice_name:   voiceName,
+                        voice_gender: gender,
+                        provider:     provider,
+                        speed:        parseFloat(speedVal),
+                    }),
+                });
+
+                const result = await resp.json();
+
+                if (result.success && result.audio_b64) {
+                    previewStatus.classList.add('hidden');
+                    const src = `data:${result.mime_type};base64,${result.audio_b64}`;
+                    previewAudio.src = src;
+                    previewAudio.classList.remove('hidden');
+                    previewAudio.play().catch(err => {
+                        if (err.name !== 'AbortError') console.error('Playback error:', err);
+                    });
+                } else {
+                    previewStatus.textContent = '❌ ' + (result.error ?? 'Có lỗi xảy ra');
+                }
+            } catch (e) {
+                previewStatus.textContent = '❌ Lỗi kết nối: ' + e.message;
+            } finally {
+                previewBtn.disabled    = false;
+                previewBtn.textContent = 'Nghe thử';
+            }
+        }
     </script>
 @endsection

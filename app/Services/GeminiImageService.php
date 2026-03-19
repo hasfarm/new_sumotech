@@ -10,7 +10,7 @@ use Illuminate\Support\Facades\Storage;
 class GeminiImageService
 {
     private Client $client;
-    private string $apiKey;
+    private ?string $apiKey;
 
     public function __construct()
     {
@@ -19,7 +19,7 @@ class GeminiImageService
             'connect_timeout' => 30,
         ]);
         // Sử dụng GEMINI_TTS_API_KEY cho Nano Banana Pro (image generation)
-        $this->apiKey = env('GEMINI_TTS_API_KEY') ?: config('services.gemini.api_key') ?: env('GEMINI_API_KEY');
+        $this->apiKey = config('services.gemini.tts_api_key') ?: config('services.gemini.api_key');
     }
 
     /**
@@ -31,8 +31,13 @@ class GeminiImageService
      * @param string $aspectRatio Aspect ratio: "1:1", "16:9", "9:16", "4:3", "3:4"
      * @return array{success: bool, path?: string, error?: string}
      */
-    public function generateImage(string $prompt, string $outputPath, string $aspectRatio = '16:9'): array
+    public function generateImage(string $prompt, string $outputPath, string $aspectRatio = '16:9', string $provider = 'gemini'): array
     {
+        $provider = strtolower(trim($provider));
+        if ($provider === 'flux') {
+            return app(FluxImageService::class)->generateImage($prompt, $outputPath, $aspectRatio);
+        }
+
         if (empty($this->apiKey)) {
             return [
                 'success' => false,
@@ -50,8 +55,18 @@ class GeminiImageService
             $result = $this->generateWithGeminiNative($prompt, $aspectRatio);
 
             if (!$result['success']) {
-                // Fallback to Gemini Flash
-                Log::info('GeminiImageService: Falling back to Gemini Flash');
+                // Fallback to Imagen 3
+                Log::info('GeminiImageService: Gemini Native failed, falling back to Imagen 3', [
+                    'reason' => $result['error'] ?? 'unknown'
+                ]);
+                $result = $this->generateWithImagen3($prompt, $aspectRatio);
+            }
+
+            if (!$result['success']) {
+                // Last resort: Gemini Flash
+                Log::info('GeminiImageService: Imagen 3 failed, falling back to Gemini Flash', [
+                    'reason' => $result['error'] ?? 'unknown'
+                ]);
                 $result = $this->generateWithGeminiFlash($prompt);
             }
 
@@ -88,6 +103,42 @@ class GeminiImageService
                 'error' => $e->getMessage()
             ];
         }
+    }
+
+    /**
+     * Generate vertical short image using the same AI pipeline as thumbnails
+     * (Gemini Native / Nano Banana Pro first, then fallback).
+     *
+     * @param string $conceptPrompt Core concept prompt for the short scene
+     * @param string $outputPath Path to save generated image
+     * @return array{success: bool, path?: string, error?: string}
+     */
+    public function generateShortVerticalImage(string $conceptPrompt, string $outputPath, string $provider = 'gemini'): array
+    {
+        $conceptPrompt = trim($conceptPrompt);
+        if ($conceptPrompt === '') {
+            return [
+                'success' => false,
+                'error' => 'Thiếu prompt để tạo ảnh short.'
+            ];
+        }
+
+        $prompt = "Create a premium vertical 9:16 cinematic image for YouTube Shorts / TikTok.\n\n";
+        $prompt .= "Core scene: {$conceptPrompt}\n\n";
+        $prompt .= "Requirements:\n";
+        $prompt .= "- Vertical composition optimized for mobile viewing (9:16)\n";
+        $prompt .= "- Strong subject focus, high contrast, dramatic cinematic lighting\n";
+        $prompt .= "- Rich detail, depth, and visual storytelling\n";
+        $prompt .= "- Keep center area clear and readable for possible captions\n";
+        $prompt .= "- NO text, NO letters, NO watermark, NO logo\n";
+        $prompt .= "- Professional quality, click-worthy thumbnail-like visual impact\n";
+
+        Log::info('GeminiImageService: Generating short vertical image with thumbnail-like pipeline', [
+            'aspectRatio' => '9:16',
+            'prompt_preview' => mb_substr($conceptPrompt, 0, 180),
+        ]);
+
+        return $this->generateImage($prompt, $outputPath, '9:16', $provider);
     }
 
     /**
@@ -774,12 +825,12 @@ class GeminiImageService
     }
 
     /**
-     * Generate image using Gemini 3 Pro Image (fallback)
+     * Generate image using Gemini 2.0 Flash (last resort fallback)
      */
     private function generateWithGeminiFlash(string $prompt): array
     {
         try {
-            $url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-pro-image-preview:generateContent?key={$this->apiKey}";
+            $url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-preview-image-generation:generateContent?key={$this->apiKey}";
 
             $response = $this->client->post($url, [
                 'headers' => [
@@ -849,6 +900,7 @@ class GeminiImageService
     public function buildThumbnailPrompt(array $bookInfo, string $style = 'cinematic', ?string $customPrompt = null): string
     {
         $category = $bookInfo['category'] ?? '';
+        $preferPortrait = (bool)($bookInfo['prefer_portrait'] ?? true);
 
         $stylePrompts = [
             'cinematic' => 'cinematic movie scene, dramatic lighting, dark moody atmospheric, film noir aesthetic',
@@ -890,6 +942,20 @@ class GeminiImageService
         $prompt .= "- Rich colors and lighting\n";
         $prompt .= "- Professional composition\n\n";
 
+        if ($preferPortrait) {
+            $prompt .= "PRIMARY SUBJECT (Very Important):\n";
+            $prompt .= "- The MAIN CHARACTER/protagonist as a HUMAN portrait\n";
+            $prompt .= "- Head-and-shoulders framing, FACE FRONT, eye contact with camera\n";
+            $prompt .= "- Camera angle straight-on (no tilt), eye-level, front-facing\n";
+            $prompt .= "- Subject centered or on the LEFT THIRD; keep RIGHT side cleaner for potential text overlay\n";
+            $prompt .= "- High-detail skin, eyes, and facial expression; cinematic rim/back light\n\n";
+
+            $prompt .= "NEGATIVE CONSTRAINTS for subject (must avoid):\n";
+            $prompt .= "- No profile/side view, no back view, no looking away\n";
+            $prompt .= "- No masks/helmets/covered faces, no motion blur on face\n";
+            $prompt .= "- No groups/crowds; exactly ONE person as the focal subject\n\n";
+        }
+
         $prompt .= "STRICTLY FORBIDDEN - WILL BE REJECTED IF PRESENT:\n";
         $prompt .= "- ANY text in ANY language (English, Vietnamese, Chinese, Japanese, etc.)\n";
         $prompt .= "- ANY letters or alphabets\n";
@@ -909,6 +975,7 @@ class GeminiImageService
         $title = $bookInfo['title'] ?? 'Audiobook';
         $author = $bookInfo['author'] ?? '';
         $category = $bookInfo['category'] ?? '';
+        $preferPortrait = (bool)($bookInfo['prefer_portrait'] ?? true);
 
         $stylePrompts = [
             'cinematic' => 'cinematic movie poster style with dramatic lighting',
@@ -944,11 +1011,21 @@ class GeminiImageService
             $prompt .= "THEME/GENRE: {$category}\n\n";
         }
 
+        if ($preferPortrait) {
+            $prompt .= "PRIMARY VISUAL SUBJECT (Very Important):\n";
+            $prompt .= "• The MAIN CHARACTER/protagonist as a HUMAN portrait, head-and-shoulders, FRONT-FACING, eye contact\n";
+            $prompt .= "• Place character on the LEFT THIRD; reserve CLEAN SPACE on the RIGHT for the title text\n";
+            $prompt .= "• Eye-level straight camera, high-detail face with dramatic lighting\n\n";
+
+            $prompt .= "NEGATIVE CONSTRAINTS (avoid):\n";
+            $prompt .= "• No side view/profile/back view; no covered/obscured faces; no groups\n\n";
+        }
+
         $prompt .= "TEXT RENDERING REQUIREMENTS:\n";
         $prompt .= "• The title \"{$title}\" MUST be rendered as ACTUAL TEXT in the image\n";
         $prompt .= "• Text must be WHITE or YELLOW with BLACK OUTLINE/SHADOW for readability\n";
         $prompt .= "• Font style: Bold, blocky, movie-poster style\n";
-        $prompt .= "• Text position: Lower third of the image (banner area)\n";
+        $prompt .= "• Text position: Right of the image (use the reserved clean space)\n";
         $prompt .= "• Text must be perfectly spelled - copy exactly as provided\n";
         $prompt .= "• Do NOT blur, distort, or partially hide the text\n";
         $prompt .= "• Make the text the FOCAL POINT of the thumbnail\n\n";
@@ -957,7 +1034,7 @@ class GeminiImageService
         return $prompt;
     }
 
-    public function generateThumbnail(array $bookInfo, string $style = 'cinematic', ?int $chapterNumber = null, ?string $customPrompt = null, ?string $overridePrompt = null): array
+    public function generateThumbnail(array $bookInfo, string $style = 'cinematic', ?int $chapterNumber = null, ?string $customPrompt = null, ?string $overridePrompt = null, string $provider = 'gemini'): array
     {
         $bookId = $bookInfo['book_id'] ?? 0;
 
@@ -975,7 +1052,7 @@ class GeminiImageService
         $bgOutputPath = $outputDir . DIRECTORY_SEPARATOR . $bgFilename;
 
         // Generate background image with Gemini
-        $result = $this->generateImage($prompt, $bgOutputPath, '16:9');
+        $result = $this->generateImage($prompt, $bgOutputPath, '16:9', $provider);
 
         if (!$result['success']) {
             return $result;
@@ -1001,12 +1078,12 @@ class GeminiImageService
      * @param int|null $chapterNumber Chapter number for chapter-specific thumbnails
      * @return array
      */
-    public function generateThumbnailWithText(array $bookInfo, string $style = 'cinematic', ?int $chapterNumber = null, ?string $customPrompt = null, ?string $overridePrompt = null): array
+    public function generateThumbnailWithText(array $bookInfo, string $style = 'cinematic', ?int $chapterNumber = null, ?string $customPrompt = null, ?string $overridePrompt = null, string $provider = 'gemini'): array
     {
-        return $this->generateThumbnailWithAIText($bookInfo, $style, $chapterNumber, $customPrompt, $overridePrompt);
+        return $this->generateThumbnailWithAIText($bookInfo, $style, $chapterNumber, $customPrompt, $overridePrompt, $provider);
     }
 
-    public function generateThumbnailWithAIText(array $bookInfo, string $style = 'cinematic', ?int $chapterNumber = null, ?string $customPrompt = null, ?string $overridePrompt = null): array
+    public function generateThumbnailWithAIText(array $bookInfo, string $style = 'cinematic', ?int $chapterNumber = null, ?string $customPrompt = null, ?string $overridePrompt = null, string $provider = 'gemini'): array
     {
         $title = $bookInfo['title'] ?? 'Audiobook';
         $author = $bookInfo['author'] ?? '';
@@ -1038,7 +1115,7 @@ class GeminiImageService
         ]);
 
         // Generate image with Gemini (text included by AI)
-        $result = $this->generateImage($prompt, $outputPath, '16:9');
+        $result = $this->generateImage($prompt, $outputPath, '16:9', $provider);
 
         if (!$result['success']) {
             Log::error('GeminiImageService: Failed to generate thumbnail with AI text', [
@@ -1078,7 +1155,7 @@ class GeminiImageService
      * @param string|null $customPrompt Custom scene description
      * @return array
      */
-    public function generateThumbnailWithFFmpegText(array $bookInfo, string $style = 'cinematic', ?int $chapterNumber = null, ?string $customPrompt = null): array
+    public function generateThumbnailWithFFmpegText(array $bookInfo, string $style = 'cinematic', ?int $chapterNumber = null, ?string $customPrompt = null, string $provider = 'gemini'): array
     {
         $title = $bookInfo['title'] ?? 'Audiobook';
         $author = $bookInfo['author'] ?? '';
@@ -1165,7 +1242,7 @@ class GeminiImageService
         $bgOutputPath = $outputDir . DIRECTORY_SEPARATOR . $bgFilename;
 
         // Generate background image with Gemini
-        $result = $this->generateImage($prompt, $bgOutputPath, '16:9');
+        $result = $this->generateImage($prompt, $bgOutputPath, '16:9', $provider);
 
         if (!$result['success']) {
             return $result;
@@ -1219,7 +1296,7 @@ class GeminiImageService
      */
     private function addTextOverlayWithFFmpeg(string $inputPath, string $outputPath, array $textElements, array $styling = []): array
     {
-        $ffmpegPath = env('FFMPEG_PATH', 'ffmpeg');
+        $ffmpegPath = config('services.ffmpeg.path', 'ffmpeg');
 
         // Extract styling options with defaults
         $position = $styling['position'] ?? 'bottom';
@@ -1563,7 +1640,7 @@ class GeminiImageService
             return [];
         }
 
-        $apiKey = env('GEMINI_API_KEY');
+        $apiKey = config('services.gemini.api_key');
         if (!$apiKey) {
             \Log::error("GEMINI_API_KEY not configured");
             // Fallback with default count if not provided
@@ -1881,15 +1958,24 @@ class GeminiImageService
 
         $thumbDir = $baseDir . '/thumbnails';
         if (is_dir($thumbDir)) {
-            $files = glob($thumbDir . '/*.{png,jpg,jpeg,webp}', GLOB_BRACE);
+            $files = glob($thumbDir . '/*.{png,jpg,jpeg,webp}', GLOB_BRACE) ?: [];
             foreach ($files as $file) {
+                if (!is_file($file) || !is_readable($file)) {
+                    continue;
+                }
+
+                $createdAt = @filemtime($file);
+                if ($createdAt === false) {
+                    continue;
+                }
+
                 $filename = basename($file);
                 $relativePath = 'books/' . $bookId . '/thumbnails/' . $filename;
                 $media['thumbnails'][] = [
                     'filename' => $filename,
                     'path' => $relativePath,
                     'url' => asset('storage/' . $relativePath),
-                    'created_at' => filemtime($file)
+                    'created_at' => $createdAt
                 ];
             }
             // Sort by newest first
@@ -1898,16 +1984,28 @@ class GeminiImageService
 
         $scenesDir = $baseDir . '/scenes';
         if (is_dir($scenesDir)) {
-            $files = glob($scenesDir . '/*.{png,jpg,jpeg,webp}', GLOB_BRACE);
+            $files = glob($scenesDir . '/*.{png,jpg,jpeg,webp}', GLOB_BRACE) ?: [];
             foreach ($files as $file) {
+                if (!is_file($file) || !is_readable($file)) {
+                    continue;
+                }
+
+                $createdAt = @filemtime($file);
+                if ($createdAt === false) {
+                    continue;
+                }
+
                 $filename = basename($file);
                 $relativePath = 'books/' . $bookId . '/scenes/' . $filename;
 
                 // Try to load metadata
                 $metadataFile = str_replace(['.png', '.jpg', '.jpeg', '.webp'], '.json', $file);
                 $metadata = null;
-                if (file_exists($metadataFile)) {
-                    $metadata = json_decode(file_get_contents($metadataFile), true);
+                if (file_exists($metadataFile) && is_readable($metadataFile)) {
+                    $metadataRaw = @file_get_contents($metadataFile);
+                    if ($metadataRaw !== false) {
+                        $metadata = json_decode($metadataRaw, true);
+                    }
                 }
 
                 $media['scenes'][] = [
@@ -1917,7 +2015,7 @@ class GeminiImageService
                     'title' => $metadata['title'] ?? null,
                     'description' => $metadata['description'] ?? null,
                     'scene_number' => $metadata['scene_number'] ?? null,
-                    'created_at' => filemtime($file)
+                    'created_at' => $createdAt
                 ];
             }
             // Sort by index then by time
@@ -1939,15 +2037,24 @@ class GeminiImageService
         // Get animations (MP4 videos from Kling AI)
         $animDir = $baseDir . '/animations';
         if (is_dir($animDir)) {
-            $files = glob($animDir . '/*.{mp4,webm}', GLOB_BRACE);
+            $files = glob($animDir . '/*.{mp4,webm}', GLOB_BRACE) ?: [];
             foreach ($files as $file) {
+                if (!is_file($file) || !is_readable($file)) {
+                    continue;
+                }
+
+                $createdAt = @filemtime($file);
+                if ($createdAt === false) {
+                    continue;
+                }
+
                 $filename = basename($file);
                 $relativePath = 'books/' . $bookId . '/animations/' . $filename;
                 $media['animations'][] = [
                     'filename' => $filename,
                     'path' => $relativePath,
                     'url' => asset('storage/' . $relativePath),
-                    'created_at' => filemtime($file)
+                    'created_at' => $createdAt
                 ];
             }
             // Sort by newest first

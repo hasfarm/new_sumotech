@@ -1015,7 +1015,7 @@ class DubSyncController extends Controller
         ]);
 
         try {
-            if ($request->provider === 'gemini' && !env('GEMINI_TTS_API_KEY')) {
+            if ($request->provider === 'gemini' && !config('services.gemini.tts_api_key') && !config('services.gemini.api_key')) {
                 return response()->json([
                     'success' => false,
                     'error' => 'GEMINI_TTS_API_KEY chưa được cấu hình'

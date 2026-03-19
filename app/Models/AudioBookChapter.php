@@ -28,12 +28,14 @@ class AudioBookChapter extends Model
         'youtube_video_id',
         'youtube_video_title',
         'youtube_video_description',
-        'youtube_uploaded_at'
+        'youtube_uploaded_at',
+        'audio_boosted_at'
     ];
 
     protected $casts = [
         'tts_speed' => 'float',
         'total_duration' => 'float',
+        'audio_boosted_at' => 'datetime',
     ];
 
     public function audioBook()

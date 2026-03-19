@@ -12,8 +12,8 @@ return new class extends Migration
     public function up(): void
     {
         Schema::table('audio_books', function (Blueprint $table) {
-            $table->decimal('tts_speed', 3, 2)->default(1.00)->after('tts_style_instruction');
-            $table->decimal('pause_between_chunks', 3, 1)->default(0)->after('tts_speed');
+            $table->text('art_style_instruction')->nullable()->after('tts_style_instruction')
+                  ->comment('Visual style & character description for AI image generation');
         });
     }
 
@@ -23,7 +23,7 @@ return new class extends Migration
     public function down(): void
     {
         Schema::table('audio_books', function (Blueprint $table) {
-            $table->dropColumn(['tts_speed', 'pause_between_chunks']);
+            $table->dropColumn('art_style_instruction');
         });
     }
 };

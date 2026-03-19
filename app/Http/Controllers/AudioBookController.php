@@ -21,6 +21,9 @@ use App\Jobs\GenerateFullBookVideoJob;
 use App\Jobs\GenerateBatchVideoJob;
 use App\Jobs\PublishYoutubeJob;
 use App\Jobs\GenerateThumbnailJob;
+use App\Jobs\GenerateDescriptionAudioJob;
+use App\Jobs\GenerateBookReviewVideoJob;
+use App\Services\BookReviewVideoService;
 use App\Models\AudioBookVideoSegment;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Cache;
@@ -256,9 +259,61 @@ class AudioBookController extends Controller
                 ->get();
         }
 
+        // Calculate storage sizes
+        $bookStorageSize = $this->calculateDirectorySize(storage_path('app/public/books/' . $audioBook->id));
+
+        $channelStorageSize = 0;
+        $channelBookSizes = [];
+        if ($audioBook->youtube_channel_id) {
+            $channelBooks = AudioBook::where('youtube_channel_id', $audioBook->youtube_channel_id)->get(['id', 'title']);
+            foreach ($channelBooks as $book) {
+                $size = $this->calculateDirectorySize(storage_path('app/public/books/' . $book->id));
+                $channelStorageSize += $size;
+                if ($size > 0) {
+                    $channelBookSizes[] = ['id' => $book->id, 'title' => $book->title, 'size' => $size];
+                }
+            }
+            // Sort by size descending
+            usort($channelBookSizes, fn($a, $b) => $b['size'] <=> $a['size']);
+        }
+
         $scrapeSources = $this->getScrapeSources();
 
-        return view('audiobooks.show', compact('audioBook', 'speakers', 'scrapeSources'));
+        return view('audiobooks.show', compact(
+            'audioBook',
+            'speakers',
+            'scrapeSources',
+            'bookStorageSize',
+            'channelStorageSize',
+            'channelBookSizes'
+        ));
+    }
+
+    private function calculateDirectorySize(string $directory): int
+    {
+        if (!is_dir($directory)) {
+            return 0;
+        }
+        $size = 0;
+        $iterator = new \RecursiveIteratorIterator(new \RecursiveDirectoryIterator($directory, \FilesystemIterator::SKIP_DOTS));
+        foreach ($iterator as $file) {
+            if ($file->isFile()) {
+                $size += $file->getSize();
+            }
+        }
+        return $size;
+    }
+
+    private function formatBytes(int $bytes): string
+    {
+        if ($bytes === 0) return '0 B';
+        $units = ['B', 'KB', 'MB', 'GB', 'TB'];
+        $i = 0;
+        while ($bytes >= 1024 && $i < count($units) - 1) {
+            $bytes /= 1024;
+            $i++;
+        }
+        return round($bytes, 1) . ' ' . $units[$i];
     }
 
     /**
@@ -684,6 +739,98 @@ class AudioBookController extends Controller
     }
 
     /**
+     * Find and replace text across all chapters of an audiobook
+     */
+    public function findReplace(Request $request, AudioBook $audioBook)
+    {
+        $data = $request->validate([
+            'search'        => 'required|string|min:1|max:500',
+            'replace'       => 'required_without_all|nullable|string|max:500',
+            'case_sensitive' => 'nullable|boolean',
+            'preview_only'  => 'nullable|boolean',
+        ]);
+
+        $search        = $data['search'];
+        $replace       = $data['replace'] ?? '';
+        $caseSensitive = !empty($data['case_sensitive']);
+        $previewOnly   = !empty($data['preview_only']);
+
+        $chapters          = $audioBook->chapters()->whereNotNull('content')->get();
+        $totalMatches      = 0;
+        $chaptersAffected  = 0;
+        $previewItems      = [];
+
+        foreach ($chapters as $chapter) {
+            if ($caseSensitive) {
+                $count = substr_count($chapter->content, $search);
+            } else {
+                $count = substr_count(mb_strtolower($chapter->content), mb_strtolower($search));
+            }
+
+            if ($count > 0) {
+                $totalMatches += $count;
+                $chaptersAffected++;
+
+                if ($previewOnly) {
+                    $previewItems[] = [
+                        'chapter_id'     => $chapter->id,
+                        'chapter_title'  => $chapter->title ?: "Chương {$chapter->chapter_number}",
+                        'match_count'    => $count,
+                    ];
+                } else {
+                    if ($caseSensitive) {
+                        $newContent = str_replace($search, $replace, $chapter->content);
+                    } else {
+                        $newContent = str_ireplace($search, $replace, $chapter->content);
+                    }
+                    $chapter->update(['content' => $newContent]);
+                }
+            }
+        }
+
+        return response()->json([
+            'success'           => true,
+            'preview_only'      => $previewOnly,
+            'total_matches'     => $totalMatches,
+            'chapters_affected' => $chaptersAffected,
+            'preview_items'     => $previewItems,
+            'message'           => $previewOnly
+                ? "Tìm thấy {$totalMatches} kết quả trong {$chaptersAffected} chương."
+                : "Đã thay thế {$totalMatches} lần trong {$chaptersAffected} chương.",
+        ]);
+    }
+
+    /**
+     * Fix chapters where content starts with a single letter then a space (e.g. "A bc..." => "Abc...")
+     */
+    public function fixLeadingInitialSpace(AudioBook $audioBook)
+    {
+        $chapters = $audioBook->chapters()->whereNotNull('content')->get();
+        $chaptersAffected = 0;
+        $totalReplacements = 0;
+
+        foreach ($chapters as $chapter) {
+            $content = (string) $chapter->content;
+            $newContent = preg_replace('/^(\s*)(\p{L})\s+/u', '$1$2', $content, 1, $count);
+
+            if (($count ?? 0) > 0 && $newContent !== null && $newContent !== $content) {
+                $chapter->update(['content' => $newContent]);
+                $chaptersAffected++;
+                $totalReplacements += (int) $count;
+            }
+        }
+
+        return response()->json([
+            'success' => true,
+            'chapters_affected' => $chaptersAffected,
+            'total_replacements' => $totalReplacements,
+            'message' => $chaptersAffected > 0
+                ? "Đã sửa {$totalReplacements} lỗi ở {$chaptersAffected} chương."
+                : 'Không phát hiện chương nào có lỗi ký tự đầu + khoảng trắng.',
+        ]);
+    }
+
+    /**
      * Upload intro/outro music for audiobook
      */
     public function uploadMusic(Request $request, AudioBook $audioBook)
@@ -707,12 +854,6 @@ class AudioBookController extends Controller
             // Generate filename
             $filename = "{$type}_" . time() . '.' . $file->getClientOriginalExtension();
             $relativePath = "{$musicDir}/{$filename}";
-
-            // Delete old file if exists
-            $oldPath = $type === 'intro' ? $audioBook->intro_music : $audioBook->outro_music;
-            if ($oldPath && Storage::disk('public')->exists($oldPath)) {
-                Storage::disk('public')->delete($oldPath);
-            }
 
             // Store new file
             $file->storeAs("public/{$musicDir}", $filename);
@@ -741,6 +882,56 @@ class AudioBookController extends Controller
     }
 
     /**
+     * Assign one previously uploaded music file to intro/outro
+     */
+    public function selectMusicFile(Request $request, AudioBook $audioBook)
+    {
+        try {
+            $data = $request->validate([
+                'type' => 'required|in:intro,outro',
+                'path' => 'required|string'
+            ]);
+
+            $type = $data['type'];
+            $path = ltrim((string) $data['path'], '/');
+
+            if (!preg_match('/^books\/\d+\/music\/.+\.(mp3|wav|m4a)$/i', $path)) {
+                return response()->json([
+                    'success' => false,
+                    'error' => 'Đường dẫn file nhạc không hợp lệ.'
+                ], 422);
+            }
+
+            if (!Storage::disk('public')->exists($path)) {
+                return response()->json([
+                    'success' => false,
+                    'error' => 'Không tìm thấy file nhạc đã chọn.'
+                ], 404);
+            }
+
+            $field = $type === 'intro' ? 'intro_music' : 'outro_music';
+            $audioBook->update([$field => $path]);
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Đã chọn nhạc ' . $type,
+                'path' => $path,
+                'url' => asset('storage/' . $path)
+            ]);
+        } catch (\Illuminate\Validation\ValidationException $e) {
+            return response()->json([
+                'success' => false,
+                'error' => $e->validator->errors()->first()
+            ], 422);
+        } catch (\Exception $e) {
+            return response()->json([
+                'success' => false,
+                'error' => 'Lỗi chọn nhạc: ' . $e->getMessage()
+            ], 500);
+        }
+    }
+
+    /**
      * Delete intro/outro music
      */
     public function deleteMusic(Request $request, AudioBook $audioBook)
@@ -753,10 +944,6 @@ class AudioBookController extends Controller
             $type = $request->input('type');
             $field = $type === 'intro' ? 'intro_music' : 'outro_music';
             $path = $audioBook->$field;
-
-            if ($path && Storage::disk('public')->exists($path)) {
-                Storage::disk('public')->delete($path);
-            }
 
             $audioBook->update([$field => null]);
 
@@ -1058,81 +1245,36 @@ class AudioBookController extends Controller
             'style_instruction' => 'nullable|string'
         ]);
 
-        try {
-            $description = $request->input('description');
-            $provider = $request->input('provider');
-            $voiceName = $request->input('voice_name');
-            $voiceGender = $request->input('voice_gender', 'female');
-            $styleInstruction = $request->input('style_instruction');
-            $bookId = $audioBook->id;
+        // Clear previous progress
+        Cache::forget("desc_audio_progress_{$audioBook->id}");
 
-            // Skip style_instruction for Microsoft and OpenAI TTS
-            $providersWithoutStyle = ['microsoft', 'openai'];
-            if (in_array($provider, $providersWithoutStyle)) {
-                $styleInstruction = null;
-            }
+        GenerateDescriptionAudioJob::dispatch($audioBook->id, [
+            'description' => $request->input('description'),
+            'provider' => $request->input('provider'),
+            'voice_name' => $request->input('voice_name'),
+            'voice_gender' => $request->input('voice_gender', 'female'),
+            'style_instruction' => $request->input('style_instruction'),
+        ]);
 
-            // Generate full audio using TTSService
-            $audioPath = $this->ttsService->generateAudio(
-                $description,
-                0, // index
-                $voiceGender,
-                $voiceName,
-                $provider,
-                $styleInstruction,
-                null // projectId
-            );
+        return response()->json([
+            'success' => true,
+            'queued' => true,
+            'message' => 'Đã đưa vào hàng đợi tạo audio...',
+        ]);
+    }
 
-            // Move to permanent location
-            $outputDir = storage_path('app/public/books/' . $bookId);
-            if (!is_dir($outputDir)) {
-                mkdir($outputDir, 0755, true);
-            }
+    public function getDescriptionAudioProgress(AudioBook $audioBook)
+    {
+        $progress = Cache::get("desc_audio_progress_{$audioBook->id}");
 
-            $timestamp = time();
-            $filename = "description_{$timestamp}.mp3";
-            $outputPath = $outputDir . DIRECTORY_SEPARATOR . $filename;
-
-            $sourcePath = storage_path('app/' . $audioPath);
-            if (file_exists($sourcePath)) {
-                // Delete old description audio if exists
-                if ($audioBook->description_audio) {
-                    $oldPath = storage_path('app/public/' . $audioBook->description_audio);
-                    if (file_exists($oldPath)) {
-                        unlink($oldPath);
-                    }
-                }
-
-                copy($sourcePath, $outputPath);
-                unlink($sourcePath); // Clean up original
-            }
-
-            // Get audio duration
-            $duration = $this->getAudioDuration($outputPath);
-
-            // Save to audiobook
-            $relativePath = 'books/' . $bookId . '/' . $filename;
-            $audioBook->update([
-                'description_audio' => $relativePath,
-                'description_audio_duration' => $duration
-            ]);
-
-            Log::info("Generated description audio for audiobook {$audioBook->id}: {$filename}");
-
+        if (!$progress) {
             return response()->json([
-                'success' => true,
-                'audio_file' => $relativePath,
-                'audio_url' => asset('storage/' . $relativePath),
-                'duration' => $duration
+                'status' => 'pending',
+                'message' => 'Đang chờ xử lý...',
             ]);
-        } catch (\Exception $e) {
-            Log::error("Generate description audio failed for audiobook {$audioBook->id}: " . $e->getMessage());
-
-            return response()->json([
-                'success' => false,
-                'error' => $e->getMessage()
-            ], 500);
         }
+
+        return response()->json($progress);
     }
 
     /**
@@ -1729,6 +1871,435 @@ class AudioBookController extends Controller
         }
     }
 
+    // ========== BOOK REVIEW VIDEO ==========
+
+    public function startBookReviewVideoJob(Request $request, AudioBook $audioBook)
+    {
+        $chaptersWithContent = $audioBook->chapters()->whereNotNull('content')->where('content', '!=', '')->count();
+        if ($chaptersWithContent === 0) {
+            return response()->json([
+                'success' => false,
+                'error' => 'Sách chưa có chương nào có nội dung.'
+            ], 400);
+        }
+
+        Cache::forget("review_video_progress_{$audioBook->id}");
+
+        GenerateBookReviewVideoJob::dispatch($audioBook->id, [
+            'provider' => $request->input('provider', $audioBook->tts_provider ?? 'microsoft'),
+            'voice_name' => $request->input('voice_name', $audioBook->tts_voice_name ?? ''),
+            'voice_gender' => $request->input('voice_gender', $audioBook->tts_voice_gender ?? 'female'),
+            'style_instruction' => $request->input('style_instruction', $audioBook->tts_style_instruction),
+        ]);
+
+        return response()->json([
+            'success' => true,
+            'queued' => true,
+            'message' => 'Đã đưa vào hàng đợi tạo video review...',
+            'chapters_count' => $chaptersWithContent,
+        ]);
+    }
+
+    public function getBookReviewVideoProgress(AudioBook $audioBook)
+    {
+        $progress = Cache::get("review_video_progress_{$audioBook->id}");
+
+        if (!$progress) {
+            return response()->json([
+                'status' => 'pending',
+                'message' => 'Đang chờ xử lý...',
+            ]);
+        }
+
+        return response()->json($progress);
+    }
+
+    public function deleteBookReviewVideo(AudioBook $audioBook)
+    {
+        try {
+            if ($audioBook->review_video) {
+                $filePath = storage_path('app/public/' . $audioBook->review_video);
+                if (file_exists($filePath)) {
+                    unlink($filePath);
+                }
+            }
+
+            // Clean up work directory
+            $workDir = storage_path('app/public/books/' . $audioBook->id . '/review_video');
+            if (is_dir($workDir)) {
+                $iterator = new \RecursiveIteratorIterator(
+                    new \RecursiveDirectoryIterator($workDir, \FilesystemIterator::SKIP_DOTS),
+                    \RecursiveIteratorIterator::CHILD_FIRST
+                );
+                foreach ($iterator as $file) {
+                    $file->isDir() ? rmdir($file->getPathname()) : unlink($file->getPathname());
+                }
+                rmdir($workDir);
+            }
+
+            $audioBook->update([
+                'review_script' => null,
+                'review_video' => null,
+                'review_video_duration' => null,
+            ]);
+
+            Cache::forget("review_video_progress_{$audioBook->id}");
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Đã xóa video review'
+            ]);
+        } catch (\Exception $e) {
+            return response()->json([
+                'success' => false,
+                'error' => $e->getMessage()
+            ], 500);
+        }
+    }
+
+    public function getReviewChunks(AudioBook $audioBook)
+    {
+        $service = app(BookReviewVideoService::class);
+        $chunks = $service->loadChunks($audioBook->id);
+
+        if (!$chunks) {
+            return response()->json(['success' => true, 'chunks' => []]);
+        }
+
+        $result = [];
+        foreach ($chunks as $i => $chunk) {
+            $imageUrl = null;
+            if (!empty($chunk['image_path']) && file_exists($chunk['image_path'])) {
+                $relativePath = str_replace(storage_path('app/public/'), '', $chunk['image_path']);
+                $imageUrl = asset('storage/' . $relativePath);
+            }
+
+            $hasAudio = !empty($chunk['audio_path']) && file_exists($chunk['audio_path']);
+
+            $result[] = [
+                'chunk_index' => $i,
+                'text' => $chunk['text'] ?? '',
+                'image_prompt' => $chunk['image_prompt'] ?? '',
+                'image_url' => $imageUrl,
+                'has_audio' => $hasAudio,
+                'audio_duration' => $chunk['audio_duration'] ?? null,
+            ];
+        }
+
+        return response()->json(['success' => true, 'chunks' => $result]);
+    }
+
+    public function openReviewScriptStudio(AudioBook $audioBook)
+    {
+        $reviewScript = trim((string)($audioBook->review_script ?? ''));
+        if ($reviewScript === '') {
+            return response()->json([
+                'success' => false,
+                'error' => 'Chưa có kịch bản review để mở Studio câu.',
+            ], 422);
+        }
+
+        $bookTitle = trim((string)($audioBook->title ?? ''));
+        $defaultImagePrompt = $bookTitle !== ''
+            ? 'Vertical 9:16 cinematic scene inspired by the book review of "' . $bookTitle . '", dramatic lighting, emotional atmosphere, no text, ultra detailed.'
+            : 'Vertical 9:16 cinematic scene inspired by a book review, dramatic lighting, emotional atmosphere, no text, ultra detailed.';
+
+        $service = app(BookReviewVideoService::class);
+        $reviewChunks = $service->loadChunks($audioBook->id);
+        if (is_array($reviewChunks)) {
+            foreach ($reviewChunks as $chunk) {
+                $chunkPrompt = trim((string)($chunk['image_prompt'] ?? ''));
+                if ($chunkPrompt !== '') {
+                    $defaultImagePrompt = $chunkPrompt;
+                    break;
+                }
+            }
+        }
+
+        $items = $this->loadShortVideoItems($audioBook->id);
+
+        $targetKey = null;
+        foreach ($items as $key => $item) {
+            if (($item['source'] ?? null) === 'review_script') {
+                $targetKey = $key;
+                break;
+            }
+        }
+
+        if ($targetKey === null) {
+            foreach ($items as $key => $item) {
+                $title = strtolower(trim((string)($item['title'] ?? '')));
+                if ($title !== '' && strpos($title, 'review script') !== false) {
+                    $targetKey = $key;
+                    break;
+                }
+            }
+        }
+
+        $now = now()->toDateTimeString();
+        $targetIndex = 0;
+        if ($targetKey === null) {
+            $maxIndex = 0;
+            foreach ($items as $position => $item) {
+                $itemIndex = (int)($item['index'] ?? ($position + 1));
+                if ($itemIndex > $maxIndex) {
+                    $maxIndex = $itemIndex;
+                }
+            }
+
+            $targetIndex = $maxIndex + 1;
+            if ($targetIndex <= 0) {
+                $targetIndex = count($items) + 1;
+            }
+
+            $items[] = [
+                'index' => $targetIndex,
+                'title' => 'Review Script',
+                'style' => 'Review',
+                'script' => $reviewScript,
+                'image_prompt' => $defaultImagePrompt,
+                'status' => 'planned',
+                'error_message' => null,
+                'audio_path' => null,
+                'image_path' => null,
+                'video_path' => null,
+                'duration' => null,
+                'shots' => [],
+                'story_bible' => null,
+                'character_bible' => null,
+                'source' => 'review_script',
+                'created_at' => $now,
+                'updated_at' => $now,
+            ];
+        } else {
+            $item = $items[$targetKey];
+            $targetIndex = (int)($item['index'] ?? ($targetKey + 1));
+            if ($targetIndex <= 0) {
+                $targetIndex = $targetKey + 1;
+            }
+
+            $oldScript = trim((string)($item['script'] ?? ''));
+            $oldImagePrompt = trim((string)($item['image_prompt'] ?? ''));
+            $newImagePrompt = $oldImagePrompt !== '' ? $oldImagePrompt : $defaultImagePrompt;
+
+            $scriptChanged = $oldScript !== $reviewScript;
+            $imagePromptChanged = $newImagePrompt !== $oldImagePrompt;
+
+            $item['index'] = $targetIndex;
+            $item['title'] = trim((string)($item['title'] ?? '')) !== '' ? $item['title'] : 'Review Script';
+            $item['style'] = trim((string)($item['style'] ?? '')) !== '' ? $item['style'] : 'Review';
+            $item['script'] = $reviewScript;
+            $item['image_prompt'] = $newImagePrompt;
+            $item['source'] = 'review_script';
+            $item['status'] = 'planned';
+            $item['error_message'] = null;
+            $item['updated_at'] = $now;
+
+            if (empty($item['created_at'])) {
+                $item['created_at'] = $now;
+            }
+
+            if ($scriptChanged && !empty($item['audio_path'])) {
+                $this->deleteShortVideoAssetFile($item['audio_path']);
+                $item['audio_path'] = null;
+                $item['duration'] = null;
+            }
+
+            if ($scriptChanged) {
+                $this->deleteShortVideoShotAssets($item);
+                $item['shots'] = [];
+                $item['story_bible'] = null;
+                $item['character_bible'] = null;
+            }
+
+            if (($scriptChanged || $imagePromptChanged) && !empty($item['image_path'])) {
+                $this->deleteShortVideoAssetFile($item['image_path']);
+                $item['image_path'] = null;
+            }
+
+            if (($scriptChanged || $imagePromptChanged) && !empty($item['video_path'])) {
+                $this->deleteShortVideoAssetFile($item['video_path']);
+                $item['video_path'] = null;
+            }
+
+            $items[$targetKey] = $item;
+        }
+
+        $this->saveShortVideoItems($audioBook->id, $items);
+
+        $targetKeyAfterSave = $this->findShortVideoItemIndex($items, $targetIndex);
+
+        if ($targetKeyAfterSave === null || $targetIndex <= 0) {
+            return response()->json([
+                'success' => false,
+                'error' => 'Không xác định được short review để mở Studio câu.',
+            ], 500);
+        }
+
+        return response()->json([
+            'success' => true,
+            'short_index' => $targetIndex,
+            'item' => $this->mapShortVideoItemForResponse($audioBook->id, $items[$targetKeyAfterSave]),
+            'items' => array_map(fn($item) => $this->mapShortVideoItemForResponse($audioBook->id, $item), $items),
+        ]);
+    }
+
+    public function updateReviewChunkPrompt(Request $request, AudioBook $audioBook, int $index)
+    {
+        $request->validate(['image_prompt' => 'required|string']);
+
+        $service = app(BookReviewVideoService::class);
+        $chunks = $service->loadChunks($audioBook->id);
+
+        if (!$chunks || !isset($chunks[$index])) {
+            return response()->json(['success' => false, 'error' => 'Segment không tồn tại'], 404);
+        }
+
+        $chunks[$index]['image_prompt'] = $request->input('image_prompt');
+        $service->saveChunks($audioBook->id, $chunks);
+
+        return response()->json(['success' => true, 'image_prompt' => $chunks[$index]['image_prompt']]);
+    }
+
+    public function regenerateReviewChunkImage(Request $request, AudioBook $audioBook, int $index)
+    {
+        $service = app(BookReviewVideoService::class);
+        $chunks = $service->loadChunks($audioBook->id);
+
+        if (!$chunks || !isset($chunks[$index])) {
+            return response()->json(['success' => false, 'error' => 'Segment không tồn tại'], 404);
+        }
+
+        $prompt = $chunks[$index]['image_prompt'] ?? '';
+        if (empty($prompt)) {
+            return response()->json(['success' => false, 'error' => 'Chưa có image prompt'], 400);
+        }
+
+        $imageProvider = $request->input('image_provider', 'gemini');
+
+        try {
+            $result = $service->generateChunkImage($audioBook->id, $index, $prompt, $imageProvider);
+
+            if ($result['success']) {
+                $relativePath = str_replace(storage_path('app/public/'), '', $result['image_path']);
+                $imageUrl = asset('storage/' . $relativePath) . '?t=' . time();
+                return response()->json(['success' => true, 'image_url' => $imageUrl]);
+            }
+
+            return response()->json(['success' => false, 'error' => $result['error'] ?? 'Không thể tạo ảnh'], 500);
+        } catch (\Exception $e) {
+            return response()->json(['success' => false, 'error' => $e->getMessage()], 500);
+        }
+    }
+
+    public function translateReviewChunkPrompt(Request $request, AudioBook $audioBook, int $index)
+    {
+        $service = app(BookReviewVideoService::class);
+        $chunks = $service->loadChunks($audioBook->id);
+
+        if (!$chunks || !isset($chunks[$index])) {
+            return response()->json(['success' => false, 'error' => 'Segment không tồn tại'], 404);
+        }
+
+        $prompt = $chunks[$index]['image_prompt'] ?? '';
+        if (empty($prompt)) {
+            return response()->json(['success' => false, 'error' => 'Chưa có image prompt'], 400);
+        }
+
+        try {
+            $result = $service->translatePrompt($prompt);
+            return response()->json(['success' => true, ...$result]);
+        } catch (\Exception $e) {
+            return response()->json(['success' => false, 'error' => $e->getMessage()], 500);
+        }
+    }
+
+    public function startReviewAssetsJob(Request $request, AudioBook $audioBook)
+    {
+        $service = app(BookReviewVideoService::class);
+        $chunks = $service->loadChunks($audioBook->id);
+
+        if (!$chunks || empty($chunks)) {
+            return response()->json(['success' => false, 'error' => 'Chưa có segments. Hãy tạo kịch bản trước.'], 400);
+        }
+
+        Cache::forget("review_assets_progress_{$audioBook->id}");
+
+        \App\Jobs\GenerateReviewAssetsJob::dispatch($audioBook->id, [
+            'provider' => $request->input('provider', $audioBook->tts_provider ?? 'microsoft'),
+            'voice_name' => $request->input('voice_name', $audioBook->tts_voice_name ?? ''),
+            'voice_gender' => $request->input('voice_gender', $audioBook->tts_voice_gender ?? 'female'),
+            'style_instruction' => $request->input('style_instruction', $audioBook->tts_style_instruction),
+            'image_provider' => $request->input('image_provider', 'gemini'),
+        ]);
+
+        return response()->json([
+            'success' => true,
+            'queued' => true,
+            'message' => 'Đã đưa vào hàng đợi tạo ảnh & audio...',
+        ]);
+    }
+
+    public function getReviewAssetsProgress(AudioBook $audioBook)
+    {
+        $progress = Cache::get("review_assets_progress_{$audioBook->id}");
+
+        if (!$progress) {
+            return response()->json(['status' => 'pending', 'message' => 'Đang chờ xử lý...']);
+        }
+
+        return response()->json($progress);
+    }
+
+    public function splitReviewChunk(Request $request, AudioBook $audioBook, int $index)
+    {
+        $request->validate(['text_with_delimiters' => 'required|string']);
+
+        $service = app(BookReviewVideoService::class);
+
+        try {
+            $chunks = $service->splitChunk($audioBook->id, $index, $request->input('text_with_delimiters'));
+            return response()->json(['success' => true, 'chunks_count' => count($chunks)]);
+        } catch (\Exception $e) {
+            return response()->json(['success' => false, 'error' => $e->getMessage()], 400);
+        }
+    }
+
+    public function translateAllReviewPrompts(AudioBook $audioBook)
+    {
+        $service = app(BookReviewVideoService::class);
+        $chunks = $service->loadChunks($audioBook->id);
+
+        if (!$chunks || empty($chunks)) {
+            return response()->json(['success' => false, 'error' => 'Chưa có segments'], 400);
+        }
+
+        $translated = 0;
+        $errors = [];
+
+        foreach ($chunks as $i => &$chunk) {
+            $prompt = $chunk['image_prompt'] ?? '';
+            if (empty($prompt)) continue;
+
+            try {
+                $result = $service->translatePrompt($prompt);
+                $chunk['image_prompt'] = $result['translated'];
+                $translated++;
+                sleep(2); // Rate limit
+            } catch (\Exception $e) {
+                $errors[] = "Segment {$i}: " . $e->getMessage();
+            }
+        }
+
+        $service->saveChunks($audioBook->id, $chunks);
+
+        return response()->json([
+            'success' => true,
+            'translated' => $translated,
+            'errors' => $errors,
+        ]);
+    }
+
     /**
      * Generate lip-sync video for speaker
      */
@@ -1992,6 +2563,2688 @@ class AudioBookController extends Controller
         ]);
     }
 
+    public function uploadMedia(Request $request, AudioBook $audioBook)
+    {
+        error_log("=== UPLOAD MEDIA STARTED ===");
+        error_log("AudioBook ID: " . $audioBook->id);
+        error_log("Request type: " . $request->input('type'));
+        error_log("Files count: " . count($request->file('images') ?? []));
+        
+        try {
+            $request->validate([
+                'type' => 'required|string|in:thumbnails,scenes',
+                'images' => 'required|array|min:1|max:10',
+                'images.*' => 'required|image|mimes:jpeg,jpg,png,webp|max:10240',
+            ]);
+            
+            error_log("Validation passed");
+
+            $type = $request->input('type');
+            $uploadedCount = 0;
+            $uploadedFiles = [];
+
+            $baseDir = storage_path('app/public/books/' . $audioBook->id . '/' . $type);
+
+            if (!is_dir($baseDir)) {
+                if (!mkdir($baseDir, 0775, true)) {
+                    throw new \Exception("Không thể tạo thư mục: {$baseDir}");
+                }
+            }
+
+            if (!is_writable($baseDir)) {
+                throw new \Exception("Không có quyền ghi vào thư mục: {$baseDir}");
+            }
+
+            foreach ($request->file('images') as $index => $image) {
+                if (!$image->isValid()) {
+                    Log::warning("Invalid uploaded file at index {$index}");
+                    continue;
+                }
+
+                $timestamp = time() . '_' . random_int(1000, 9999);
+                $extension = $image->getClientOriginalExtension();
+                $filename = ($type === 'thumbnails' ? 'thumb_' : 'scene_') . $timestamp . '.' . $extension;
+
+                $targetPath = $baseDir . '/' . $filename;
+
+                if ($image->move($baseDir, $filename)) {
+                    $uploadedCount++;
+                    $uploadedFiles[] = $filename;
+                } else {
+                    Log::warning("Failed to move uploaded file: {$filename}");
+                }
+            }
+
+            if ($uploadedCount === 0) {
+                throw new \Exception("Không có file nào được upload thành công");
+            }
+
+            Log::info('Media uploaded', [
+                'audio_book_id' => $audioBook->id,
+                'type' => $type,
+                'count' => $uploadedCount,
+                'files' => $uploadedFiles,
+            ]);
+
+            error_log("=== UPLOAD MEDIA SUCCESS - Returning response ===");
+            error_log("Uploaded count: " . $uploadedCount);
+            
+            return response()->json([
+                'success' => true,
+                'uploaded' => $uploadedCount,
+                'message' => "Đã upload {$uploadedCount} file vào {$type}",
+                'files' => $uploadedFiles,
+            ]);
+        } catch (\Illuminate\Validation\ValidationException $e) {
+            error_log("=== UPLOAD MEDIA VALIDATION ERROR ===");
+            error_log("Validation errors: " . json_encode($e->errors()));
+            
+            Log::error('Upload media validation failed', [
+                'audio_book_id' => $audioBook->id,
+                'errors' => $e->errors(),
+            ]);
+
+            return response()->json([
+                'success' => false,
+                'error' => 'Validation failed: ' . json_encode($e->errors()),
+            ], 422);
+        } catch (\Throwable $e) {
+            error_log("=== UPLOAD MEDIA EXCEPTION ===");
+            error_log("Error: " . $e->getMessage());
+            error_log("File: " . $e->getFile() . ":" . $e->getLine());
+            
+            Log::error('Upload media failed', [
+                'audio_book_id' => $audioBook->id,
+                'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString(),
+            ]);
+
+            return response()->json([
+                'success' => false,
+                'error' => $e->getMessage(),
+            ], 500);
+        }
+    }
+
+    public function getShortVideos(AudioBook $audioBook)
+    {
+        $items = $this->loadShortVideoItems($audioBook->id);
+
+        return response()->json([
+            'success' => true,
+            'items' => array_map(fn($item) => $this->mapShortVideoItemForResponse($audioBook->id, $item), $items),
+        ]);
+    }
+
+    public function generateShortVideoPlans(Request $request, AudioBook $audioBook)
+    {
+        $request->validate([
+            'count' => 'required|integer|min:1|max:20',
+        ]);
+
+        try {
+            $count = (int) $request->input('count');
+            $plans = $this->createShortVideoPlansWithAi($audioBook, $count);
+            $this->saveShortVideoItems($audioBook->id, $plans);
+
+            return response()->json([
+                'success' => true,
+                'count' => count($plans),
+                'items' => array_map(fn($item) => $this->mapShortVideoItemForResponse($audioBook->id, $item), $plans),
+            ]);
+        } catch (\Throwable $e) {
+            Log::error('Generate short video plans failed', [
+                'audio_book_id' => $audioBook->id,
+                'error' => $e->getMessage(),
+            ]);
+
+            return response()->json([
+                'success' => false,
+                'error' => $e->getMessage(),
+            ], 500);
+        }
+    }
+
+    public function generateShortVideoAssets(Request $request, AudioBook $audioBook)
+    {
+        $request->validate([
+            'provider' => 'nullable|string|in:openai,gemini,microsoft,vbee',
+            'voice_name' => 'nullable|string',
+            'voice_gender' => 'nullable|string|in:male,female',
+            'style_instruction' => 'nullable|string',
+            'tts_speed' => 'nullable|numeric|between:0.5,2.0',
+        ]);
+
+        $items = $this->loadShortVideoItems($audioBook->id);
+        if (empty($items)) {
+            return response()->json([
+                'success' => false,
+                'error' => 'Chưa có kịch bản short. Hãy tạo kế hoạch trước.',
+            ], 422);
+        }
+
+        $provider = $request->input('provider', $audioBook->tts_provider ?: 'openai');
+        $voiceName = $request->input('voice_name', $audioBook->tts_voice_name);
+        $voiceGender = $request->input('voice_gender', $audioBook->tts_voice_gender ?: 'female');
+        $styleInstruction = $request->input('style_instruction', $audioBook->tts_style_instruction);
+        $ttsSpeed = (float) $request->input('tts_speed', $audioBook->tts_speed ?: 1.0);
+
+        if (empty($voiceName)) {
+            return response()->json([
+                'success' => false,
+                'error' => 'Thiếu voice_name. Vui lòng cấu hình giọng TTS trước.',
+            ], 422);
+        }
+
+        $dirs = $this->ensureShortVideoAssetDirs($audioBook->id);
+        $audioDir = $dirs['audio'];
+        $imageDir = $dirs['images'];
+        $videoDir = $dirs['videos'];
+
+        $successCount = 0;
+        $errorCount = 0;
+
+        foreach ($items as $idx => &$item) {
+            try {
+                $script = trim((string)($item['script'] ?? ''));
+                $imagePrompt = trim((string)($item['image_prompt'] ?? ''));
+                if ($script === '' || $imagePrompt === '') {
+                    throw new \RuntimeException('Thiếu script hoặc image_prompt.');
+                }
+
+                $item['status'] = 'processing';
+                $item['error_message'] = null;
+
+                $tempAudioRelPath = $this->ttsService->generateAudio(
+                    $script,
+                    $idx + 1,
+                    $voiceGender,
+                    $voiceName,
+                    $provider,
+                    $styleInstruction,
+                    null,
+                    $ttsSpeed
+                );
+
+                $tempAudioAbsPath = storage_path('app/' . $tempAudioRelPath);
+                if (!file_exists($tempAudioAbsPath)) {
+                    throw new \RuntimeException('Không tìm thấy file audio tạm từ TTS.');
+                }
+
+                $audioFileName = 'short_' . ($idx + 1) . '_' . time() . '.mp3';
+                $audioAbsPath = $audioDir . '/' . $audioFileName;
+                if (file_exists($audioAbsPath)) {
+                    unlink($audioAbsPath);
+                }
+                copy($tempAudioAbsPath, $audioAbsPath);
+                @unlink($tempAudioAbsPath);
+
+                $audioDuration = (float)($this->getAudioDuration($audioAbsPath) ?? 0.0);
+                if ($audioDuration <= 0) {
+                    $audioDuration = 30.0;
+                }
+                $videoDuration = min(60.0, $audioDuration);
+
+                $imageFileName = 'short_' . ($idx + 1) . '_' . time() . '.png';
+                $imageAbsPath = $imageDir . '/' . $imageFileName;
+                $imgResult = $this->imageService->generateImage($imagePrompt, $imageAbsPath, '9:16');
+                if (empty($imgResult['success'])) {
+                    throw new \RuntimeException($imgResult['error'] ?? 'Không thể tạo ảnh minh họa.');
+                }
+
+                $videoFileName = 'short_' . ($idx + 1) . '_' . time() . '.mp4';
+                $videoAbsPath = $videoDir . '/' . $videoFileName;
+                $ffmpegPath = config('services.ffmpeg.path', env('FFMPEG_PATH', 'ffmpeg'));
+
+                $ffmpegCmd = sprintf(
+                    '%s -loop 1 -i %s -i %s -filter_complex %s -map "[v]" -map 1:a ' .
+                        '-c:v libx264 -preset fast -crf 23 -c:a aac -b:a 192k -pix_fmt yuv420p -r 30 -t %.3f -shortest %s -y 2>&1',
+                    escapeshellarg($ffmpegPath),
+                    escapeshellarg($imageAbsPath),
+                    escapeshellarg($audioAbsPath),
+                    escapeshellarg('[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,zoompan=z=\'min(zoom+0.0006,1.12)\':d=1:s=1080x1920:fps=30[v]'),
+                    $videoDuration,
+                    escapeshellarg($videoAbsPath)
+                );
+
+                exec($ffmpegCmd, $ffmpegOutput, $ffmpegCode);
+                if ($ffmpegCode !== 0 || !file_exists($videoAbsPath)) {
+                    throw new \RuntimeException('FFmpeg tạo short video thất bại: ' . implode("\n", array_slice($ffmpegOutput, -5)));
+                }
+
+                $item['audio_path'] = 'books/' . $audioBook->id . '/short_videos/audio/' . $audioFileName;
+                $item['image_path'] = 'books/' . $audioBook->id . '/short_videos/images/' . $imageFileName;
+                $item['video_path'] = 'books/' . $audioBook->id . '/short_videos/videos/' . $videoFileName;
+                $item['duration'] = round($videoDuration, 3);
+                $item['status'] = 'completed';
+                $item['updated_at'] = now()->toDateTimeString();
+                $successCount++;
+            } catch (\Throwable $e) {
+                $item['status'] = 'error';
+                $item['error_message'] = $e->getMessage();
+                $item['updated_at'] = now()->toDateTimeString();
+                $errorCount++;
+            }
+        }
+        unset($item);
+
+        $this->saveShortVideoItems($audioBook->id, $items);
+
+        return response()->json([
+            'success' => true,
+            'processed' => count($items),
+            'completed' => $successCount,
+            'failed' => $errorCount,
+            'items' => array_map(fn($item) => $this->mapShortVideoItemForResponse($audioBook->id, $item), $items),
+        ]);
+    }
+
+    public function generateShortVideoTts(Request $request, AudioBook $audioBook)
+    {
+        $request->validate([
+            'selected_indices' => 'required|array|min:1',
+            'selected_indices.*' => 'integer|min:1',
+            'provider' => 'nullable|string|in:openai,gemini,microsoft,vbee',
+            'voice_name' => 'nullable|string',
+            'voice_gender' => 'nullable|string|in:male,female',
+            'style_instruction' => 'nullable|string',
+            'tts_speed' => 'nullable|numeric|between:0.5,2.0',
+        ]);
+
+        $items = $this->loadShortVideoItems($audioBook->id);
+        if (empty($items)) {
+            return response()->json([
+                'success' => false,
+                'error' => 'Chưa có kịch bản short. Hãy tạo kế hoạch trước.',
+            ], 422);
+        }
+
+        $selectedLookup = array_flip(array_values(array_unique(array_map('intval', (array) $request->input('selected_indices', [])))));
+        if (empty($selectedLookup)) {
+            return response()->json([
+                'success' => false,
+                'error' => 'Vui lòng chọn ít nhất 1 short.',
+            ], 422);
+        }
+
+        $provider = $request->input('provider', $audioBook->tts_provider ?: 'openai');
+        $voiceName = $request->input('voice_name', $audioBook->tts_voice_name);
+        $voiceGender = $request->input('voice_gender', $audioBook->tts_voice_gender ?: 'female');
+        $styleInstruction = $request->input('style_instruction', $audioBook->tts_style_instruction);
+        $ttsSpeed = (float) $request->input('tts_speed', $audioBook->tts_speed ?: 1.0);
+
+        if (empty($voiceName)) {
+            return response()->json([
+                'success' => false,
+                'error' => 'Thiếu voice_name. Vui lòng cấu hình giọng TTS trước.',
+            ], 422);
+        }
+
+        $dirs = $this->ensureShortVideoAssetDirs($audioBook->id);
+        $audioDir = $dirs['audio'];
+
+        $successCount = 0;
+        $errorCount = 0;
+
+        foreach ($items as $idx => &$item) {
+            $itemIndex = (int)($item['index'] ?? ($idx + 1));
+            if (!isset($selectedLookup[$itemIndex])) {
+                continue;
+            }
+
+            try {
+                $script = trim((string)($item['script'] ?? ''));
+                if ($script === '') {
+                    throw new \RuntimeException('Thiếu script để tạo TTS.');
+                }
+
+                $item['status'] = 'processing';
+                $item['error_message'] = null;
+
+                $tempAudioRelPath = $this->ttsService->generateAudio(
+                    $script,
+                    $itemIndex,
+                    $voiceGender,
+                    $voiceName,
+                    $provider,
+                    $styleInstruction,
+                    null,
+                    $ttsSpeed
+                );
+
+                $tempAudioAbsPath = storage_path('app/' . $tempAudioRelPath);
+                if (!file_exists($tempAudioAbsPath)) {
+                    throw new \RuntimeException('Không tìm thấy file audio tạm từ TTS.');
+                }
+
+                if (!empty($item['audio_path'])) {
+                    $this->deleteShortVideoAssetFile($item['audio_path']);
+                }
+
+                if (!empty($item['video_path'])) {
+                    $this->deleteShortVideoAssetFile($item['video_path']);
+                    $item['video_path'] = null;
+                }
+
+                $audioFileName = 'short_' . $itemIndex . '_' . time() . '.mp3';
+                $audioAbsPath = $audioDir . '/' . $audioFileName;
+                copy($tempAudioAbsPath, $audioAbsPath);
+                @unlink($tempAudioAbsPath);
+
+                $audioDuration = (float)($this->getAudioDuration($audioAbsPath) ?? 0.0);
+                if ($audioDuration <= 0) {
+                    $audioDuration = 30.0;
+                }
+
+                $item['audio_path'] = 'books/' . $audioBook->id . '/short_videos/audio/' . $audioFileName;
+                $item['duration'] = round(min(60.0, $audioDuration), 3);
+                $item['status'] = 'planned';
+                $item['updated_at'] = now()->toDateTimeString();
+                $successCount++;
+            } catch (\Throwable $e) {
+                $item['status'] = 'error';
+                $item['error_message'] = $e->getMessage();
+                $item['updated_at'] = now()->toDateTimeString();
+                $errorCount++;
+            }
+        }
+        unset($item);
+
+        $this->saveShortVideoItems($audioBook->id, $items);
+
+        return response()->json([
+            'success' => true,
+            'processed' => count($selectedLookup),
+            'completed' => $successCount,
+            'failed' => $errorCount,
+            'items' => array_map(fn($item) => $this->mapShortVideoItemForResponse($audioBook->id, $item), $items),
+        ]);
+    }
+
+    public function generateShortVideoImages(Request $request, AudioBook $audioBook)
+    {
+        $request->validate([
+            'selected_indices' => 'required|array|min:1',
+            'selected_indices.*' => 'integer|min:1',
+        ]);
+
+        $items = $this->loadShortVideoItems($audioBook->id);
+        if (empty($items)) {
+            return response()->json([
+                'success' => false,
+                'error' => 'Chưa có kịch bản short. Hãy tạo kế hoạch trước.',
+            ], 422);
+        }
+
+        $selectedLookup = array_flip(array_values(array_unique(array_map('intval', (array) $request->input('selected_indices', [])))));
+        if (empty($selectedLookup)) {
+            return response()->json([
+                'success' => false,
+                'error' => 'Vui lòng chọn ít nhất 1 short.',
+            ], 422);
+        }
+
+        $dirs = $this->ensureShortVideoAssetDirs($audioBook->id);
+        $imageDir = $dirs['images'];
+
+        $successCount = 0;
+        $errorCount = 0;
+
+        foreach ($items as $idx => &$item) {
+            $itemIndex = (int)($item['index'] ?? ($idx + 1));
+            if (!isset($selectedLookup[$itemIndex])) {
+                continue;
+            }
+
+            try {
+                $imagePrompt = trim((string)($item['image_prompt'] ?? ''));
+                if ($imagePrompt === '') {
+                    throw new \RuntimeException('Thiếu image_prompt để tạo ảnh.');
+                }
+
+                $item['status'] = 'processing';
+                $item['error_message'] = null;
+
+                if (!empty($item['image_path'])) {
+                    $this->deleteShortVideoAssetFile($item['image_path']);
+                }
+
+                if (!empty($item['video_path'])) {
+                    $this->deleteShortVideoAssetFile($item['video_path']);
+                    $item['video_path'] = null;
+                }
+
+                $imageFileName = 'short_' . $itemIndex . '_' . time() . '.png';
+                $imageAbsPath = $imageDir . '/' . $imageFileName;
+                $imgResult = $this->imageService->generateShortVerticalImage($imagePrompt, $imageAbsPath);
+                if (empty($imgResult['success'])) {
+                    throw new \RuntimeException($imgResult['error'] ?? 'Không thể tạo ảnh minh họa.');
+                }
+
+                $item['image_path'] = 'books/' . $audioBook->id . '/short_videos/images/' . $imageFileName;
+                $item['status'] = 'planned';
+                $item['updated_at'] = now()->toDateTimeString();
+                $successCount++;
+            } catch (\Throwable $e) {
+                $item['status'] = 'error';
+                $item['error_message'] = $e->getMessage();
+                $item['updated_at'] = now()->toDateTimeString();
+                $errorCount++;
+            }
+        }
+        unset($item);
+
+        $this->saveShortVideoItems($audioBook->id, $items);
+
+        return response()->json([
+            'success' => true,
+            'processed' => count($selectedLookup),
+            'completed' => $successCount,
+            'failed' => $errorCount,
+            'items' => array_map(fn($item) => $this->mapShortVideoItemForResponse($audioBook->id, $item), $items),
+        ]);
+    }
+
+    public function downloadSelectedShortResources(Request $request, AudioBook $audioBook)
+    {
+        $request->validate([
+            'selected_indices' => 'required|array|min:1',
+            'selected_indices.*' => 'integer|min:1',
+        ]);
+
+        $items = $this->loadShortVideoItems($audioBook->id);
+        if (empty($items)) {
+            return response()->json([
+                'success' => false,
+                'error' => 'Chưa có short video để tải tài nguyên.',
+            ], 404);
+        }
+
+        $selectedLookup = array_flip(array_values(array_unique(array_map('intval', (array) $request->input('selected_indices', [])))));
+        if (empty($selectedLookup)) {
+            return response()->json([
+                'success' => false,
+                'error' => 'Vui lòng chọn ít nhất 1 short.',
+            ], 422);
+        }
+
+        $tmpDir = storage_path('app/tmp');
+        if (!is_dir($tmpDir)) {
+            mkdir($tmpDir, 0775, true);
+        }
+
+        $zipFileName = 'short_resources_book_' . $audioBook->id . '_' . now()->format('Ymd_His') . '.zip';
+        $zipPath = $tmpDir . '/' . $zipFileName;
+
+        $zip = new \ZipArchive();
+        $opened = $zip->open($zipPath, \ZipArchive::CREATE | \ZipArchive::OVERWRITE);
+        if ($opened !== true) {
+            return response()->json([
+                'success' => false,
+                'error' => 'Không thể tạo file ZIP để tải.',
+            ], 500);
+        }
+
+        $addedCount = 0;
+        foreach ($items as $key => $item) {
+            $itemIndex = (int)($item['index'] ?? ($key + 1));
+            if (!isset($selectedLookup[$itemIndex])) {
+                continue;
+            }
+
+            $assetMap = [
+                'image' => $item['image_path'] ?? null,
+                'audio' => $item['audio_path'] ?? null,
+            ];
+
+            foreach ($assetMap as $type => $relativePath) {
+                if (empty($relativePath)) {
+                    continue;
+                }
+
+                $absPath = storage_path('app/public/' . ltrim((string)$relativePath, '/'));
+                if (!is_file($absPath)) {
+                    continue;
+                }
+
+                $ext = pathinfo($absPath, PATHINFO_EXTENSION);
+                $safeExt = $ext ? ('.' . $ext) : '';
+                $entryName = 'short_' . $itemIndex . '/' . $type . $safeExt;
+                if ($zip->addFile($absPath, $entryName)) {
+                    $addedCount++;
+                }
+            }
+        }
+
+        $zip->close();
+
+        if ($addedCount === 0) {
+            if (is_file($zipPath)) {
+                @unlink($zipPath);
+            }
+
+            return response()->json([
+                'success' => false,
+                'error' => 'Các short đã chọn chưa có ảnh hoặc TTS để tải.',
+            ], 422);
+        }
+
+        return response()->download($zipPath, $zipFileName, [
+            'Content-Type' => 'application/zip',
+        ])->deleteFileAfterSend(true);
+    }
+
+    public function generateShortVideoImagePrompt(AudioBook $audioBook, int $index)
+    {
+        $items = $this->loadShortVideoItems($audioBook->id);
+        if (empty($items)) {
+            return response()->json([
+                'success' => false,
+                'error' => 'Chưa có short video để tạo prompt.',
+            ], 404);
+        }
+
+        $targetKey = null;
+        $targetItem = null;
+        foreach ($items as $key => $item) {
+            $itemIndex = (int)($item['index'] ?? ($key + 1));
+            if ($itemIndex !== $index) {
+                continue;
+            }
+            $targetKey = $key;
+            $targetItem = $item;
+            break;
+        }
+
+        if ($targetKey === null || !$targetItem) {
+            return response()->json([
+                'success' => false,
+                'error' => 'Không tìm thấy short đã chọn.',
+            ], 404);
+        }
+
+        $script = trim((string)($targetItem['script'] ?? ''));
+        if ($script === '') {
+            return response()->json([
+                'success' => false,
+                'error' => 'Short chưa có nội dung script để tạo prompt ảnh.',
+            ], 422);
+        }
+
+        $apiKey = config('services.openai.api_key');
+        if (empty($apiKey)) {
+            return response()->json([
+                'success' => false,
+                'error' => 'Thiếu OPENAI_API_KEY. Vui lòng cấu hình để dùng ChatGPT AI.',
+            ], 500);
+        }
+
+        $bookTitle = trim((string)($audioBook->title ?? ''));
+        $style = trim((string)($targetItem['style'] ?? 'Cinematic'));
+        $title = trim((string)($targetItem['title'] ?? ('Short #' . $index)));
+
+        $systemPrompt = "You are an expert cinematic prompt engineer for vertical short-video cover images.";
+        $userPrompt = "Generate ONE English image prompt for AI image generation based on this short video content.\n"
+            . "Requirements:\n"
+            . "- Vertical composition 9:16 for YouTube Shorts/TikTok\n"
+            . "- Cinematic, vivid, emotional, high detail, dramatic lighting\n"
+            . "- No text, no captions, no logos, no watermark\n"
+            . "- Avoid violence/gore/explicit content\n"
+            . "- Keep under 90 words\n"
+            . "- Return ONLY the prompt text, no explanation\n\n"
+            . "Book title: {$bookTitle}\n"
+            . "Short title: {$title}\n"
+            . "Style: {$style}\n"
+            . "Short script:\n{$script}";
+
+        try {
+            $resp = Http::timeout(60)
+                ->withToken($apiKey)
+                ->post('https://api.openai.com/v1/chat/completions', [
+                    'model' => env('OPENAI_IMAGE_PROMPT_MODEL', 'gpt-4o-mini'),
+                    'messages' => [
+                        ['role' => 'system', 'content' => $systemPrompt],
+                        ['role' => 'user', 'content' => $userPrompt],
+                    ],
+                    'temperature' => 0.7,
+                    'max_tokens' => 220,
+                ]);
+
+            if (!$resp->successful()) {
+                return response()->json([
+                    'success' => false,
+                    'error' => 'OpenAI API lỗi: HTTP ' . $resp->status(),
+                ], 502);
+            }
+
+            $content = trim((string)data_get($resp->json(), 'choices.0.message.content', ''));
+            if ($content === '') {
+                return response()->json([
+                    'success' => false,
+                    'error' => 'ChatGPT không trả về prompt hợp lệ.',
+                ], 502);
+            }
+
+            $content = trim($content, " \t\n\r\0\x0B\"'");
+            $items[$targetKey]['image_prompt'] = $content;
+            $items[$targetKey]['updated_at'] = now()->toDateTimeString();
+
+            $this->saveShortVideoItems($audioBook->id, $items);
+
+            return response()->json([
+                'success' => true,
+                'generated_prompt' => $content,
+                'updated_index' => $index,
+                'items' => array_map(fn($item) => $this->mapShortVideoItemForResponse($audioBook->id, $item), $items),
+            ]);
+        } catch (\Throwable $e) {
+            Log::error('Lỗi tạo image prompt cho short bằng ChatGPT', [
+                'audio_book_id' => $audioBook->id,
+                'index' => $index,
+                'message' => $e->getMessage(),
+            ]);
+
+            return response()->json([
+                'success' => false,
+                'error' => 'Lỗi tạo prompt AI: ' . $e->getMessage(),
+            ], 500);
+        }
+    }
+
+    public function deleteShortVideo(AudioBook $audioBook, int $index)
+    {
+        $items = $this->loadShortVideoItems($audioBook->id);
+        if (empty($items)) {
+            return response()->json([
+                'success' => false,
+                'error' => 'Không có short video để xóa.',
+            ], 404);
+        }
+
+        $removed = null;
+        foreach ($items as $key => $item) {
+            $itemIndex = (int)($item['index'] ?? ($key + 1));
+            if ($itemIndex !== $index) {
+                continue;
+            }
+
+            $removed = $item;
+            unset($items[$key]);
+            break;
+        }
+
+        if (!$removed) {
+            return response()->json([
+                'success' => false,
+                'error' => 'Không tìm thấy short đã chọn.',
+            ], 404);
+        }
+
+        $this->deleteShortVideoAssetFile($removed['audio_path'] ?? null);
+        $this->deleteShortVideoAssetFile($removed['image_path'] ?? null);
+        $this->deleteShortVideoAssetFile($removed['video_path'] ?? null);
+        $this->deleteShortVideoShotAssets($removed);
+
+        $items = array_values($items);
+        foreach ($items as $i => &$item) {
+            $item['index'] = $i + 1;
+            $item['updated_at'] = now()->toDateTimeString();
+        }
+        unset($item);
+
+        try {
+            $this->saveShortVideoItems($audioBook->id, $items);
+        } catch (\Throwable $e) {
+            Log::error('Không thể lưu shorts.json sau khi xóa short', [
+                'audio_book_id' => $audioBook->id,
+                'index' => $index,
+                'exception' => $e,
+            ]);
+
+            return response()->json([
+                'success' => false,
+                'error' => 'Không thể cập nhật danh sách short do lỗi quyền ghi file. Vui lòng kiểm tra thư mục storage/app/public/books/' . $audioBook->id . '/short_videos',
+            ], 500);
+        }
+
+        return response()->json([
+            'success' => true,
+            'deleted_index' => $index,
+            'items' => array_map(fn($item) => $this->mapShortVideoItemForResponse($audioBook->id, $item), $items),
+        ]);
+    }
+
+    public function updateShortVideo(Request $request, AudioBook $audioBook, int $index)
+    {
+        $request->validate([
+            'script' => 'nullable|string|min:10|max:5000',
+            'image_prompt' => 'nullable|string|min:10|max:5000',
+        ]);
+
+        $hasScript = $request->has('script');
+        $hasImagePrompt = $request->has('image_prompt');
+        if (!$hasScript && !$hasImagePrompt) {
+            return response()->json([
+                'success' => false,
+                'error' => 'Không có dữ liệu cần cập nhật.',
+            ], 422);
+        }
+
+        $items = $this->loadShortVideoItems($audioBook->id);
+        if (empty($items)) {
+            return response()->json([
+                'success' => false,
+                'error' => 'Không có short video để cập nhật.',
+            ], 404);
+        }
+
+        $updated = false;
+        foreach ($items as $key => &$item) {
+            $itemIndex = (int)($item['index'] ?? ($key + 1));
+            if ($itemIndex !== $index) {
+                continue;
+            }
+
+            $newScript = $hasScript ? trim((string) $request->input('script')) : trim((string)($item['script'] ?? ''));
+            $newImagePrompt = $hasImagePrompt ? trim((string) $request->input('image_prompt')) : trim((string)($item['image_prompt'] ?? ''));
+
+            $scriptChanged = $newScript !== trim((string)($item['script'] ?? ''));
+            $imagePromptChanged = $newImagePrompt !== trim((string)($item['image_prompt'] ?? ''));
+
+            $item['script'] = $newScript;
+            $item['image_prompt'] = $newImagePrompt;
+            $item['status'] = 'planned';
+            $item['error_message'] = null;
+            $item['updated_at'] = now()->toDateTimeString();
+
+            if ($scriptChanged && !empty($item['audio_path'])) {
+                $this->deleteShortVideoAssetFile($item['audio_path']);
+                $item['audio_path'] = null;
+                $item['duration'] = null;
+            }
+
+            if ($scriptChanged) {
+                $this->deleteShortVideoShotAssets($item);
+                $item['shots'] = [];
+                $item['story_bible'] = null;
+                $item['character_bible'] = null;
+            }
+
+            if (($scriptChanged || $imagePromptChanged) && !empty($item['image_path'])) {
+                $this->deleteShortVideoAssetFile($item['image_path']);
+                $item['image_path'] = null;
+            }
+
+            if (($scriptChanged || $imagePromptChanged) && !empty($item['video_path'])) {
+                $this->deleteShortVideoAssetFile($item['video_path']);
+                $item['video_path'] = null;
+            }
+
+            $updated = true;
+            break;
+        }
+        unset($item);
+
+        if (!$updated) {
+            return response()->json([
+                'success' => false,
+                'error' => 'Không tìm thấy short đã chọn.',
+            ], 404);
+        }
+
+        $this->saveShortVideoItems($audioBook->id, $items);
+
+        return response()->json([
+            'success' => true,
+            'updated_index' => $index,
+            'items' => array_map(fn($item) => $this->mapShortVideoItemForResponse($audioBook->id, $item), $items),
+        ]);
+    }
+
+    public function getShortVideoWorkspace(AudioBook $audioBook, int $index)
+    {
+        $items = $this->loadShortVideoItems($audioBook->id);
+        $itemKey = $this->findShortVideoItemIndex($items, $index);
+
+        if ($itemKey === null) {
+            return response()->json([
+                'success' => false,
+                'error' => 'Không tìm thấy short đã chọn.',
+            ], 404);
+        }
+
+        $item = $items[$itemKey];
+        $shots = is_array($item['shots'] ?? null) ? array_values($item['shots']) : [];
+
+        if (!empty($shots)) {
+            [$enrichedShots, $translationChanged] = $this->ensureShortShotPromptTranslations($shots, $audioBook->id, $index);
+            if ($translationChanged) {
+                $item['shots'] = $enrichedShots;
+                $item['updated_at'] = now()->toDateTimeString();
+                $items[$itemKey] = $item;
+                $this->saveShortVideoItems($audioBook->id, $items);
+            }
+        }
+
+        $item = $this->mapShortVideoItemForResponse($audioBook->id, $item);
+
+        return response()->json([
+            'success' => true,
+            'item' => $item,
+            'workspace_ready' => !empty($item['shots']) && is_array($item['shots']),
+        ]);
+    }
+
+    public function buildShortVideoWorkspace(Request $request, AudioBook $audioBook, int $index)
+    {
+        $request->validate([
+            'force' => 'nullable|boolean',
+        ]);
+
+        $items = $this->loadShortVideoItems($audioBook->id);
+        $itemKey = $this->findShortVideoItemIndex($items, $index);
+
+        if ($itemKey === null) {
+            return response()->json([
+                'success' => false,
+                'error' => 'Không tìm thấy short đã chọn.',
+            ], 404);
+        }
+
+        $item = $items[$itemKey];
+        $script = trim((string)($item['script'] ?? ''));
+        if ($script === '') {
+            return response()->json([
+                'success' => false,
+                'error' => 'Short chưa có script để tách câu.',
+            ], 422);
+        }
+
+        $force = (bool) $request->boolean('force', false);
+        if ($force) {
+            $this->deleteShortVideoShotAssets($item);
+        }
+
+        $workspace = $this->buildShortStoryboardData($audioBook, $item, $index);
+
+        $item['shots'] = $workspace['shots'];
+        $item['story_bible'] = $workspace['story_bible'];
+        $item['character_bible'] = $workspace['character_bible'];
+        $item['workspace_updated_at'] = now()->toDateTimeString();
+        $item['status'] = 'planned';
+        $item['error_message'] = null;
+        $item['updated_at'] = now()->toDateTimeString();
+
+        if (!empty($item['video_path'])) {
+            $this->deleteShortVideoAssetFile($item['video_path']);
+            $item['video_path'] = null;
+            $item['duration'] = null;
+        }
+
+        $items[$itemKey] = $item;
+        $this->saveShortVideoItems($audioBook->id, $items);
+
+        return response()->json([
+            'success' => true,
+            'item' => $this->mapShortVideoItemForResponse($audioBook->id, $item),
+        ]);
+    }
+
+    public function updateShortVideoShot(Request $request, AudioBook $audioBook, int $index, int $shotIndex)
+    {
+        $request->validate([
+            'sentence' => 'nullable|string|min:1|max:5000',
+            'image_prompt' => 'nullable|string|min:5|max:5000',
+            'kling_prompt' => 'nullable|string|min:5|max:5000',
+            'reference_shot_indices' => 'nullable|array',
+            'reference_shot_indices.*' => 'integer|min:1',
+            'is_reference_keyframe' => 'nullable|boolean',
+        ]);
+
+        $items = $this->loadShortVideoItems($audioBook->id);
+        $itemKey = $this->findShortVideoItemIndex($items, $index);
+
+        if ($itemKey === null) {
+            return response()->json([
+                'success' => false,
+                'error' => 'Không tìm thấy short đã chọn.',
+            ], 404);
+        }
+
+        $item = $items[$itemKey];
+        $shots = is_array($item['shots'] ?? null) ? $item['shots'] : [];
+        if (empty($shots)) {
+            return response()->json([
+                'success' => false,
+                'error' => 'Short chưa được tách câu. Hãy bấm "Build Workspace" trước.',
+            ], 422);
+        }
+
+        $targetKey = null;
+        foreach ($shots as $key => $shot) {
+            if ((int)($shot['shot_index'] ?? ($key + 1)) === $shotIndex) {
+                $targetKey = $key;
+                break;
+            }
+        }
+
+        if ($targetKey === null) {
+            return response()->json([
+                'success' => false,
+                'error' => 'Không tìm thấy câu/shot đã chọn.',
+            ], 404);
+        }
+
+        $shot = $shots[$targetKey];
+
+        $oldSentence = trim((string)($shot['sentence'] ?? ''));
+        $oldImagePrompt = trim((string)($shot['image_prompt'] ?? ''));
+        $oldKlingPrompt = trim((string)($shot['kling_prompt'] ?? ''));
+        $oldRefIndices = array_values(array_unique(array_filter(array_map('intval', (array)($shot['reference_shot_indices'] ?? [])), fn($val) => $val > 0 && $val !== $shotIndex)));
+        sort($oldRefIndices);
+        $oldIsReferenceKeyframe = (bool)($shot['is_reference_keyframe'] ?? false);
+
+        if ($request->has('sentence')) {
+            $shot['sentence'] = trim((string)$request->input('sentence'));
+        }
+        if ($request->has('image_prompt')) {
+            $shot['image_prompt'] = trim((string)$request->input('image_prompt'));
+        }
+        if ($request->has('kling_prompt')) {
+            $shot['kling_prompt'] = trim((string)$request->input('kling_prompt'));
+        }
+        if ($request->has('reference_shot_indices')) {
+            $refIndices = array_values(array_unique(array_map('intval', (array)$request->input('reference_shot_indices', []))));
+            $shot['reference_shot_indices'] = array_values(array_filter($refIndices, fn($val) => $val > 0 && $val !== $shotIndex));
+        }
+        if ($request->has('is_reference_keyframe')) {
+            $shot['is_reference_keyframe'] = (bool) $request->boolean('is_reference_keyframe');
+        }
+
+        $newSentence = trim((string)($shot['sentence'] ?? ''));
+        $newImagePrompt = trim((string)($shot['image_prompt'] ?? ''));
+        $newKlingPrompt = trim((string)($shot['kling_prompt'] ?? ''));
+        $newRefIndices = array_values(array_unique(array_filter(array_map('intval', (array)($shot['reference_shot_indices'] ?? [])), fn($val) => $val > 0 && $val !== $shotIndex)));
+        sort($newRefIndices);
+        $newIsReferenceKeyframe = (bool)($shot['is_reference_keyframe'] ?? false);
+
+        $sentenceChanged = $oldSentence !== $newSentence;
+        $visualChanged = $oldImagePrompt !== $newImagePrompt ||
+            $oldKlingPrompt !== $newKlingPrompt ||
+            $oldRefIndices !== $newRefIndices ||
+            $oldIsReferenceKeyframe !== $newIsReferenceKeyframe;
+
+        if ($sentenceChanged && !empty($shot['tts_audio_path'])) {
+            $this->deleteShortVideoAssetFile($shot['tts_audio_path']);
+            $shot['tts_audio_path'] = null;
+            $shot['tts_duration'] = null;
+        }
+
+        if ($visualChanged && !empty($shot['image_path'])) {
+            $this->deleteShortVideoAssetFile($shot['image_path']);
+            $shot['image_path'] = null;
+            $shot['resolved_image_prompt'] = null;
+        }
+
+        if (($sentenceChanged || $visualChanged) && !empty($shot['kling_video_path'])) {
+            $this->deleteShortVideoAssetFile($shot['kling_video_path']);
+            $shot['kling_video_path'] = null;
+        }
+
+        if (($sentenceChanged || $visualChanged) && !empty($shot['segment_video_path'])) {
+            $this->deleteShortVideoAssetFile($shot['segment_video_path']);
+            $shot['segment_video_path'] = null;
+        }
+
+        if ($sentenceChanged || $visualChanged) {
+            $shot['kling_task_id'] = null;
+            $shot['kling_status'] = null;
+            $shot['error_message'] = null;
+        }
+
+        $shot['updated_at'] = now()->toDateTimeString();
+        $shots[$targetKey] = $shot;
+        $item['shots'] = $shots;
+
+        if (!empty($item['video_path'])) {
+            $this->deleteShortVideoAssetFile($item['video_path']);
+            $item['video_path'] = null;
+            $item['duration'] = null;
+        }
+
+        $item['updated_at'] = now()->toDateTimeString();
+        $item['status'] = 'planned';
+        $items[$itemKey] = $item;
+        $this->saveShortVideoItems($audioBook->id, $items);
+
+        return response()->json([
+            'success' => true,
+            'item' => $this->mapShortVideoItemForResponse($audioBook->id, $item),
+        ]);
+    }
+
+    public function generateShortVideoShotTts(Request $request, AudioBook $audioBook, int $index)
+    {
+        $request->validate([
+            'selected_shot_indices' => 'nullable|array',
+            'selected_shot_indices.*' => 'integer|min:1',
+            'provider' => 'nullable|string|in:openai,gemini,microsoft,vbee',
+            'voice_name' => 'nullable|string',
+            'voice_gender' => 'nullable|string|in:male,female',
+            'style_instruction' => 'nullable|string',
+            'tts_speed' => 'nullable|numeric|between:0.5,2.0',
+        ]);
+
+        $items = $this->loadShortVideoItems($audioBook->id);
+        $itemKey = $this->findShortVideoItemIndex($items, $index);
+
+        if ($itemKey === null) {
+            return response()->json(['success' => false, 'error' => 'Không tìm thấy short đã chọn.'], 404);
+        }
+
+        $item = $items[$itemKey];
+        $shots = is_array($item['shots'] ?? null) ? $item['shots'] : [];
+        if (empty($shots)) {
+            return response()->json(['success' => false, 'error' => 'Short chưa được tách câu.'], 422);
+        }
+
+        $selectedIndices = $this->getSelectedShotIndices($shots, $request->input('selected_shot_indices'));
+        if (empty($selectedIndices)) {
+            return response()->json(['success' => false, 'error' => 'Không có câu/shot hợp lệ để tạo TTS.'], 422);
+        }
+
+        $ttsOptions = $this->resolveShortVideoTtsOptions($request, $audioBook);
+        if (empty($ttsOptions['voice_name'])) {
+            return response()->json([
+                'success' => false,
+                'error' => 'Thiếu voice_name. Vui lòng cấu hình giọng TTS trước.',
+            ], 422);
+        }
+
+        $dirs = $this->ensureShortVideoAssetDirs($audioBook->id);
+        $shotAudioDir = $dirs['shot_audio'];
+
+        $completed = 0;
+        $failed = 0;
+
+        foreach ($shots as $key => $shot) {
+            $shotNo = (int)($shot['shot_index'] ?? ($key + 1));
+            if (!in_array($shotNo, $selectedIndices, true)) {
+                continue;
+            }
+
+            try {
+                $sentence = trim((string)($shot['sentence'] ?? ''));
+                if ($sentence === '') {
+                    throw new \RuntimeException('Shot chưa có nội dung câu để tạo TTS.');
+                }
+
+                $tempAudioRelPath = $this->ttsService->generateAudio(
+                    $sentence,
+                    ($index * 1000) + $shotNo,
+                    $ttsOptions['voice_gender'],
+                    $ttsOptions['voice_name'],
+                    $ttsOptions['provider'],
+                    $ttsOptions['style_instruction'],
+                    null,
+                    $ttsOptions['tts_speed']
+                );
+
+                $tempAudioAbsPath = storage_path('app/' . $tempAudioRelPath);
+                if (!file_exists($tempAudioAbsPath)) {
+                    throw new \RuntimeException('Không tìm thấy file audio tạm từ TTS.');
+                }
+
+                if (!empty($shot['tts_audio_path'])) {
+                    $this->deleteShortVideoAssetFile($shot['tts_audio_path']);
+                }
+
+                if (!empty($shot['segment_video_path'])) {
+                    $this->deleteShortVideoAssetFile($shot['segment_video_path']);
+                    $shot['segment_video_path'] = null;
+                }
+
+                $audioFileName = 'short_' . $index . '_shot_' . $shotNo . '_' . time() . '.mp3';
+                $audioAbsPath = $shotAudioDir . '/' . $audioFileName;
+                copy($tempAudioAbsPath, $audioAbsPath);
+                @unlink($tempAudioAbsPath);
+
+                $audioDuration = (float)($this->getAudioDuration($audioAbsPath) ?? 0.0);
+                if ($audioDuration <= 0) {
+                    $audioDuration = 3.0;
+                }
+
+                $shot['tts_audio_path'] = 'books/' . $audioBook->id . '/short_videos/shots/audio/' . $audioFileName;
+                $shot['tts_duration'] = round($audioDuration, 3);
+                $shot['error_message'] = null;
+                $shot['updated_at'] = now()->toDateTimeString();
+                $completed++;
+            } catch (\Throwable $e) {
+                $shot['error_message'] = $e->getMessage();
+                $shot['updated_at'] = now()->toDateTimeString();
+                $failed++;
+            }
+
+            $shots[$key] = $shot;
+        }
+
+        $item['shots'] = $shots;
+        if (!empty($item['video_path'])) {
+            $this->deleteShortVideoAssetFile($item['video_path']);
+            $item['video_path'] = null;
+            $item['duration'] = null;
+        }
+        $item['status'] = 'planned';
+        $item['updated_at'] = now()->toDateTimeString();
+
+        $items[$itemKey] = $item;
+        $this->saveShortVideoItems($audioBook->id, $items);
+
+        return response()->json([
+            'success' => true,
+            'completed' => $completed,
+            'failed' => $failed,
+            'item' => $this->mapShortVideoItemForResponse($audioBook->id, $item),
+        ]);
+    }
+
+    public function generateShortVideoShotImages(Request $request, AudioBook $audioBook, int $index)
+    {
+        $request->validate([
+            'selected_shot_indices' => 'nullable|array',
+            'selected_shot_indices.*' => 'integer|min:1',
+        ]);
+
+        $items = $this->loadShortVideoItems($audioBook->id);
+        $itemKey = $this->findShortVideoItemIndex($items, $index);
+
+        if ($itemKey === null) {
+            return response()->json(['success' => false, 'error' => 'Không tìm thấy short đã chọn.'], 404);
+        }
+
+        $item = $items[$itemKey];
+        $shots = is_array($item['shots'] ?? null) ? $item['shots'] : [];
+        if (empty($shots)) {
+            return response()->json(['success' => false, 'error' => 'Short chưa được tách câu.'], 422);
+        }
+
+        $selectedIndices = $this->getSelectedShotIndices($shots, $request->input('selected_shot_indices'));
+        if (empty($selectedIndices)) {
+            return response()->json(['success' => false, 'error' => 'Không có câu/shot hợp lệ để tạo ảnh.'], 422);
+        }
+
+        $dirs = $this->ensureShortVideoAssetDirs($audioBook->id);
+        $shotImageDir = $dirs['shot_images'];
+
+        $completed = 0;
+        $failed = 0;
+
+        foreach ($shots as $key => $shot) {
+            $shotNo = (int)($shot['shot_index'] ?? ($key + 1));
+            if (!in_array($shotNo, $selectedIndices, true)) {
+                continue;
+            }
+
+            try {
+                $imagePrompt = trim((string)($shot['image_prompt'] ?? ''));
+                if ($imagePrompt === '') {
+                    throw new \RuntimeException('Shot chưa có image_prompt.');
+                }
+
+                if (!empty($shot['image_path'])) {
+                    $this->deleteShortVideoAssetFile($shot['image_path']);
+                }
+
+                if (!empty($shot['kling_video_path'])) {
+                    $this->deleteShortVideoAssetFile($shot['kling_video_path']);
+                    $shot['kling_video_path'] = null;
+                }
+
+                if (!empty($shot['segment_video_path'])) {
+                    $this->deleteShortVideoAssetFile($shot['segment_video_path']);
+                    $shot['segment_video_path'] = null;
+                }
+
+                $finalPrompt = $this->buildShortShotImagePromptWithContinuity($item, $shots, $shot);
+
+                $imageFileName = 'short_' . $index . '_shot_' . $shotNo . '_' . time() . '.png';
+                $imageAbsPath = $shotImageDir . '/' . $imageFileName;
+
+                $imgResult = $this->imageService->generateShortVerticalImage($finalPrompt, $imageAbsPath);
+                if (empty($imgResult['success'])) {
+                    $imgError = trim((string)($imgResult['error'] ?? ''));
+                    throw new \RuntimeException($imgError !== '' ? $imgError : 'Không thể tạo ảnh minh họa.');
+                }
+
+                $shot['image_path'] = 'books/' . $audioBook->id . '/short_videos/shots/images/' . $imageFileName;
+                $shot['resolved_image_prompt'] = $finalPrompt;
+                $shot['kling_task_id'] = null;
+                $shot['kling_status'] = null;
+                $shot['error_message'] = null;
+                $shot['updated_at'] = now()->toDateTimeString();
+                $completed++;
+            } catch (\Throwable $e) {
+                $imgError = trim((string)$e->getMessage());
+                $shot['error_message'] = $imgError !== '' ? $imgError : 'Tạo ảnh thất bại (không có thông báo lỗi chi tiết).';
+                $shot['updated_at'] = now()->toDateTimeString();
+                $failed++;
+            }
+
+            $shots[$key] = $shot;
+        }
+
+        $item['shots'] = $shots;
+        if (!empty($item['video_path'])) {
+            $this->deleteShortVideoAssetFile($item['video_path']);
+            $item['video_path'] = null;
+            $item['duration'] = null;
+        }
+        $item['status'] = 'planned';
+        $item['updated_at'] = now()->toDateTimeString();
+
+        $items[$itemKey] = $item;
+        $this->saveShortVideoItems($audioBook->id, $items);
+
+        return response()->json([
+            'success' => true,
+            'completed' => $completed,
+            'failed' => $failed,
+            'item' => $this->mapShortVideoItemForResponse($audioBook->id, $item),
+        ]);
+    }
+
+    public function startShortVideoShotKling(Request $request, AudioBook $audioBook, int $index)
+    {
+        $request->validate([
+            'selected_shot_indices' => 'nullable|array',
+            'selected_shot_indices.*' => 'integer|min:1',
+            'duration' => 'nullable|in:5,10',
+        ]);
+
+        $items = $this->loadShortVideoItems($audioBook->id);
+        $itemKey = $this->findShortVideoItemIndex($items, $index);
+
+        if ($itemKey === null) {
+            return response()->json(['success' => false, 'error' => 'Không tìm thấy short đã chọn.'], 404);
+        }
+
+        $item = $items[$itemKey];
+        $shots = is_array($item['shots'] ?? null) ? $item['shots'] : [];
+        if (empty($shots)) {
+            return response()->json(['success' => false, 'error' => 'Short chưa được tách câu.'], 422);
+        }
+
+        $selectedIndices = $this->getSelectedShotIndices($shots, $request->input('selected_shot_indices'));
+        if (empty($selectedIndices)) {
+            return response()->json(['success' => false, 'error' => 'Không có câu/shot hợp lệ để chạy Kling.'], 422);
+        }
+
+        $duration = (string)($request->input('duration', '5'));
+        $queued = 0;
+        $failed = 0;
+
+        foreach ($shots as $key => $shot) {
+            $shotNo = (int)($shot['shot_index'] ?? ($key + 1));
+            if (!in_array($shotNo, $selectedIndices, true)) {
+                continue;
+            }
+
+            try {
+                if (empty($shot['image_path'])) {
+                    throw new \RuntimeException('Shot chưa có ảnh để chạy Kling.');
+                }
+
+                $klingPrompt = trim((string)($shot['kling_prompt'] ?? ''));
+                if ($klingPrompt === '') {
+                    $klingPrompt = 'Cinematic motion with consistent characters, smooth camera move, natural facial and cloth movement, no sudden jump cuts.';
+                }
+
+                $result = $this->klingService->createImageToVideoTask(
+                    $shot['image_path'],
+                    $klingPrompt,
+                    ['duration' => $duration]
+                );
+
+                if (empty($result['success']) || empty($result['task_id'])) {
+                    $klingError = trim((string)($result['error'] ?? ''));
+                    throw new \RuntimeException($klingError !== '' ? $klingError : 'Không thể tạo task Kling.');
+                }
+
+                $shot['kling_task_id'] = $result['task_id'];
+                $shot['kling_status'] = 'queued';
+                $shot['error_message'] = null;
+                $shot['updated_at'] = now()->toDateTimeString();
+                $queued++;
+            } catch (\Throwable $e) {
+                $klingError = trim((string)$e->getMessage());
+                $shot['error_message'] = $klingError !== '' ? $klingError : 'Chạy Kling thất bại (không có thông báo lỗi chi tiết).';
+                $shot['kling_status'] = 'failed';
+                $shot['updated_at'] = now()->toDateTimeString();
+                $failed++;
+            }
+
+            $shots[$key] = $shot;
+        }
+
+        $item['shots'] = $shots;
+        $item['updated_at'] = now()->toDateTimeString();
+        $items[$itemKey] = $item;
+        $this->saveShortVideoItems($audioBook->id, $items);
+
+        return response()->json([
+            'success' => true,
+            'queued' => $queued,
+            'failed' => $failed,
+            'item' => $this->mapShortVideoItemForResponse($audioBook->id, $item),
+        ]);
+    }
+
+    public function pollShortVideoShotKling(Request $request, AudioBook $audioBook, int $index)
+    {
+        $request->validate([
+            'selected_shot_indices' => 'nullable|array',
+            'selected_shot_indices.*' => 'integer|min:1',
+        ]);
+
+        $items = $this->loadShortVideoItems($audioBook->id);
+        $itemKey = $this->findShortVideoItemIndex($items, $index);
+
+        if ($itemKey === null) {
+            return response()->json(['success' => false, 'error' => 'Không tìm thấy short đã chọn.'], 404);
+        }
+
+        $item = $items[$itemKey];
+        $shots = is_array($item['shots'] ?? null) ? $item['shots'] : [];
+        if (empty($shots)) {
+            return response()->json(['success' => false, 'error' => 'Short chưa được tách câu.'], 422);
+        }
+
+        $selectedIndices = $this->getSelectedShotIndices($shots, $request->input('selected_shot_indices'));
+        if (empty($selectedIndices)) {
+            return response()->json(['success' => false, 'error' => 'Không có câu/shot hợp lệ để kiểm tra Kling.'], 422);
+        }
+
+        $completed = 0;
+        $failed = 0;
+        $processing = 0;
+
+        foreach ($shots as $key => $shot) {
+            $shotNo = (int)($shot['shot_index'] ?? ($key + 1));
+            if (!in_array($shotNo, $selectedIndices, true)) {
+                continue;
+            }
+            if (empty($shot['kling_task_id'])) {
+                continue;
+            }
+
+            try {
+                $statusResult = $this->klingService->getTaskStatus((string)$shot['kling_task_id']);
+                if (empty($statusResult['success'])) {
+                    throw new \RuntimeException($statusResult['error'] ?? 'Không lấy được trạng thái Kling.');
+                }
+
+                $status = (string)($statusResult['status'] ?? 'processing');
+                $shot['kling_status'] = $status;
+
+                if ($status === 'completed' && !empty($statusResult['video_url'])) {
+                    if (!empty($shot['kling_video_path'])) {
+                        $this->deleteShortVideoAssetFile($shot['kling_video_path']);
+                    }
+
+                    $videoFileName = 'short_' . $index . '_shot_' . $shotNo . '_kling_' . time() . '.mp4';
+                    $relativePath = 'books/' . $audioBook->id . '/short_videos/shots/videos/' . $videoFileName;
+                    $this->downloadVideoToPublicStorage((string)$statusResult['video_url'], $relativePath);
+
+                    $shot['kling_video_path'] = $relativePath;
+                    $shot['error_message'] = null;
+                    $completed++;
+                } elseif ($status === 'failed') {
+                    $statusError = trim((string)($statusResult['error'] ?? ''));
+                    $shot['error_message'] = $statusError !== '' ? $statusError : 'Kling xử lý thất bại.';
+                    $failed++;
+                } else {
+                    $processing++;
+                }
+
+                $shot['updated_at'] = now()->toDateTimeString();
+            } catch (\Throwable $e) {
+                $shot['kling_status'] = 'failed';
+                $pollError = trim((string)$e->getMessage());
+                $shot['error_message'] = $pollError !== '' ? $pollError : 'Poll Kling thất bại (không có thông báo lỗi chi tiết).';
+                $shot['updated_at'] = now()->toDateTimeString();
+                $failed++;
+            }
+
+            $shots[$key] = $shot;
+        }
+
+        $item['shots'] = $shots;
+        $item['updated_at'] = now()->toDateTimeString();
+        $items[$itemKey] = $item;
+        $this->saveShortVideoItems($audioBook->id, $items);
+
+        return response()->json([
+            'success' => true,
+            'completed' => $completed,
+            'processing' => $processing,
+            'failed' => $failed,
+            'item' => $this->mapShortVideoItemForResponse($audioBook->id, $item),
+        ]);
+    }
+
+    public function composeShortVideoFromShots(Request $request, AudioBook $audioBook, int $index)
+    {
+        $request->validate([
+            'selected_shot_indices' => 'nullable|array',
+            'selected_shot_indices.*' => 'integer|min:1',
+        ]);
+
+        $items = $this->loadShortVideoItems($audioBook->id);
+        $itemKey = $this->findShortVideoItemIndex($items, $index);
+        if ($itemKey === null) {
+            return response()->json(['success' => false, 'error' => 'Không tìm thấy short đã chọn.'], 404);
+        }
+
+        $item = $items[$itemKey];
+        $shots = is_array($item['shots'] ?? null) ? $item['shots'] : [];
+        if (empty($shots)) {
+            return response()->json(['success' => false, 'error' => 'Short chưa có shots để ghép video.'], 422);
+        }
+
+        $selectedIndices = $this->getSelectedShotIndices($shots, $request->input('selected_shot_indices'));
+        if (empty($selectedIndices)) {
+            return response()->json(['success' => false, 'error' => 'Không có shot hợp lệ để ghép video.'], 422);
+        }
+
+        $dirs = $this->ensureShortVideoAssetDirs($audioBook->id);
+        $ffmpegPath = config('services.ffmpeg.path', env('FFMPEG_PATH', 'ffmpeg'));
+
+        $tempDir = storage_path('app/temp/short_compose_' . $audioBook->id . '_' . $index . '_' . time());
+        if (!is_dir($tempDir)) {
+            mkdir($tempDir, 0775, true);
+        }
+
+        $segmentPaths = [];
+        $totalDuration = 0.0;
+
+        try {
+            foreach ($selectedIndices as $shotNo) {
+                $shotKey = null;
+                foreach ($shots as $key => $shot) {
+                    if ((int)($shot['shot_index'] ?? ($key + 1)) === $shotNo) {
+                        $shotKey = $key;
+                        break;
+                    }
+                }
+
+                if ($shotKey === null) {
+                    continue;
+                }
+
+                $shot = $shots[$shotKey];
+                $audioRel = (string)($shot['tts_audio_path'] ?? '');
+                if ($audioRel === '') {
+                    throw new \RuntimeException('Shot #' . $shotNo . ' chưa có TTS.');
+                }
+
+                $audioAbs = storage_path('app/public/' . ltrim($audioRel, '/'));
+                if (!file_exists($audioAbs)) {
+                    throw new \RuntimeException('Không tìm thấy audio của shot #' . $shotNo . '.');
+                }
+
+                $duration = (float)($shot['tts_duration'] ?? 0.0);
+                if ($duration <= 0) {
+                    $duration = (float)($this->getAudioDuration($audioAbs) ?? 0.0);
+                }
+                if ($duration <= 0) {
+                    $duration = 3.0;
+                }
+
+                $segmentFileName = 'short_' . $index . '_shot_' . $shotNo . '_segment_' . time() . '.mp4';
+                $segmentRelPath = 'books/' . $audioBook->id . '/short_videos/shots/videos/' . $segmentFileName;
+                $segmentAbsPath = storage_path('app/public/' . $segmentRelPath);
+
+                $segmentDir = dirname($segmentAbsPath);
+                if (!is_dir($segmentDir)) {
+                    mkdir($segmentDir, 0775, true);
+                }
+
+                if (!empty($shot['segment_video_path'])) {
+                    $this->deleteShortVideoAssetFile($shot['segment_video_path']);
+                }
+
+                $sourceVideoAbs = null;
+                if (!empty($shot['kling_video_path'])) {
+                    $klingVideoAbs = storage_path('app/public/' . ltrim((string)$shot['kling_video_path'], '/'));
+                    if (file_exists($klingVideoAbs)) {
+                        $sourceVideoAbs = $klingVideoAbs;
+                    }
+                }
+
+                $sourceImageAbs = null;
+                if (!$sourceVideoAbs && !empty($shot['image_path'])) {
+                    $imageAbs = storage_path('app/public/' . ltrim((string)$shot['image_path'], '/'));
+                    if (file_exists($imageAbs)) {
+                        $sourceImageAbs = $imageAbs;
+                    }
+                }
+
+                if (!$sourceVideoAbs && !$sourceImageAbs) {
+                    throw new \RuntimeException('Shot #' . $shotNo . ' chưa có Kling video hoặc ảnh để tạo segment.');
+                }
+
+                $this->composeShortShotSegment(
+                    $ffmpegPath,
+                    $sourceVideoAbs,
+                    $sourceImageAbs,
+                    $audioAbs,
+                    $duration,
+                    $segmentAbsPath
+                );
+
+                $shot['segment_video_path'] = $segmentRelPath;
+                $shot['updated_at'] = now()->toDateTimeString();
+                $shots[$shotKey] = $shot;
+
+                $segmentPaths[] = $segmentAbsPath;
+                $totalDuration += $duration;
+            }
+
+            if (empty($segmentPaths)) {
+                throw new \RuntimeException('Không tạo được segment nào để ghép.');
+            }
+
+            if (!empty($item['video_path'])) {
+                $this->deleteShortVideoAssetFile($item['video_path']);
+            }
+
+            $outputFileName = 'short_' . $index . '_story_' . time() . '.mp4';
+            $outputRelPath = 'books/' . $audioBook->id . '/short_videos/videos/' . $outputFileName;
+            $outputAbsPath = storage_path('app/public/' . $outputRelPath);
+
+            $listPath = $tempDir . '/concat_list.txt';
+            $listContent = '';
+            foreach ($segmentPaths as $segPath) {
+                $escapedPath = str_replace("'", "'\\''", $segPath);
+                $listContent .= "file '{$escapedPath}'\n";
+            }
+            file_put_contents($listPath, $listContent);
+
+            $concatCmd = sprintf(
+                '%s -y -f concat -safe 0 -i %s -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 192k %s 2>&1',
+                escapeshellarg($ffmpegPath),
+                escapeshellarg($listPath),
+                escapeshellarg($outputAbsPath)
+            );
+            $this->runFfmpegCommand($concatCmd, 'Ghép các segment thành video full short thất bại.');
+
+            $item['shots'] = $shots;
+            $item['video_path'] = $outputRelPath;
+            $item['duration'] = round($totalDuration, 3);
+            $item['status'] = 'completed';
+            $item['error_message'] = null;
+            $item['updated_at'] = now()->toDateTimeString();
+
+            $items[$itemKey] = $item;
+            $this->saveShortVideoItems($audioBook->id, $items);
+
+            return response()->json([
+                'success' => true,
+                'video_path' => $outputRelPath,
+                'video_url' => asset('storage/' . $outputRelPath),
+                'duration' => $item['duration'],
+                'item' => $this->mapShortVideoItemForResponse($audioBook->id, $item),
+            ]);
+        } catch (\Throwable $e) {
+            return response()->json([
+                'success' => false,
+                'error' => $e->getMessage(),
+            ], 500);
+        } finally {
+            if (is_dir($tempDir)) {
+                $files = glob($tempDir . '/*') ?: [];
+                foreach ($files as $file) {
+                    @unlink($file);
+                }
+                @rmdir($tempDir);
+            }
+        }
+    }
+
+    public function downloadShortVideoWorkspacePackage(Request $request, AudioBook $audioBook, int $index)
+    {
+        $request->validate([
+            'dry_run' => 'nullable|boolean',
+            'allow_missing' => 'nullable|boolean',
+        ]);
+
+        $dryRun = (bool)$request->boolean('dry_run', false);
+        $allowMissing = (bool)$request->boolean('allow_missing', false);
+
+        $items = $this->loadShortVideoItems($audioBook->id);
+        $itemKey = $this->findShortVideoItemIndex($items, $index);
+        if ($itemKey === null) {
+            return response()->json(['success' => false, 'error' => 'Không tìm thấy short đã chọn.'], 404);
+        }
+
+        $item = $items[$itemKey];
+        $shots = is_array($item['shots'] ?? null) ? $item['shots'] : [];
+        if (empty($shots)) {
+            return response()->json(['success' => false, 'error' => 'Short chưa có workspace để tải.'], 422);
+        }
+
+        $bookTitle = trim((string)($audioBook->title ?? ('book_' . $audioBook->id)));
+        $bookBaseName = preg_replace('/[^\pL\pN]+/u', '_', $bookTitle);
+        $bookBaseName = trim((string)$bookBaseName, '_');
+        if ($bookBaseName === '') {
+            $bookBaseName = 'book_' . $audioBook->id;
+        }
+
+        $orderedShots = array_values($shots);
+        usort($orderedShots, function ($left, $right) {
+            $leftNo = (int)($left['shot_index'] ?? 0);
+            $rightNo = (int)($right['shot_index'] ?? 0);
+            return $leftNo <=> $rightNo;
+        });
+
+        $packableEntries = [];
+        $missingByShot = [];
+
+        foreach ($orderedShots as $key => $shot) {
+            $shotNo = (int)($shot['shot_index'] ?? ($key + 1));
+            if ($shotNo <= 0) {
+                continue;
+            }
+
+            $shotNoPadded = str_pad((string)$shotNo, 2, '0', STR_PAD_LEFT);
+            $shotPrefix = $bookBaseName . '_shot_' . $shotNoPadded;
+
+            $videoPath = trim((string)($shot['segment_video_path'] ?? ''));
+            if ($videoPath === '') {
+                $videoPath = trim((string)($shot['kling_video_path'] ?? ''));
+            }
+
+            $assetMap = [
+                [
+                    'type' => 'audio',
+                    'relative_path' => trim((string)($shot['tts_audio_path'] ?? '')),
+                    'suffix' => 'audio',
+                    'default_ext' => 'mp3',
+                ],
+                [
+                    'type' => 'image',
+                    'relative_path' => trim((string)($shot['image_path'] ?? '')),
+                    'suffix' => 'image',
+                    'default_ext' => 'png',
+                ],
+                [
+                    'type' => 'video',
+                    'relative_path' => $videoPath,
+                    'suffix' => 'video',
+                    'default_ext' => 'mp4',
+                ],
+            ];
+
+            $missingTypes = [];
+
+            foreach ($assetMap as $asset) {
+                $relativePath = (string)($asset['relative_path'] ?? '');
+                if ($relativePath === '') {
+                    $missingTypes[] = (string)$asset['type'];
+                    continue;
+                }
+
+                $absPath = storage_path('app/public/' . ltrim($relativePath, '/'));
+                if (!is_file($absPath)) {
+                    $missingTypes[] = (string)$asset['type'];
+                    continue;
+                }
+
+                $ext = strtolower((string)pathinfo($absPath, PATHINFO_EXTENSION));
+                if ($ext === '') {
+                    $ext = (string)($asset['default_ext'] ?? 'dat');
+                }
+
+                $zipEntryName = $bookBaseName . '/' . $shotPrefix . '_' . (string)$asset['suffix'] . '.' . $ext;
+                $packableEntries[] = [
+                    'abs_path' => $absPath,
+                    'zip_entry_name' => $zipEntryName,
+                    'shot_index' => $shotNo,
+                    'type' => (string)$asset['type'],
+                ];
+            }
+
+            if (!empty($missingTypes)) {
+                $missingByShot[] = [
+                    'shot_index' => $shotNo,
+                    'missing_types' => array_values(array_unique($missingTypes)),
+                ];
+            }
+        }
+
+        $availableFilesCount = count($packableEntries);
+        $missingShotCount = count($missingByShot);
+
+        if ($dryRun) {
+            return response()->json([
+                'success' => true,
+                'ready_to_download' => $missingShotCount === 0,
+                'total_shots' => count($orderedShots),
+                'available_files_count' => $availableFilesCount,
+                'missing_count' => $missingShotCount,
+                'missing_files' => $missingByShot,
+                'book_folder' => $bookBaseName,
+            ]);
+        }
+
+        if ($missingShotCount > 0 && !$allowMissing) {
+            return response()->json([
+                'success' => false,
+                'error' => 'Một số shot đang thiếu file audio/image/video. Vui lòng xác nhận trước khi tải.',
+                'missing_count' => $missingShotCount,
+                'missing_files' => $missingByShot,
+            ], 422);
+        }
+
+        if ($availableFilesCount === 0) {
+            return response()->json([
+                'success' => false,
+                'error' => 'Không có file audio/image/mp4 hợp lệ để đóng gói.',
+            ], 422);
+        }
+
+        $tmpDir = storage_path('app/tmp');
+        if (!is_dir($tmpDir)) {
+            mkdir($tmpDir, 0775, true);
+        }
+
+        $zipFileName = $bookBaseName . '_short_' . str_pad((string)$index, 2, '0', STR_PAD_LEFT) . '_capcut_' . now()->format('Ymd_His') . '.zip';
+        $zipPath = $tmpDir . '/' . $zipFileName;
+
+        $zip = new \ZipArchive();
+        $opened = $zip->open($zipPath, \ZipArchive::CREATE | \ZipArchive::OVERWRITE);
+        if ($opened !== true) {
+            return response()->json([
+                'success' => false,
+                'error' => 'Không thể tạo file ZIP.',
+            ], 500);
+        }
+
+        foreach ($packableEntries as $entry) {
+            $zip->addFile((string)$entry['abs_path'], (string)$entry['zip_entry_name']);
+        }
+
+        $zip->close();
+
+        return response()->download($zipPath, $zipFileName, [
+            'Content-Type' => 'application/zip',
+        ])->deleteFileAfterSend(true);
+    }
+
+    private function findShortVideoItemIndex(array $items, int $targetIndex): ?int
+    {
+        foreach ($items as $key => $item) {
+            $itemIndex = (int)($item['index'] ?? ($key + 1));
+            if ($itemIndex === $targetIndex) {
+                return $key;
+            }
+        }
+
+        return null;
+    }
+
+    private function buildShortStoryboardData(AudioBook $audioBook, array $item, int $shortIndex): array
+    {
+        $script = trim((string)($item['script'] ?? ''));
+        $sentences = $this->splitShortScriptIntoSentences($script);
+        if (empty($sentences)) {
+            throw new \RuntimeException('Không thể tách câu từ script short.');
+        }
+
+        $storyboard = $this->buildShortStoryboardWithAi($audioBook, $item, $shortIndex, $sentences);
+        if ($storyboard === null) {
+            $storyboard = $this->buildShortStoryboardFallback($audioBook, $item, $shortIndex, $sentences);
+        }
+
+        $shots = [];
+        foreach ($sentences as $i => $sentence) {
+            $rawShot = $storyboard['shots'][$i] ?? [];
+            $shots[] = $this->normalizeShortShotData($rawShot, $i + 1, $sentence);
+        }
+
+        [$shots] = $this->ensureShortShotPromptTranslations($shots, $audioBook->id, $shortIndex);
+
+        return [
+            'story_bible' => trim((string)($storyboard['story_bible'] ?? '')),
+            'character_bible' => trim((string)($storyboard['character_bible'] ?? '')),
+            'shots' => $shots,
+        ];
+    }
+
+    private function splitShortScriptIntoSentences(string $script): array
+    {
+        $normalizedScript = str_replace(["\r\n", "\r"], "\n", trim($script));
+        $normalizedScript = preg_replace('/[ \t]+/u', ' ', $normalizedScript);
+        $normalizedScript = preg_replace('/\n{2,}/u', "\n", (string)$normalizedScript);
+        $normalizedScript = trim((string)$normalizedScript);
+
+        if ($normalizedScript === '') {
+            return [];
+        }
+
+        $sentences = [];
+        $appendSentence = function (string $candidate) use (&$sentences): void {
+            $sentence = trim($candidate);
+            if ($sentence === '') {
+                return;
+            }
+
+            $lastIndex = count($sentences) - 1;
+            if (mb_strlen($sentence) < 20 && $lastIndex >= 0) {
+                $sentences[$lastIndex] = trim($sentences[$lastIndex] . ' ' . $sentence);
+                return;
+            }
+
+            $sentences[] = $sentence;
+        };
+
+        $parts = preg_split('/(?<=[\.\!\?…;])\s+|\n+/u', $normalizedScript) ?: [];
+        foreach ($parts as $part) {
+            $appendSentence((string)$part);
+        }
+
+        if (count($sentences) === 1) {
+            $commaParts = preg_split('/(?<=[,;:])\s+/u', $sentences[0]) ?: [];
+            if (count($commaParts) > 1) {
+                $sentences = [];
+                foreach ($commaParts as $part) {
+                    $appendSentence((string)$part);
+                }
+            }
+        }
+
+        if (count($sentences) === 1) {
+            $single = trim((string)$sentences[0]);
+            $words = preg_split('/\s+/u', $single, -1, PREG_SPLIT_NO_EMPTY) ?: [];
+            if (count($words) > 28) {
+                $chunkSize = 18;
+                $chunks = [];
+                $current = [];
+
+                foreach ($words as $word) {
+                    $current[] = $word;
+                    if (count($current) >= $chunkSize) {
+                        $chunks[] = $current;
+                        $current = [];
+                    }
+                }
+
+                if (!empty($current)) {
+                    if (count($current) < 7 && !empty($chunks)) {
+                        $chunks[count($chunks) - 1] = array_merge($chunks[count($chunks) - 1], $current);
+                    } else {
+                        $chunks[] = $current;
+                    }
+                }
+
+                $sentences = [];
+                foreach ($chunks as $chunkWords) {
+                    $appendSentence(implode(' ', $chunkWords));
+                }
+            }
+        }
+
+        if (empty($sentences)) {
+            $sentences[] = preg_replace('/\s+/u', ' ', str_replace("\n", ' ', $normalizedScript));
+        }
+
+        return $sentences;
+    }
+
+    private function buildShortStoryboardWithAi(AudioBook $audioBook, array $item, int $shortIndex, array $sentences): ?array
+    {
+        $apiKey = config('services.gemini.api_key') ?: config('services.gemini.tts_api_key');
+        if (empty($apiKey)) {
+            return null;
+        }
+
+        [$bookTitle, $channelName] = $this->resolveShortVideoContextNames($audioBook);
+        $style = trim((string)($item['style'] ?? 'Cinematic'));
+        $sentenceList = [];
+        foreach ($sentences as $i => $sentence) {
+            $sentenceList[] = ($i + 1) . '. ' . $sentence;
+        }
+
+        $prompt = "Bạn là đạo diễn storyboard cho short video dọc 9:16.\n";
+        $prompt .= "Mục tiêu: mỗi câu thoại = 1 frame/shot, nhưng các frame phải giữ cùng cốt truyện và nhân vật nhất quán.\n\n";
+        $prompt .= "Thông tin:\n";
+        $prompt .= "- Sách: {$bookTitle}\n";
+        $prompt .= "- Kênh: {$channelName}\n";
+        $prompt .= "- Short #{$shortIndex}\n";
+        $prompt .= "- Phong cách: {$style}\n\n";
+        $prompt .= "Danh sách câu thoại (theo thứ tự thời gian):\n" . implode("\n", $sentenceList) . "\n\n";
+        $prompt .= "YÊU CẦU BẮT BUỘC:\n";
+        $prompt .= "1) Trả về đúng JSON object, không markdown/code fence.\n";
+        $prompt .= "2) Có 3 key gốc: story_bible, character_bible, shots.\n";
+        $prompt .= "3) shots là array có đúng " . count($sentences) . " phần tử, mỗi phần tử gồm:\n";
+        $prompt .= "   - sentence\n";
+        $prompt .= "   - image_prompt (English, dùng để tạo ảnh 9:16, nhấn mạnh continuity nhân vật/cảnh)\n";
+        $prompt .= "   - image_prompt_vi (Tiếng Việt, diễn giải nghĩa của image_prompt để người vận hành dễ kiểm tra)\n";
+        $prompt .= "   - kling_prompt (English, dùng cho image-to-video motion)\n";
+        $prompt .= "   - is_reference_keyframe (boolean)\n";
+        $prompt .= "4) Nhân vật phải đồng nhất ngoại hình/trang phục/độ tuổi giữa các shots.\n";
+        $prompt .= "5) Không thêm chữ vào ảnh.\n";
+
+        try {
+            $resp = Http::timeout(120)
+                ->withHeaders(['Content-Type' => 'application/json'])
+                ->post("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={$apiKey}", [
+                    'contents' => [[
+                        'parts' => [['text' => $prompt]],
+                    ]],
+                    'generationConfig' => [
+                        'temperature' => 0.7,
+                        'maxOutputTokens' => 8192,
+                        'responseMimeType' => 'application/json',
+                    ],
+                ]);
+
+            if (!$resp->ok()) {
+                return null;
+            }
+
+            $text = trim((string)data_get($resp->json(), 'candidates.0.content.parts.0.text', ''));
+            if ($text === '') {
+                return null;
+            }
+
+            $decoded = json_decode($text, true);
+            if (!is_array($decoded)) {
+                $cleaned = preg_replace('/^```(?:json)?\s*/i', '', $text);
+                $cleaned = preg_replace('/\s*```\s*$/', '', (string)$cleaned);
+                $decoded = json_decode(trim((string)$cleaned), true);
+            }
+
+            if (!is_array($decoded) || !is_array($decoded['shots'] ?? null)) {
+                return null;
+            }
+
+            $storyBibleRaw = $decoded['story_bible'] ?? '';
+            $characterBibleRaw = $decoded['character_bible'] ?? '';
+
+            return [
+                'story_bible' => is_scalar($storyBibleRaw) ? (string)$storyBibleRaw : json_encode($storyBibleRaw, JSON_UNESCAPED_UNICODE),
+                'character_bible' => is_scalar($characterBibleRaw) ? (string)$characterBibleRaw : json_encode($characterBibleRaw, JSON_UNESCAPED_UNICODE),
+                'shots' => array_values((array)$decoded['shots']),
+            ];
+        } catch (\Throwable $e) {
+            Log::warning('Short workspace AI storyboard fallback', [
+                'audio_book_id' => $audioBook->id,
+                'short_index' => $shortIndex,
+                'error' => $e->getMessage(),
+            ]);
+
+            return null;
+        }
+    }
+
+    private function buildShortStoryboardFallback(AudioBook $audioBook, array $item, int $shortIndex, array $sentences): array
+    {
+        $style = trim((string)($item['style'] ?? 'Cinematic'));
+        [$bookTitle] = $this->resolveShortVideoContextNames($audioBook);
+
+        $shots = [];
+        foreach ($sentences as $i => $sentence) {
+            $shots[] = [
+                'sentence' => $sentence,
+                'image_prompt' => 'Vertical 9:16 cinematic frame, ' . $style . ' style. Keep the same protagonist identity, face and outfit as previous frames. Scene: ' . $sentence . '. No text, no logo, high detail.',
+                'image_prompt_vi' => 'Khung hình điện ảnh dọc 9:16 theo phong cách ' . $style . ', giữ nhất quán nhân vật chính (khuôn mặt, trang phục) so với các khung trước. Cảnh: ' . $sentence . '. Không có chữ, không logo, chi tiết cao.',
+                'kling_prompt' => 'Smooth cinematic motion, subtle camera movement, preserve exact same characters and scene continuity, no jump cut.',
+                'is_reference_keyframe' => $i === 0,
+            ];
+        }
+
+        return [
+            'story_bible' => 'Một short gồm nhiều câu theo trình tự thời gian, giữ nhịp kể liền mạch từ mở đầu đến kết.',
+            'character_bible' => 'Nhân vật trung tâm phải giữ nhất quán về khuôn mặt, độ tuổi, giới tính, tóc và trang phục trong mọi shot.',
+            'shots' => $shots,
+        ];
+    }
+
+    private function normalizeShortShotData(array $rawShot, int $shotIndex, string $fallbackSentence): array
+    {
+        $refIndices = array_values(array_unique(array_filter(array_map('intval', (array)($rawShot['reference_shot_indices'] ?? [])), fn($val) => $val > 0 && $val !== $shotIndex)));
+
+        return [
+            'shot_index' => $shotIndex,
+            'sentence' => trim((string)($rawShot['sentence'] ?? $fallbackSentence)),
+            'image_prompt' => trim((string)($rawShot['image_prompt'] ?? '')),
+            'image_prompt_vi' => trim((string)($rawShot['image_prompt_vi'] ?? ($rawShot['image_prompt_vn'] ?? ''))),
+            'kling_prompt' => trim((string)($rawShot['kling_prompt'] ?? '')),
+            'is_reference_keyframe' => (bool)($rawShot['is_reference_keyframe'] ?? ($shotIndex === 1)),
+            'reference_shot_indices' => $refIndices,
+            'tts_audio_path' => $rawShot['tts_audio_path'] ?? null,
+            'tts_duration' => $rawShot['tts_duration'] ?? null,
+            'image_path' => $rawShot['image_path'] ?? null,
+            'kling_task_id' => $rawShot['kling_task_id'] ?? null,
+            'kling_status' => $rawShot['kling_status'] ?? null,
+            'kling_video_path' => $rawShot['kling_video_path'] ?? null,
+            'segment_video_path' => $rawShot['segment_video_path'] ?? null,
+            'resolved_image_prompt' => $rawShot['resolved_image_prompt'] ?? null,
+            'error_message' => $rawShot['error_message'] ?? null,
+            'updated_at' => $rawShot['updated_at'] ?? now()->toDateTimeString(),
+        ];
+    }
+
+    private function ensureShortShotPromptTranslations(array $shots, int $audioBookId, int $shortIndex): array
+    {
+        $normalizedShots = $shots;
+        $pendingRows = [];
+
+        foreach ($normalizedShots as $key => $shot) {
+            $existingTranslation = trim((string)($shot['image_prompt_vi'] ?? ($shot['image_prompt_vn'] ?? '')));
+            if ($existingTranslation !== '') {
+                $normalizedShots[$key]['image_prompt_vi'] = $existingTranslation;
+                continue;
+            }
+
+            $imagePrompt = trim((string)($shot['image_prompt'] ?? ''));
+            if ($imagePrompt === '') {
+                continue;
+            }
+
+            $pendingRows[] = [
+                'key' => $key,
+                'shot_index' => (int)($shot['shot_index'] ?? ($key + 1)),
+                'sentence' => trim((string)($shot['sentence'] ?? '')),
+                'image_prompt' => $imagePrompt,
+            ];
+        }
+
+        if (empty($pendingRows)) {
+            return [$normalizedShots, false];
+        }
+
+        $translatedMap = [];
+        foreach (array_chunk($pendingRows, 20) as $pendingChunk) {
+            $chunkMap = $this->translateShortShotPromptBatch($pendingChunk, $audioBookId, $shortIndex);
+            if (empty($chunkMap)) {
+                continue;
+            }
+
+            foreach ($chunkMap as $shotNo => $translatedText) {
+                $translatedMap[$shotNo] = $translatedText;
+            }
+        }
+
+        if (empty($translatedMap)) {
+            return [$normalizedShots, false];
+        }
+
+        $changed = false;
+        foreach ($pendingRows as $row) {
+            $translatedText = trim((string)($translatedMap[$row['shot_index']] ?? ''));
+            if ($translatedText === '') {
+                continue;
+            }
+
+            if (($normalizedShots[$row['key']]['image_prompt_vi'] ?? '') !== $translatedText) {
+                $normalizedShots[$row['key']]['image_prompt_vi'] = $translatedText;
+                $changed = true;
+            }
+        }
+
+        return [$normalizedShots, $changed];
+    }
+
+    private function translateShortShotPromptBatch(array $pendingRows, int $audioBookId, int $shortIndex): array
+    {
+        $apiKey = config('services.gemini.api_key') ?: config('services.gemini.tts_api_key');
+        if (empty($apiKey)) {
+            return [];
+        }
+
+        $payloadRows = array_map(function ($row) {
+            return [
+                'shot_index' => (int)($row['shot_index'] ?? 0),
+                'sentence' => (string)($row['sentence'] ?? ''),
+                'image_prompt' => (string)($row['image_prompt'] ?? ''),
+            ];
+        }, $pendingRows);
+
+        $prompt = "Bạn là trợ lý dịch prompt tạo ảnh cho video short.\n";
+        $prompt .= "Nhiệm vụ: dịch image_prompt tiếng Anh sang tiếng Việt để người vận hành hiểu nghĩa, KHÔNG sáng tác thêm nội dung ngoài prompt gốc.\n";
+        $prompt .= "Giữ nguyên các chi tiết kỹ thuật quan trọng (9:16, ánh sáng, trang phục, continuity...).\n";
+        $prompt .= "Trả về JSON array thuần (không markdown/code fence), mỗi phần tử gồm: shot_index, image_prompt_vi.\n";
+        $prompt .= "Dữ liệu cần dịch:\n";
+        $prompt .= json_encode($payloadRows, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
+
+        try {
+            $resp = Http::timeout(120)
+                ->withHeaders(['Content-Type' => 'application/json'])
+                ->post("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={$apiKey}", [
+                    'contents' => [[
+                        'parts' => [['text' => $prompt]],
+                    ]],
+                    'generationConfig' => [
+                        'temperature' => 0.2,
+                        'maxOutputTokens' => 4096,
+                        'responseMimeType' => 'application/json',
+                    ],
+                ]);
+
+            if (!$resp->ok()) {
+                return [];
+            }
+
+            $text = trim((string)data_get($resp->json(), 'candidates.0.content.parts.0.text', ''));
+            if ($text === '') {
+                return [];
+            }
+
+            $decoded = json_decode($text, true);
+            if (!is_array($decoded)) {
+                $cleaned = preg_replace('/^```(?:json)?\s*/i', '', $text);
+                $cleaned = preg_replace('/\s*```\s*$/', '', (string)$cleaned);
+                $decoded = json_decode(trim((string)$cleaned), true);
+            }
+
+            if (!is_array($decoded)) {
+                return [];
+            }
+
+            $rows = is_array($decoded['shots'] ?? null) ? $decoded['shots'] : $decoded;
+            $result = [];
+
+            foreach ((array)$rows as $row) {
+                if (!is_array($row)) {
+                    continue;
+                }
+
+                $shotNo = (int)($row['shot_index'] ?? 0);
+                $translated = trim((string)($row['image_prompt_vi'] ?? ($row['prompt_vi'] ?? '')));
+                if ($shotNo > 0 && $translated !== '') {
+                    $result[$shotNo] = $translated;
+                }
+            }
+
+            return $result;
+        } catch (\Throwable $e) {
+            Log::warning('Short workspace prompt translation fallback', [
+                'audio_book_id' => $audioBookId,
+                'short_index' => $shortIndex,
+                'error' => $e->getMessage(),
+            ]);
+
+            return [];
+        }
+    }
+
+    private function resolveShortVideoTtsOptions(Request $request, AudioBook $audioBook): array
+    {
+        return [
+            'provider' => $request->input('provider', $audioBook->tts_provider ?: 'openai'),
+            'voice_name' => $request->input('voice_name', $audioBook->tts_voice_name),
+            'voice_gender' => $request->input('voice_gender', $audioBook->tts_voice_gender ?: 'female'),
+            'style_instruction' => $request->input('style_instruction', $audioBook->tts_style_instruction),
+            'tts_speed' => (float)$request->input('tts_speed', $audioBook->tts_speed ?: 1.0),
+        ];
+    }
+
+    private function getSelectedShotIndices(array $shots, $selectedIndices): array
+    {
+        $allIndices = array_map(function ($shotKey) use ($shots) {
+            $shot = $shots[$shotKey];
+            return (int)($shot['shot_index'] ?? ($shotKey + 1));
+        }, array_keys($shots));
+
+        if (!is_array($selectedIndices) || empty($selectedIndices)) {
+            sort($allIndices);
+            return $allIndices;
+        }
+
+        $lookup = array_flip(array_map('intval', $allIndices));
+        $filtered = [];
+        foreach ((array)$selectedIndices as $idx) {
+            $num = (int)$idx;
+            if (isset($lookup[$num])) {
+                $filtered[] = $num;
+            }
+        }
+
+        $filtered = array_values(array_unique($filtered));
+        sort($filtered);
+        return $filtered;
+    }
+
+    private function buildShortShotImagePromptWithContinuity(array $item, array $shots, array $shot): string
+    {
+        $storyBible = trim((string)($item['story_bible'] ?? ''));
+        $characterBible = trim((string)($item['character_bible'] ?? ''));
+        $shotSentence = trim((string)($shot['sentence'] ?? ''));
+        $imagePrompt = trim((string)($shot['image_prompt'] ?? ''));
+
+        $refIndices = array_values(array_unique(array_filter(array_map('intval', (array)($shot['reference_shot_indices'] ?? [])), fn($val) => $val > 0)));
+        if (empty($refIndices)) {
+            $currentShotNo = (int)($shot['shot_index'] ?? 1);
+            for ($i = $currentShotNo - 1; $i >= 1; $i--) {
+                foreach ($shots as $refShot) {
+                    $refNo = (int)($refShot['shot_index'] ?? 0);
+                    if ($refNo !== $i) {
+                        continue;
+                    }
+                    if ((bool)($refShot['is_reference_keyframe'] ?? false) || !empty($refShot['image_path'])) {
+                        $refIndices = [$i];
+                        break 2;
+                    }
+                }
+            }
+        }
+
+        $refLines = [];
+        foreach ($refIndices as $refIndex) {
+            foreach ($shots as $refShot) {
+                if ((int)($refShot['shot_index'] ?? 0) !== $refIndex) {
+                    continue;
+                }
+                $refSentence = trim((string)($refShot['sentence'] ?? ''));
+                $refPrompt = trim((string)($refShot['image_prompt'] ?? ''));
+                $refLines[] = "- Shot {$refIndex}: {$refSentence} | visual cue: {$refPrompt}";
+                break;
+            }
+        }
+
+        $prompt = "Create a single vertical 9:16 cinematic keyframe for one moment in a continuous short story.\n";
+        if ($storyBible !== '') {
+            $prompt .= "Story bible: {$storyBible}\n";
+        }
+        if ($characterBible !== '') {
+            $prompt .= "Character bible: {$characterBible}\n";
+        }
+        $prompt .= "Current sentence: {$shotSentence}\n";
+        $prompt .= "Shot visual objective: {$imagePrompt}\n";
+        if (!empty($refLines)) {
+            $prompt .= "Reference frames for continuity:\n" . implode("\n", $refLines) . "\n";
+        }
+        $prompt .= "Requirements: keep same character identity, age, face, hairstyle and costume across frames; cinematic lighting; no text/no logo/no watermark.";
+
+        return trim($prompt);
+    }
+
+    private function composeShortShotSegment(
+        string $ffmpegPath,
+        ?string $sourceVideoAbs,
+        ?string $sourceImageAbs,
+        string $audioAbs,
+        float $duration,
+        string $outputAbs
+    ): void {
+        $vf = 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fps=30,format=yuv420p';
+
+        if ($sourceVideoAbs) {
+            $cmd = sprintf(
+                '%s -y -stream_loop -1 -i %s -i %s -t %.3f -vf %s -map 0:v:0 -map 1:a:0 -c:v libx264 -preset veryfast -crf 23 -c:a aac -b:a 192k -shortest %s 2>&1',
+                escapeshellarg($ffmpegPath),
+                escapeshellarg($sourceVideoAbs),
+                escapeshellarg($audioAbs),
+                $duration,
+                escapeshellarg($vf),
+                escapeshellarg($outputAbs)
+            );
+            $this->runFfmpegCommand($cmd, 'Không thể tạo segment từ Kling video.');
+            return;
+        }
+
+        if (!$sourceImageAbs) {
+            throw new \RuntimeException('Thiếu nguồn ảnh/video để tạo segment.');
+        }
+
+        $cmd = sprintf(
+            '%s -y -loop 1 -i %s -i %s -t %.3f -vf %s -map 0:v:0 -map 1:a:0 -c:v libx264 -preset veryfast -crf 23 -c:a aac -b:a 192k -shortest %s 2>&1',
+            escapeshellarg($ffmpegPath),
+            escapeshellarg($sourceImageAbs),
+            escapeshellarg($audioAbs),
+            $duration,
+            escapeshellarg($vf),
+            escapeshellarg($outputAbs)
+        );
+        $this->runFfmpegCommand($cmd, 'Không thể tạo segment từ ảnh + audio.');
+    }
+
+    private function runFfmpegCommand(string $command, string $errorPrefix): void
+    {
+        exec($command, $output, $code);
+        if ($code !== 0) {
+            throw new \RuntimeException($errorPrefix . ' ' . implode("\n", array_slice($output, -8)));
+        }
+    }
+
+    private function downloadVideoToPublicStorage(string $videoUrl, string $relativePath): void
+    {
+        $resp = Http::timeout(180)->get($videoUrl);
+        if (!$resp->ok()) {
+            throw new \RuntimeException('Không tải được video từ Kling. HTTP ' . $resp->status());
+        }
+
+        $disk = Storage::disk('public');
+        $dir = dirname($relativePath);
+        if (!$disk->exists($dir)) {
+            $disk->makeDirectory($dir);
+        }
+
+        $stored = $disk->put($relativePath, $resp->body());
+        if (!$stored) {
+            throw new \RuntimeException('Không lưu được video Kling vào storage.');
+        }
+    }
+
+    private function deleteShortVideoShotAssets(array $item): void
+    {
+        $shots = is_array($item['shots'] ?? null) ? $item['shots'] : [];
+        foreach ($shots as $shot) {
+            $this->deleteShortVideoAssetFile($shot['tts_audio_path'] ?? null);
+            $this->deleteShortVideoAssetFile($shot['image_path'] ?? null);
+            $this->deleteShortVideoAssetFile($shot['kling_video_path'] ?? null);
+            $this->deleteShortVideoAssetFile($shot['segment_video_path'] ?? null);
+        }
+    }
+
+    private function ensureShortVideoAssetDirs(int $bookId): array
+    {
+        $baseDir = $this->getShortVideoBaseDir($bookId);
+        $audioDir = $baseDir . '/audio';
+        $imageDir = $baseDir . '/images';
+        $videoDir = $baseDir . '/videos';
+        $shotAudioDir = $baseDir . '/shots/audio';
+        $shotImageDir = $baseDir . '/shots/images';
+        $shotVideoDir = $baseDir . '/shots/videos';
+        $packagesDir = $baseDir . '/packages';
+
+        foreach ([$audioDir, $imageDir, $videoDir, $shotAudioDir, $shotImageDir, $shotVideoDir, $packagesDir] as $dir) {
+            if (!is_dir($dir)) {
+                mkdir($dir, 0775, true);
+            }
+        }
+
+        return [
+            'audio' => $audioDir,
+            'images' => $imageDir,
+            'videos' => $videoDir,
+            'shot_audio' => $shotAudioDir,
+            'shot_images' => $shotImageDir,
+            'shot_videos' => $shotVideoDir,
+            'packages' => $packagesDir,
+        ];
+    }
+
+    private function deleteShortVideoAssetFile(?string $relativePath): void
+    {
+        if (empty($relativePath)) {
+            return;
+        }
+
+        $absPath = storage_path('app/public/' . ltrim($relativePath, '/'));
+        if (file_exists($absPath)) {
+            @unlink($absPath);
+        }
+    }
+
+    private function getShortVideoBaseDir(int $bookId): string
+    {
+        $dir = storage_path('app/public/books/' . $bookId . '/short_videos');
+        if (!is_dir($dir)) {
+            mkdir($dir, 0775, true);
+        }
+        return $dir;
+    }
+
+    private function getShortVideoJsonPath(int $bookId): string
+    {
+        return $this->getShortVideoBaseDir($bookId) . '/shorts.json';
+    }
+
+    private function loadShortVideoItems(int $bookId): array
+    {
+        $path = $this->getShortVideoJsonPath($bookId);
+        if (!file_exists($path)) {
+            return [];
+        }
+
+        $decoded = json_decode(file_get_contents($path), true);
+        return is_array($decoded) ? $decoded : [];
+    }
+
+    private function saveShortVideoItems(int $bookId, array $items): void
+    {
+        $path = $this->getShortVideoJsonPath($bookId);
+        $dir = dirname($path);
+        if (!is_dir($dir)) {
+            mkdir($dir, 0775, true);
+        }
+
+        if (!is_writable($dir)) {
+            @chmod($dir, 0775);
+        }
+
+        if (file_exists($path) && !is_writable($path)) {
+            @chmod($path, 0664);
+        }
+
+        $json = json_encode(array_values($items), JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
+        if ($json === false) {
+            throw new \RuntimeException('Không thể encode dữ liệu short videos sang JSON.');
+        }
+
+        $written = @file_put_contents($path, $json, LOCK_EX);
+        if ($written === false) {
+            throw new \RuntimeException('Không thể ghi file shorts.json. Kiểm tra quyền thư mục/file.');
+        }
+    }
+
+    private function mapShortVideoItemForResponse(int $bookId, array $item): array
+    {
+        $item['audio_url'] = !empty($item['audio_path']) ? asset('storage/' . $item['audio_path']) : null;
+        $item['image_url'] = !empty($item['image_path']) ? asset('storage/' . $item['image_path']) : null;
+        $item['video_url'] = !empty($item['video_path']) ? asset('storage/' . $item['video_path']) : null;
+
+        $shots = is_array($item['shots'] ?? null) ? $item['shots'] : [];
+        $item['shots'] = array_values(array_map(function ($shot) {
+            $shot['tts_audio_url'] = !empty($shot['tts_audio_path']) ? asset('storage/' . $shot['tts_audio_path']) : null;
+            $shot['image_url'] = !empty($shot['image_path']) ? asset('storage/' . $shot['image_path']) : null;
+            $shot['kling_video_url'] = !empty($shot['kling_video_path']) ? asset('storage/' . $shot['kling_video_path']) : null;
+            $shot['segment_video_url'] = !empty($shot['segment_video_path']) ? asset('storage/' . $shot['segment_video_path']) : null;
+            return $shot;
+        }, $shots));
+        $item['workspace_ready'] = !empty($item['shots']);
+
+        return $item;
+    }
+
+    private function createShortVideoPlansWithAi(AudioBook $audioBook, int $count): array
+    {
+        [$bookTitle, $channelName] = $this->resolveShortVideoContextNames($audioBook);
+        $styles = [
+            'Drama',
+            'Mystery',
+            'Action',
+            'Emotional',
+            'Dark',
+            'Motivational',
+            'Epic',
+            'Plot Twist',
+            'Romantic',
+            'Thriller',
+        ];
+
+        $description = trim((string) ($audioBook->description ?? ''));
+        $description = mb_substr($description, 0, 3500);
+
+        $fallback = [];
+        for ($i = 0; $i < $count; $i++) {
+            $style = $styles[$i % count($styles)];
+            $fallbackScript = 'Bạn có biết điều khiến cuốn "' . $bookTitle . '" cuốn hút đến vậy không? Đây là phân đoạn theo phong cách ' . $style . ' với tình tiết gây tò mò, gợi mở và kết thúc bằng một câu hỏi để thôi thúc người xem theo dõi tiếp.';
+            $fallback[] = [
+                'index' => $i + 1,
+                'title' => 'Short #' . ($i + 1) . ' - ' . $style,
+                'style' => $style,
+                'script' => $this->ensureShortScriptHasCta($fallbackScript, $bookTitle, $channelName),
+                'image_prompt' => 'Vertical 9:16 cinematic scene for a book short video, style ' . $style . ', dramatic lighting, high contrast, emotional atmosphere, no text, ultra detailed.',
+                'status' => 'planned',
+                'error_message' => null,
+                'audio_path' => null,
+                'image_path' => null,
+                'video_path' => null,
+                'duration' => null,
+                'created_at' => now()->toDateTimeString(),
+                'updated_at' => now()->toDateTimeString(),
+            ];
+        }
+
+        $apiKey = config('services.gemini.api_key') ?: config('services.gemini.tts_api_key');
+        if (empty($apiKey)) {
+            return $fallback;
+        }
+
+        $prompt = "Bạn là chuyên gia viết nội dung short video viral cho YouTube/TikTok.\n";
+        $prompt .= "Tạo {$count} ý tưởng short video cho cuốn sách sau, mỗi short tối đa 60 giây đọc thoại tiếng Việt.\n\n";
+        $prompt .= "Sách hiện tại (giữ nguyên chính tả): {$bookTitle}\n";
+        $prompt .= "Kênh hiện tại (giữ nguyên chính tả): {$channelName}\n";
+        if (!empty($audioBook->author)) {
+            $prompt .= "Tác giả: {$audioBook->author}\n";
+        }
+        if (!empty($audioBook->category)) {
+            $prompt .= "Thể loại: {$audioBook->category}\n";
+        }
+        if (!empty($description)) {
+            $prompt .= "Nội dung tham chiếu:\n{$description}\n\n";
+        }
+        $prompt .= "Yêu cầu:\n";
+        $prompt .= "- Mỗi short phải có phong cách khác nhau, hook mạnh ở 3 giây đầu, kết mở kích thích bình luận.\n";
+        $prompt .= "- 'script' dài khoảng 90-140 từ tiếng Việt (đủ cho ~45-60s).\n";
+        $prompt .= "- Mỗi script BẮT BUỘC có câu kêu gọi: mời người xem vào nghe audio đầy đủ của cuốn '{$bookTitle}' trên kênh '{$channelName}'.\n";
+        $prompt .= "- BẮT BUỘC dùng đúng nguyên văn tên sách '{$bookTitle}' và tên kênh '{$channelName}' trong phần CTA, không thay thế bằng từ đồng nghĩa.\n";
+        $prompt .= "- 'image_prompt' bằng tiếng Anh, mô tả khung hình dọc 9:16, không chứa chữ trong ảnh.\n";
+        $prompt .= "- Trả về JSON array thuần gồm đúng {$count} phần tử, mỗi phần tử có: title, style, script, image_prompt.\n";
+        $prompt .= "- Không thêm markdown/code fence.\n";
+
+        try {
+            $resp = Http::timeout(120)->withHeaders([
+                'Content-Type' => 'application/json',
+            ])->post("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={$apiKey}", [
+                'contents' => [[
+                    'parts' => [['text' => $prompt]],
+                ]],
+                'generationConfig' => [
+                    'temperature' => 0.8,
+                    'maxOutputTokens' => 8192,
+                    'responseMimeType' => 'application/json',
+                ],
+            ]);
+
+            if (!$resp->ok()) {
+                return $fallback;
+            }
+
+            $payload = $resp->json();
+            $text = trim((string) data_get($payload, 'candidates.0.content.parts.0.text', ''));
+            if ($text === '') {
+                return $fallback;
+            }
+
+            $decoded = json_decode($text, true);
+            if (!is_array($decoded)) {
+                $cleaned = preg_replace('/^```(?:json)?\s*/i', '', $text);
+                $cleaned = preg_replace('/\s*```\s*$/', '', $cleaned);
+                $decoded = json_decode(trim((string) $cleaned), true);
+            }
+            if (!is_array($decoded)) {
+                return $fallback;
+            }
+
+            $result = [];
+            for ($i = 0; $i < $count; $i++) {
+                $raw = $decoded[$i] ?? [];
+                $fallbackItem = $fallback[$i];
+
+                $result[] = [
+                    'index' => $i + 1,
+                    'title' => trim((string)($raw['title'] ?? $fallbackItem['title'])),
+                    'style' => trim((string)($raw['style'] ?? $fallbackItem['style'])),
+                    'script' => $this->ensureShortScriptHasCta(trim((string)($raw['script'] ?? $fallbackItem['script'])), $bookTitle, $channelName),
+                    'image_prompt' => trim((string)($raw['image_prompt'] ?? $fallbackItem['image_prompt'])),
+                    'status' => 'planned',
+                    'error_message' => null,
+                    'audio_path' => null,
+                    'image_path' => null,
+                    'video_path' => null,
+                    'duration' => null,
+                    'created_at' => now()->toDateTimeString(),
+                    'updated_at' => now()->toDateTimeString(),
+                ];
+            }
+
+            return $result;
+        } catch (\Throwable $e) {
+            Log::warning('AI short plans fallback', [
+                'audio_book_id' => $audioBook->id,
+                'error' => $e->getMessage(),
+            ]);
+            return $fallback;
+        }
+    }
+
+    private function ensureShortScriptHasCta(string $script, string $bookTitle, string $channelName): string
+    {
+        $normalized = mb_strtolower($script);
+        $bookNeedle = mb_strtolower(trim($bookTitle));
+        $channelNeedle = mb_strtolower(trim($channelName));
+        $hasCta = str_contains($normalized, 'nghe audio')
+            || str_contains($normalized, 'nghe full')
+            || str_contains($normalized, 'trọn bộ')
+            || str_contains($normalized, 'vào kênh');
+        $hasExactBook = $bookNeedle !== '' && str_contains($normalized, $bookNeedle);
+        $hasExactChannel = $channelNeedle !== '' && str_contains($normalized, $channelNeedle);
+        $hasMoiBan = str_contains($normalized, 'mời bạn');
+
+        if ($hasCta && $hasExactBook && $hasExactChannel) {
+            if ($hasMoiBan) {
+                return trim($script);
+            }
+
+            $cta = $this->ensureCtaHasMoiBan(
+                "nghe trọn bộ audio cuốn '{$bookTitle}', vào kênh {$channelName} để nghe ngay nhé!",
+                $bookTitle,
+                $channelName
+            );
+
+            return trim($script . ' ' . $cta);
+        }
+
+        $cta = $this->ensureCtaHasMoiBan(
+            "nghe trọn bộ audio cuốn '{$bookTitle}', hãy vào kênh {$channelName} để nghe ngay nhé!",
+            $bookTitle,
+            $channelName
+        );
+        return trim($script . $cta);
+    }
+
+    private function resolveShortVideoContextNames(AudioBook $audioBook): array
+    {
+        $audioBook->loadMissing('youtubeChannel');
+
+        $bookTitle = trim((string)($audioBook->title ?? ''));
+        if ($bookTitle === '') {
+            $bookTitle = 'cuốn sách hiện tại';
+        }
+
+        $channelName = trim((string)optional($audioBook->youtubeChannel)->title);
+        if ($channelName === '') {
+            $channelName = 'kênh YouTube hiện tại';
+        }
+
+        return [$bookTitle, $channelName];
+    }
+
     /**
      * Generate thumbnail using Gemini AI
      */
@@ -2004,6 +5257,7 @@ class AudioBookController extends Controller
             'with_text' => 'nullable|boolean',
             'custom_title' => 'nullable|string|max:500',
             'custom_author' => 'nullable|string|max:200',
+            'prefer_portrait' => 'nullable|boolean',
         ]);
 
         $style = $request->input('style', 'cinematic');
@@ -2019,6 +5273,7 @@ class AudioBookController extends Controller
             'author' => $customAuthor ?: ($audioBook->author ? 'Tác giả: ' . $audioBook->author : ''),
             'category' => $audioBook->category,
             'description' => $audioBook->description,
+            'prefer_portrait' => $request->boolean('prefer_portrait', true),
         ];
 
         if ($withText) {
@@ -2046,6 +5301,7 @@ class AudioBookController extends Controller
             'custom_author' => 'nullable|string|max:200',
             'text_styling' => 'nullable|array',
             'override_prompt' => 'nullable|string|max:5000',
+            'prefer_portrait' => 'nullable|boolean',
         ]);
 
         $options = [
@@ -2059,6 +5315,7 @@ class AudioBookController extends Controller
             'custom_author' => $request->input('custom_author'),
             'text_styling' => $request->input('text_styling', []),
             'override_prompt' => $request->input('override_prompt'),
+            'prefer_portrait' => $request->boolean('prefer_portrait', true),
         ];
 
         // Clear old progress
@@ -2230,13 +5487,19 @@ class AudioBookController extends Controller
                 ], 404);
             }
 
-            // Generate output filename
-            $timestamp = time();
-            $outputFilename = 'thumb_logo_' . $timestamp . '.png';
-            $outputDir = $sourceDir . '/thumbnails';
-            if (!is_dir($outputDir)) {
-                mkdir($outputDir, 0755, true);
+            // Load source image metadata first (used for output format decision)
+            $sourceInfo = getimagesize($sourcePath);
+            if (!$sourceInfo || !isset($sourceInfo[2])) {
+                throw new \RuntimeException('Không thể đọc metadata ảnh nguồn: ' . $sourcePath);
             }
+
+            // Generate output filename (match actual format to encoder)
+            $timestamp = time();
+            $extension = $sourceInfo[2] === IMAGETYPE_JPEG ? 'jpg' : 'png';
+            $outputFilename = 'thumb_logo_' . $timestamp . '_' . uniqid() . '.' . $extension;
+            $outputDir = $sourceDir . '/thumbnails';
+            $this->ensureDirectoryWritable($outputDir, 0775);
+
             $outputPath = $outputDir . '/' . $outputFilename;
 
             // Use PHP GD to create circular logo with border and shadow
@@ -2244,7 +5507,6 @@ class AudioBookController extends Controller
             $opacityFactor = $opacity / 100;
 
             // Load source image
-            $sourceInfo = getimagesize($sourcePath);
             $sourceImg = $this->gdLoadImage($sourcePath, $sourceInfo[2]);
             $srcW = imagesx($sourceImg);
             $srcH = imagesy($sourceImg);
@@ -2360,10 +5622,17 @@ class AudioBookController extends Controller
             imagecopy($sourceImg, $composite, max(0, $posX), max(0, $posY), 0, 0, $compSize, $compSize);
 
             // 8. Save output (PNG for quality, or JPEG if source was JPEG)
+            $saved = false;
             if ($sourceInfo[2] === IMAGETYPE_JPEG) {
-                imagejpeg($sourceImg, $outputPath, 95);
+                $saved = imagejpeg($sourceImg, $outputPath, 95);
             } else {
-                imagepng($sourceImg, $outputPath, 2);
+                $saved = imagepng($sourceImg, $outputPath, 2);
+            }
+
+            if (!$saved || !file_exists($outputPath)) {
+                $lastError = error_get_last();
+                $errorMsg = $lastError['message'] ?? 'Unknown GD save error';
+                throw new \RuntimeException('Không thể lưu thumbnail có logo: ' . $errorMsg);
             }
 
             // Clean up GD resources
@@ -2372,7 +5641,7 @@ class AudioBookController extends Controller
             imagedestroy($scaledLogo);
             imagedestroy($composite);
 
-            Log::info("Added circular logo overlay for audiobook {$audioBook->id}", [
+            $this->safeLog('info', "Added circular logo overlay for audiobook {$audioBook->id}", [
                 'source' => $sourceImage,
                 'output' => $outputFilename,
                 'position' => $position,
@@ -2388,14 +5657,50 @@ class AudioBookController extends Controller
                 'url' => asset('storage/' . $relativePath),
                 'filename' => $outputFilename
             ]);
-        } catch (\Exception $e) {
-            Log::error("Add logo overlay failed for audiobook {$audioBook->id}: " . $e->getMessage());
+        } catch (\Throwable $e) {
+            $this->safeLog('error', "Add logo overlay failed for audiobook {$audioBook->id}: " . $e->getMessage(), [
+                'exception' => get_class($e),
+                'trace' => $e->getTraceAsString(),
+            ]);
 
             return response()->json([
                 'success' => false,
                 'error' => $e->getMessage()
             ], 500);
         }
+    }
+
+    /**
+     * Ensure directory exists and is writable.
+     */
+    private function ensureDirectoryWritable(string $dirPath, int $mode = 0775): void
+    {
+        if (!is_dir($dirPath) && !mkdir($dirPath, $mode, true) && !is_dir($dirPath)) {
+            throw new \RuntimeException('Không thể tạo thư mục: ' . $dirPath);
+        }
+
+        @chmod($dirPath, $mode);
+
+        if (is_writable($dirPath)) {
+            return;
+        }
+
+        $permissions = substr(sprintf('%o', @fileperms($dirPath)), -4) ?: 'unknown';
+
+        $owner = @fileowner($dirPath);
+        $group = @filegroup($dirPath);
+
+        $ownerName = (is_int($owner) && function_exists('posix_getpwuid'))
+            ? (posix_getpwuid($owner)['name'] ?? (string) $owner)
+            : (string) ($owner ?? 'unknown');
+
+        $groupName = (is_int($group) && function_exists('posix_getgrgid'))
+            ? (posix_getgrgid($group)['name'] ?? (string) $group)
+            : (string) ($group ?? 'unknown');
+
+        throw new \RuntimeException(
+            "Thư mục không có quyền ghi: {$dirPath} (perm={$permissions}, owner={$ownerName}, group={$groupName})"
+        );
     }
 
     /**
@@ -2421,6 +5726,18 @@ class AudioBookController extends Controller
         }
 
         return $img;
+    }
+
+    /**
+     * Write logs safely without breaking the request flow if the log driver fails.
+     */
+    private function safeLog(string $level, string $message, array $context = []): void
+    {
+        try {
+            Log::log($level, $message, $context);
+        } catch (\Throwable $logException) {
+            error_log('[AudioBookController] Log write failed: ' . $logException->getMessage() . ' | message: ' . $message);
+        }
     }
 
     /**
@@ -3480,7 +6797,6 @@ class AudioBookController extends Controller
                         ];
                         continue;
                     }
-
                     $relativePath = "{$coversDir}/{$outputFilename}";
                     $segment->update(['image_path' => $outputFilename, 'image_type' => 'chapter_covers']);
 
@@ -4110,6 +7426,84 @@ class AudioBookController extends Controller
             }
         }
 
+        // Include AI Shorts (completed video files)
+        try {
+            $shortItems = $this->loadShortVideoItems($audioBook->id);
+            foreach ($shortItems as $key => $item) {
+                $videoRel = ltrim((string)($item['video_path'] ?? ''), '/');
+                if ($videoRel === '') continue;
+                $abs = storage_path('app/public/' . $videoRel);
+                if (!is_file($abs)) continue;
+
+                $index = (int)($item['index'] ?? ($key + 1));
+                $labelTitle = trim((string)($item['title'] ?? 'Short #' . $index));
+                $shortTitle = trim((string)($item['youtube_video_title'] ?? $labelTitle));
+                $shortDescription = trim((string)($item['youtube_video_description'] ?? ($item['script'] ?? '')));
+                $shortYoutubeId = trim((string)($item['youtube_video_id'] ?? ''));
+                $videos[] = [
+                    'id' => 'shortai_' . $index,
+                    'type' => 'short',
+                    'origin' => 'shorts',
+                    'label' => ($labelTitle !== '' ? $labelTitle : ('Short #' . $index)) . ' (AI Shorts)',
+                    'path' => $videoRel,
+                    'duration' => $item['duration'] ?? $this->getVideoDuration($abs),
+                    'youtube_video_id' => $shortYoutubeId !== '' ? $shortYoutubeId : null,
+                    'youtube_video_title' => $shortTitle !== '' ? $shortTitle : null,
+                    'youtube_video_description' => $shortDescription !== '' ? $shortDescription : null,
+                    'youtube_uploaded_at' => $item['youtube_uploaded_at'] ?? null,
+                ];
+            }
+        } catch (\Throwable $e) {
+            // soft-fail: do not block publish data on shorts errors
+            \Log::warning('Load AI shorts for publish data failed', [
+                'audio_book_id' => $audioBook->id,
+                'error' => $e->getMessage(),
+            ]);
+        }
+
+        // Include Clipping composed videos
+        try {
+            $clips = $this->loadClips($audioBook->id);
+            foreach ($clips as $clip) {
+                $status = (string)($clip['status'] ?? '');
+                $rel = ltrim((string)($clip['composed_path'] ?? ''), '/');
+                if ($status !== 'composed' || $rel === '') continue;
+                $abs = storage_path('app/public/' . $rel);
+                if (!is_file($abs)) continue;
+
+                $clipId = (string)($clip['id'] ?? md5($rel));
+                $hook = trim((string)($clip['hook_title'] ?? 'Clip'));
+                $shortTitle = trim((string)($clip['youtube_video_title'] ?? $hook));
+                $shortDescription = trim((string)($clip['youtube_video_description'] ?? ''));
+                if ($shortDescription === '') {
+                    $quote = trim((string)($clip['quote'] ?? ''));
+                    $cta = trim((string)($clip['cta_narration'] ?? ($clip['cta'] ?? '')));
+                    $descParts = array_values(array_filter([$quote, $cta], fn($value) => $value !== ''));
+                    if (!empty($descParts)) {
+                        $shortDescription = implode("\n\n", $descParts);
+                    }
+                }
+                $shortYoutubeId = trim((string)($clip['youtube_video_id'] ?? ''));
+                $videos[] = [
+                    'id' => 'shortclip_' . $clipId,
+                    'type' => 'short',
+                    'origin' => 'clipping',
+                    'label' => ($hook !== '' ? $hook : 'Clip') . ' (Clipping)',
+                    'path' => $rel,
+                    'duration' => $this->getVideoDuration($abs),
+                    'youtube_video_id' => $shortYoutubeId !== '' ? $shortYoutubeId : null,
+                    'youtube_video_title' => $shortTitle !== '' ? $shortTitle : null,
+                    'youtube_video_description' => $shortDescription !== '' ? $shortDescription : null,
+                    'youtube_uploaded_at' => $clip['youtube_uploaded_at'] ?? null,
+                ];
+            }
+        } catch (\Throwable $e) {
+            \Log::warning('Load clipping videos for publish data failed', [
+                'audio_book_id' => $audioBook->id,
+                'error' => $e->getMessage(),
+            ]);
+        }
+
         // Thumbnails from media gallery
         $media = $this->imageService->getExistingMedia($audioBook->id);
         $thumbnails = $media['thumbnails'] ?? [];
@@ -4461,7 +7855,7 @@ class AudioBookController extends Controller
             $result = json_decode($response->getBody()->getContents(), true);
             $text = trim($result['candidates'][0]['content']['parts'][0]['text'] ?? '');
 
-            \Log::info('generateVideoMeta AI response', ['text_length' => mb_strlen($text), 'text_preview' => mb_substr($text, 0, 300)]);
+            $this->safeLog('info', 'generateVideoMeta AI response', ['text_length' => mb_strlen($text), 'text_preview' => mb_substr($text, 0, 300)]);
 
             // Try direct JSON parse first (responseMimeType should return clean JSON)
             $items = json_decode($text, true);
@@ -4480,7 +7874,7 @@ class AudioBookController extends Controller
             }
 
             if (!is_array($items)) {
-                \Log::error('generateVideoMeta: Failed to parse AI JSON', ['raw_text' => mb_substr($text, 0, 1000)]);
+                $this->safeLog('error', 'generateVideoMeta: Failed to parse AI JSON', ['raw_text' => mb_substr($text, 0, 1000)]);
                 throw new \Exception('AI không trả về JSON hợp lệ. Response: ' . mb_substr($text, 0, 200));
             }
 
@@ -4525,7 +7919,7 @@ class AudioBookController extends Controller
     {
         $request->validate([
             'video_id' => 'required|string',
-            'video_type' => 'required|string|in:description,chapter,segment',
+            'video_type' => 'required|string|in:description,chapter,segment,short',
             'title' => 'required|string|max:100',
             'description' => 'nullable|string',
             'tags' => 'nullable|string',
@@ -4551,7 +7945,7 @@ class AudioBookController extends Controller
         }
 
         $title = $request->input('title');
-        $description = $request->input('description', '');
+        $description = ($request->input('description') ?? '');
         $tags = array_map('trim', explode(',', $request->input('tags', '')));
         $tags = array_filter($tags);
         $privacy = $request->input('privacy', 'private');
@@ -4613,6 +8007,25 @@ class AudioBookController extends Controller
                         'youtube_video_title' => $title,
                         'youtube_video_description' => $description,
                         'youtube_uploaded_at' => now(),
+                    ]);
+                }
+            }
+
+            // Save tracking data to short metadata store (shorts.json / clips.json)
+            if ($request->input('video_type') === 'short') {
+                try {
+                    $this->persistShortPublishMeta(
+                        $audioBook,
+                        (string) $request->input('video_id'),
+                        (string) $videoId,
+                        (string) $title,
+                        (string) $description
+                    );
+                } catch (\Throwable $shortMetaError) {
+                    Log::warning('Persist short publish metadata failed', [
+                        'audio_book_id' => $audioBook->id,
+                        'video_id' => (string) $request->input('video_id'),
+                        'error' => $shortMetaError->getMessage(),
                     ]);
                 }
             }
@@ -4708,7 +8121,7 @@ class AudioBookController extends Controller
     {
         $request->validate([
             'video_id' => 'required|string',
-            'video_type' => 'required|string|in:description,chapter,segment',
+            'video_type' => 'required|string|in:description,chapter,segment,short',
             'title' => 'required|string|max:100',
             'description' => 'nullable|string',
             'tags' => 'nullable|string',
@@ -4764,8 +8177,8 @@ class AudioBookController extends Controller
             // Step 1: Create playlist
             $playlistId = $this->youtubeCreatePlaylist(
                 $accessToken,
-                $request->input('playlist_name'),
-                $request->input('playlist_description', ''),
+                (string)($request->input('playlist_name') ?? ''),
+                (string)($request->input('playlist_description') ?? ''),
                 $privacy
             );
 
@@ -5288,6 +8701,36 @@ class AudioBookController extends Controller
      */
     private function resolveVideoPath(AudioBook $audioBook, string $videoId, string $videoType): ?string
     {
+        if ($videoType === 'short') {
+            if (str_starts_with($videoId, 'shortai_')) {
+                $indexStr = substr($videoId, strlen('shortai_'));
+                $targetIndex = (int) $indexStr;
+                $items = $this->loadShortVideoItems($audioBook->id);
+                foreach ($items as $k => $it) {
+                    $idx = (int)($it['index'] ?? ($k + 1));
+                    if ($idx !== $targetIndex) continue;
+                    $rel = ltrim((string)($it['video_path'] ?? ''), '/');
+                    if ($rel === '') return null;
+                    $abs = storage_path('app/public/' . $rel);
+                    return is_file($abs) ? $abs : null;
+                }
+                return null;
+            }
+
+            if (str_starts_with($videoId, 'shortclip_')) {
+                $clipId = substr($videoId, strlen('shortclip_'));
+                $clips = $this->loadClips($audioBook->id);
+                foreach ($clips as $clip) {
+                    if ((string)($clip['id'] ?? '') !== (string)$clipId) continue;
+                    $rel = ltrim((string)($clip['composed_path'] ?? ''), '/');
+                    if ($rel === '') return null;
+                    $abs = storage_path('app/public/' . $rel);
+                    return is_file($abs) ? $abs : null;
+                }
+                return null;
+            }
+        }
+
         if ($videoType === 'description') {
             if ($videoId === 'desc_scene' && $audioBook->description_scene_video) {
                 return storage_path('app/public/' . $audioBook->description_scene_video);
@@ -5318,6 +8761,70 @@ class AudioBookController extends Controller
         }
 
         return null;
+    }
+
+    private function persistShortPublishMeta(AudioBook $audioBook, string $sourceVideoId, string $youtubeVideoId, string $title, string $description): void
+    {
+        $uploadedAt = now()->toDateTimeString();
+
+        if (str_starts_with($sourceVideoId, 'shortai_')) {
+            $targetIndex = (int) substr($sourceVideoId, strlen('shortai_'));
+            if ($targetIndex <= 0) {
+                return;
+            }
+
+            $items = $this->loadShortVideoItems($audioBook->id);
+            $updated = false;
+
+            foreach ($items as $key => $item) {
+                $index = (int) ($item['index'] ?? ($key + 1));
+                if ($index !== $targetIndex) {
+                    continue;
+                }
+
+                $items[$key]['youtube_video_id'] = $youtubeVideoId;
+                $items[$key]['youtube_video_title'] = $title;
+                $items[$key]['youtube_video_description'] = $description;
+                $items[$key]['youtube_uploaded_at'] = $uploadedAt;
+                $items[$key]['updated_at'] = $uploadedAt;
+                $updated = true;
+                break;
+            }
+
+            if ($updated) {
+                $this->saveShortVideoItems($audioBook->id, $items);
+            }
+
+            return;
+        }
+
+        if (str_starts_with($sourceVideoId, 'shortclip_')) {
+            $clipId = substr($sourceVideoId, strlen('shortclip_'));
+            if ($clipId === '') {
+                return;
+            }
+
+            $clips = $this->loadClips($audioBook->id);
+            $updated = false;
+
+            foreach ($clips as $key => $clip) {
+                if ((string) ($clip['id'] ?? '') !== (string) $clipId) {
+                    continue;
+                }
+
+                $clips[$key]['youtube_video_id'] = $youtubeVideoId;
+                $clips[$key]['youtube_video_title'] = $title;
+                $clips[$key]['youtube_video_description'] = $description;
+                $clips[$key]['youtube_uploaded_at'] = $uploadedAt;
+                $clips[$key]['updated_at'] = $uploadedAt;
+                $updated = true;
+                break;
+            }
+
+            if ($updated) {
+                $this->saveClips($audioBook->id, $clips);
+            }
+        }
     }
 
     /**
@@ -5427,8 +8934,9 @@ class AudioBookController extends Controller
     /**
      * Create a YouTube playlist.
      */
-    private function youtubeCreatePlaylist(string $accessToken, string $title, string $description, string $privacy): string
+    private function youtubeCreatePlaylist(string $accessToken, string $title, ?string $description, string $privacy): string
     {
+        $description = $description ?? '';
         $client = new \GuzzleHttp\Client();
 
         $response = $client->post('https://www.googleapis.com/youtube/v3/playlists?part=snippet,status', [
@@ -6315,5 +9823,2571 @@ class AudioBookController extends Controller
         $segment->delete();
 
         return response()->json(['success' => true, 'message' => 'Da xoa segment.']);
+    }
+
+    // =========================================================
+    // CLIPPING FEATURE
+    // =========================================================
+
+    private function getClippingDir(int $bookId): string
+    {
+        $dir = storage_path('app/public/books/' . $bookId . '/clipping');
+        if (!is_dir($dir)) mkdir($dir, 0755, true);
+        $clipsDir = $dir . '/clips';
+        if (!is_dir($clipsDir)) mkdir($clipsDir, 0755, true);
+        return $dir;
+    }
+
+    private function loadClips(int $bookId): array
+    {
+        $path = $this->getClippingDir($bookId) . '/clips.json';
+        if (!file_exists($path)) return [];
+        return json_decode(file_get_contents($path), true) ?: [];
+    }
+
+    private function saveClips(int $bookId, array $clips): void
+    {
+        $path = $this->getClippingDir($bookId) . '/clips.json';
+        file_put_contents($path, json_encode($clips, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE));
+    }
+
+    private function findClip(array $clips, string $clipId): ?array
+    {
+        foreach ($clips as $clip) {
+            if (($clip['id'] ?? '') === $clipId) return $clip;
+        }
+        return null;
+    }
+
+    private function updateClipInList(array &$clips, string $clipId, array $data): void
+    {
+        if (array_key_exists('cta', $data) && is_string($data['cta']) && trim($data['cta']) !== '') {
+            $data['cta'] = $this->ensureCtaHasMoiBan((string)$data['cta']);
+        }
+
+        if (array_key_exists('cta_narration', $data) && is_string($data['cta_narration']) && trim($data['cta_narration']) !== '') {
+            $data['cta_narration'] = $this->ensureCtaHasMoiBan((string)$data['cta_narration']);
+        }
+
+        foreach ($clips as &$clip) {
+            if (($clip['id'] ?? '') === $clipId) {
+                $clip = array_merge($clip, $data, ['updated_at' => now()->toDateTimeString()]);
+                return;
+            }
+        }
+    }
+
+    private function getVideoDuration(string $filePath): float
+    {
+        $ffprobePath = config('services.ffmpeg.ffprobe_path', 'ffprobe');
+        $cmd = sprintf(
+            '%s -v quiet -show_entries format=duration -of csv=p=0 %s 2>/dev/null',
+            escapeshellarg($ffprobePath),
+            escapeshellarg($filePath)
+        );
+        $out = [];
+        exec($cmd, $out);
+        return (float) trim(implode('', $out) ?: '0');
+    }
+
+    private function getClipNumberFromId(string $clipId): int
+    {
+        if (preg_match('/clip_(\d+)_/i', $clipId, $matches)) {
+            return max(1, (int)($matches[1] ?? 1));
+        }
+
+        return 1;
+    }
+
+    private function ensureCtaHasMoiBan(string $text, string $bookTitle = '', string $channelName = ''): string
+    {
+        $bookTitle = trim($bookTitle) !== '' ? trim($bookTitle) : 'cuốn sách này';
+        $channelName = trim($channelName);
+        $channelMention = $channelName !== '' ? 'kênh ' . $channelName : 'kênh Sumo Phiêu Lưu Ký';
+
+        $normalized = trim((string) preg_replace('/\s+/u', ' ', $text));
+        if ($normalized === '') {
+            return "Mời bạn nghe trọn bộ {$bookTitle} trên {$channelMention} nhé.";
+        }
+
+        if (mb_stripos($normalized, 'mời bạn') !== false) {
+            return $normalized;
+        }
+
+        $normalized = (string) preg_replace('/^Bạn\s+/ui', '', $normalized);
+        $normalized = trim($normalized);
+        if ($normalized === '') {
+            return "Mời bạn nghe trọn bộ {$bookTitle} trên {$channelMention} nhé.";
+        }
+
+        $firstChar = mb_substr($normalized, 0, 1);
+        $rest = mb_substr($normalized, 1);
+        if ($firstChar !== '' && preg_match('/^[A-ZÀ-Ỹ]$/u', $firstChar)) {
+            $normalized = mb_strtolower($firstChar) . $rest;
+        }
+
+        return 'Mời bạn ' . $normalized;
+    }
+
+    private function buildClipCtaNarration(AudioBook $audioBook, array $clip, int $clipNumber): string
+    {
+        $bookTitle = trim((string)($audioBook->title ?? ''));
+        if ($bookTitle === '') {
+            $bookTitle = 'cuốn sách này';
+        }
+
+        $channelName = trim((string) optional($audioBook->youtubeChannel)->title);
+        if ($channelName === '') {
+            $channelName = 'Sumo Phiêu Lưu Ký';
+        }
+
+        $part = max(1, $clipNumber);
+        $hookTitle = trim((string)($clip['hook_title'] ?? ''));
+
+        // Try AI rewrite for a creative, engaging CTA
+        try {
+            $apiKey = config('services.gemini.api_key');
+            if ($apiKey) {
+                $prompt = "Bạn là một content creator chuyên nghiệp. Hãy viết một đoạn CTA (call-to-action) ngắn gọn, hấp dẫn cho video trích đoạn audiobook.\n"
+                    . "Thông tin:\n"
+                    . "- Tên sách: {$bookTitle}\n"
+                    . "- Phần: {$part}\n"
+                    . ($hookTitle !== '' ? "- Tiêu đề hook: {$hookTitle}\n" : '')
+                    . "- Kênh: {$channelName}\n\n"
+                    . "Yêu cầu:\n"
+                    . "- Viết 1-2 câu ngắn gọn (tối đa 40 từ)\n"
+                    . "- Giọng điệu cuốn hút, kích thích tò mò\n"
+                    . "- Kêu gọi người nghe theo dõi kênh hoặc nghe tiếp\n"
+                    . "- Đề cập tên sách một cách tự nhiên\n"
+                    . "- Nên có cụm 'Mời bạn' để CTA thân thiện hơn\n"
+                    . "- Không dùng emoji, hashtag hay ký hiệu đặc biệt\n"
+                    . "- Chỉ trả về nội dung CTA, không giải thích gì thêm\n\n"
+                    . "Ví dụ tốt:\n"
+                    . "- Câu chuyện còn kịch tính hơn thế nữa! Mời bạn nghe trọn bộ Tên Sách ngay trên kênh Sumo Phiêu Lưu Ký nhé!\n"
+                    . "- Muốn biết kết cục ra sao? Mời bạn theo dõi kênh Sumo Phiêu Lưu Ký để nghe đầy đủ Tên Sách!";
+
+                $client = new \GuzzleHttp\Client();
+                $response = $client->post(
+                    "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={$apiKey}",
+                    [
+                        'headers' => ['Content-Type' => 'application/json'],
+                        'json' => [
+                            'contents' => [['parts' => [['text' => $prompt]]]],
+                            'generationConfig' => [
+                                'temperature' => 0.85,
+                                'maxOutputTokens' => 200,
+                            ],
+                        ],
+                        'timeout' => 15,
+                    ]
+                );
+
+                $result = json_decode($response->getBody()->getContents(), true);
+                $aiText = trim((string)($result['candidates'][0]['content']['parts'][0]['text'] ?? ''));
+
+                // Clean up AI output: remove surrounding quotes, asterisks, etc.
+                $aiText = preg_replace('/^["\'\'\*]+|["\'\'\*]+$/u', '', $aiText);
+                $aiText = trim($aiText);
+
+                if (mb_strlen($aiText) >= 15 && mb_strlen($aiText) <= 200) {
+                    $aiText = $this->ensureCtaHasMoiBan($aiText, $bookTitle, $channelName);
+                    Log::info('Clipping CTA AI rewrite success', ['clip' => $clip['id'] ?? '', 'cta' => $aiText]);
+                    return $aiText;
+                }
+            }
+        } catch (\Throwable $e) {
+            Log::warning('Clipping CTA AI rewrite failed, using template', [
+                'error' => $e->getMessage(),
+            ]);
+        }
+
+        // Fallback to template
+        return $this->ensureCtaHasMoiBan(
+            "Bạn vừa nghe trích đoạn audiobook phần {$part} của {$bookTitle}. Mời bạn vào kênh {$channelName} để nghe trọn bộ nhé.",
+            $bookTitle,
+            $channelName
+        );
+    }
+
+    private function createClipCtaAudio(AudioBook $audioBook, string $clipId, string $ctaText): array
+    {
+        $provider = strtolower((string)($audioBook->tts_provider ?: 'microsoft'));
+        $voiceGender = (string)($audioBook->tts_voice_gender ?: 'female');
+        $voiceName = $audioBook->tts_voice_name ?: null;
+        $styleInstruction = $audioBook->tts_style_instruction ?: null;
+        $speed = (float)($audioBook->tts_speed ?? 1.0);
+
+        $generatedAudioStoragePath = $this->ttsService->generateAudio(
+            $ctaText,
+            (int) random_int(10000, 99999),
+            $voiceGender,
+            $voiceName,
+            $provider,
+            $styleInstruction,
+            null,
+            $speed
+        );
+
+        $generatedAudioAbsPath = Storage::path($generatedAudioStoragePath);
+        if (!file_exists($generatedAudioAbsPath)) {
+            throw new \RuntimeException('Không thể tạo audio CTA từ TTS.');
+        }
+
+        $ctaDir = $this->getClippingDir($audioBook->id) . '/cta';
+        if (!is_dir($ctaDir)) {
+            mkdir($ctaDir, 0755, true);
+        }
+
+        $filename = $clipId . '_cta_' . time() . '.mp3';
+        $targetAbsPath = $ctaDir . '/' . $filename;
+        $targetRelPath = 'books/' . $audioBook->id . '/clipping/cta/' . $filename;
+
+        if (!@copy($generatedAudioAbsPath, $targetAbsPath)) {
+            throw new \RuntimeException('Không thể lưu audio CTA vào thư mục clipping.');
+        }
+
+        $duration = (float)($this->getAudioDuration($targetAbsPath) ?? 0.0);
+        if ($duration <= 0) {
+            $duration = 4.0;
+        }
+
+        return [
+            'absolute_path' => $targetAbsPath,
+            'relative_path' => $targetRelPath,
+            'duration' => $duration,
+        ];
+    }
+
+    private function getRelativePublicPathFromAbsolute(string $absolutePath): ?string
+    {
+        $publicBase = rtrim(storage_path('app/public'), '/');
+        if (!str_starts_with($absolutePath, $publicBase . '/')) {
+            return null;
+        }
+
+        return ltrim(substr($absolutePath, strlen($publicBase)), '/');
+    }
+
+    private function getVideoDimensions(string $filePath): ?array
+    {
+        if (!file_exists($filePath)) {
+            return null;
+        }
+
+        $ffprobePath = config('services.ffmpeg.ffprobe_path', 'ffprobe');
+        $cmd = sprintf(
+            '%s -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0:s=x %s 2>/dev/null',
+            escapeshellarg($ffprobePath),
+            escapeshellarg($filePath)
+        );
+
+        $output = [];
+        exec($cmd, $output, $code);
+
+        if ($code !== 0 || empty($output[0])) {
+            return null;
+        }
+
+        $parts = explode('x', trim((string)$output[0]));
+        if (count($parts) !== 2) {
+            return null;
+        }
+
+        $width = (int)($parts[0] ?? 0);
+        $height = (int)($parts[1] ?? 0);
+        if ($width <= 0 || $height <= 0) {
+            return null;
+        }
+
+        return [
+            'width' => $width,
+            'height' => $height,
+        ];
+    }
+
+    private function collectClippingAnimationOptions(int $bookId): array
+    {
+        $candidateDirs = [
+            [
+                'path' => storage_path('app/public/books/' . $bookId . '/media/animations'),
+                'priority' => 0,
+                'source' => 'media_library',
+            ],
+            [
+                'path' => storage_path('app/public/books/' . $bookId . '/animations'),
+                'priority' => 1,
+                'source' => 'animations',
+            ],
+        ];
+
+        $files = [];
+        foreach ($candidateDirs as $dirMeta) {
+            $dir = $dirMeta['path'] ?? null;
+            $priority = (int)($dirMeta['priority'] ?? 99);
+            $source = (string)($dirMeta['source'] ?? 'unknown');
+            if (!$dir) {
+                continue;
+            }
+
+            if (!is_dir($dir)) {
+                continue;
+            }
+
+            $paths = glob($dir . '/*.{mp4,webm,mov,mkv}', GLOB_BRACE) ?: [];
+            foreach ($paths as $path) {
+                if (is_file($path) && is_readable($path)) {
+                    $files[] = [
+                        'path' => $path,
+                        'source_priority' => $priority,
+                        'source' => $source,
+                    ];
+                }
+            }
+        }
+
+        if (empty($files)) {
+            return [];
+        }
+
+        $targetRatio = 9 / 16;
+        $scored = [];
+
+        foreach ($files as $file) {
+            $path = (string)($file['path'] ?? '');
+            if ($path === '') {
+                continue;
+            }
+
+            $dimensions = $this->getVideoDimensions($path);
+            if (!$dimensions) {
+                continue;
+            }
+
+            $width = (int)$dimensions['width'];
+            $height = (int)$dimensions['height'];
+            if ($height <= 0 || $width <= 0 || $height <= $width) {
+                continue;
+            }
+
+            $ratio = $width / $height;
+            $score = abs($ratio - $targetRatio);
+            $relativePath = $this->getRelativePublicPathFromAbsolute($path);
+            if (!$relativePath) {
+                continue;
+            }
+
+            $scored[] = [
+                'absolute_path' => $path,
+                'relative_path' => $relativePath,
+                'width' => $width,
+                'height' => $height,
+                'score' => $score,
+                'source' => (string)($file['source'] ?? 'unknown'),
+                'source_priority' => (int)($file['source_priority'] ?? 99),
+                'created_at' => @filemtime($path) ?: 0,
+            ];
+        }
+
+        if (empty($scored)) {
+            return [];
+        }
+
+        usort($scored, function ($a, $b) {
+            if (abs($a['score'] - $b['score']) > 0.0001) {
+                return $a['score'] <=> $b['score'];
+            }
+
+            if ((int)($a['source_priority'] ?? 99) !== (int)($b['source_priority'] ?? 99)) {
+                return (int)($a['source_priority'] ?? 99) <=> (int)($b['source_priority'] ?? 99);
+            }
+
+            return $b['created_at'] <=> $a['created_at'];
+        });
+
+        return $scored;
+    }
+
+    private function resolveClippingAnimationByPath(AudioBook $audioBook, ?string $relativePath): ?array
+    {
+        $relativePath = ltrim((string)$relativePath, '/');
+        if ($relativePath === '' || str_contains($relativePath, '..')) {
+            return null;
+        }
+
+        $ext = strtolower(pathinfo($relativePath, PATHINFO_EXTENSION));
+        if (!in_array($ext, ['mp4', 'webm', 'mov', 'mkv'], true)) {
+            return null;
+        }
+
+        $mediaLibraryPrefix = 'books/' . $audioBook->id . '/media/animations/';
+        $legacyAnimationsPrefix = 'books/' . $audioBook->id . '/animations/';
+
+        $isAllowed = str_starts_with($relativePath, $mediaLibraryPrefix)
+            || str_starts_with($relativePath, $legacyAnimationsPrefix);
+
+        if (!$isAllowed) {
+            return null;
+        }
+
+        $absPath = storage_path('app/public/' . $relativePath);
+        $realPath = realpath($absPath);
+        $publicBase = realpath(storage_path('app/public'));
+
+        if (!$realPath || !$publicBase || !str_starts_with($realPath, $publicBase . DIRECTORY_SEPARATOR)) {
+            return null;
+        }
+
+        if (!is_file($realPath) || !is_readable($realPath)) {
+            return null;
+        }
+
+        $dimensions = $this->getVideoDimensions($realPath);
+        if (!$dimensions) {
+            return null;
+        }
+
+        $width = (int)($dimensions['width'] ?? 0);
+        $height = (int)($dimensions['height'] ?? 0);
+        if ($width <= 0 || $height <= 0 || $height <= $width) {
+            return null;
+        }
+
+        $targetRatio = 9 / 16;
+        $ratio = $width / $height;
+        $score = abs($ratio - $targetRatio);
+        $source = str_starts_with($relativePath, $mediaLibraryPrefix) ? 'media_library' : 'animations';
+
+        return [
+            'absolute_path' => $realPath,
+            'relative_path' => $relativePath,
+            'width' => $width,
+            'height' => $height,
+            'score' => $score,
+            'source' => $source,
+            'source_priority' => $source === 'media_library' ? 0 : 1,
+            'created_at' => @filemtime($realPath) ?: 0,
+        ];
+    }
+
+    private function findBestClippingAnimation(int $bookId): ?array
+    {
+        $options = $this->collectClippingAnimationOptions($bookId);
+        return $options[0] ?? null;
+    }
+
+    private function collectClippingBackgroundAudioOptions(AudioBook $audioBook): array
+    {
+        $options = [];
+        $seen = [];
+
+        $pushOption = function (string $relativePath, string $type) use (&$options, &$seen, $audioBook) {
+            $relativePath = ltrim($relativePath, '/');
+            if ($relativePath === '' || isset($seen[$relativePath])) {
+                return;
+            }
+
+            $resolved = $this->resolveClippingBackgroundAudioByPath($audioBook, $relativePath);
+            if (!$resolved) {
+                return;
+            }
+
+            $seen[$relativePath] = true;
+            $options[] = [
+                'path' => $relativePath,
+                'label' => basename($relativePath),
+                'type' => $type,
+            ];
+        };
+
+        $introMusic = ltrim((string)($audioBook->intro_music ?? ''), '/');
+        if ($introMusic !== '') {
+            $pushOption($introMusic, 'intro');
+        }
+
+        $outroMusic = ltrim((string)($audioBook->outro_music ?? ''), '/');
+        if ($outroMusic !== '') {
+            $pushOption($outroMusic, 'outro');
+        }
+
+        $musicDir = storage_path('app/public/books/' . $audioBook->id . '/music');
+        if (!is_dir($musicDir)) {
+            return $options;
+        }
+
+        $preferred = glob($musicDir . '/intro*.{mp3,wav,m4a,aac,ogg}', GLOB_BRACE) ?: [];
+        $fallback = glob($musicDir . '/*.{mp3,wav,m4a,aac,ogg}', GLOB_BRACE) ?: [];
+        $all = array_values(array_unique(array_merge($preferred, $fallback)));
+
+        foreach ($all as $path) {
+            if (!is_file($path) || !is_readable($path)) {
+                continue;
+            }
+
+            $relativePath = $this->getRelativePublicPathFromAbsolute($path);
+            if (!$relativePath) {
+                continue;
+            }
+
+            $pushOption($relativePath, 'library');
+        }
+
+        return $options;
+    }
+
+    private function resolveClippingBackgroundAudioByPath(AudioBook $audioBook, ?string $relativePath): ?array
+    {
+        $relativePath = ltrim((string)$relativePath, '/');
+        if ($relativePath === '' || str_contains($relativePath, '..')) {
+            return null;
+        }
+
+        $ext = strtolower(pathinfo($relativePath, PATHINFO_EXTENSION));
+        if (!in_array($ext, ['mp3', 'wav', 'm4a', 'aac', 'ogg'], true)) {
+            return null;
+        }
+
+        $bookMusicPrefix = 'books/' . $audioBook->id . '/music/';
+        $introMusic = ltrim((string)($audioBook->intro_music ?? ''), '/');
+        $outroMusic = ltrim((string)($audioBook->outro_music ?? ''), '/');
+
+        $isAllowed = str_starts_with($relativePath, $bookMusicPrefix)
+            || ($introMusic !== '' && $relativePath === $introMusic)
+            || ($outroMusic !== '' && $relativePath === $outroMusic);
+
+        if (!$isAllowed) {
+            return null;
+        }
+
+        $absPath = storage_path('app/public/' . $relativePath);
+        $realPath = realpath($absPath);
+        $publicBase = realpath(storage_path('app/public'));
+
+        if (!$realPath || !$publicBase || !str_starts_with($realPath, $publicBase . DIRECTORY_SEPARATOR)) {
+            return null;
+        }
+
+        if (!is_file($realPath) || !is_readable($realPath)) {
+            return null;
+        }
+
+        return [
+            'absolute_path' => $realPath,
+            'relative_path' => $relativePath,
+        ];
+    }
+
+    private function resolveClippingBackgroundAudio(AudioBook $audioBook): ?array
+    {
+        $options = $this->collectClippingBackgroundAudioOptions($audioBook);
+        foreach ($options as $option) {
+            $resolved = $this->resolveClippingBackgroundAudioByPath($audioBook, $option['path'] ?? null);
+            if ($resolved) {
+                return $resolved;
+            }
+        }
+
+        return null;
+    }
+
+    private function formatAssTime(float $seconds): string
+    {
+        $seconds = max(0.0, $seconds);
+        $hours = (int) floor($seconds / 3600);
+        $minutes = (int) floor(($seconds % 3600) / 60);
+        $wholeSeconds = (int) floor($seconds % 60);
+        $centiseconds = (int) floor(($seconds - floor($seconds)) * 100);
+
+        return sprintf('%d:%02d:%02d.%02d', $hours, $minutes, $wholeSeconds, $centiseconds);
+    }
+
+    private function formatAssText(string $text, int $maxChars = 30): string
+    {
+        $normalized = trim((string) preg_replace('/\s+/u', ' ', $text));
+        if ($normalized === '') {
+            return '';
+        }
+
+        $words = preg_split('/\s+/u', $normalized, -1, PREG_SPLIT_NO_EMPTY) ?: [];
+        $lines = [];
+        $current = '';
+
+        foreach ($words as $word) {
+            $candidate = $current === '' ? $word : ($current . ' ' . $word);
+            if (mb_strlen($candidate) > $maxChars && $current !== '') {
+                $lines[] = $current;
+                $current = $word;
+                continue;
+            }
+            $current = $candidate;
+        }
+
+        if ($current !== '') {
+            $lines[] = $current;
+        }
+
+        $escaped = array_map(function ($line) {
+            $line = str_replace('\\', '\\\\', $line);
+            $line = str_replace('{', '\\{', $line);
+            $line = str_replace('}', '\\}', $line);
+            return $line;
+        }, $lines);
+
+        return implode('\\N', $escaped);
+    }
+
+    /**
+     * Transcribe audio using OpenAI Whisper API.
+     * Returns array of segments: [{start, end, text}, ...]
+     */
+    private function transcribeClipAudio(string $audioFilePath, float $maxDuration = 0): array
+    {
+        $apiKey = config('services.openai.api_key');
+        if (!$apiKey) {
+            Log::warning('Clipping transcription: OpenAI API key not configured');
+            return [];
+        }
+
+        if (!file_exists($audioFilePath) || !is_readable($audioFilePath)) {
+            return [];
+        }
+
+        // Extract audio from video to a small mp3 for Whisper
+        $ffmpegPath = config('services.ffmpeg.path', env('FFMPEG_PATH', 'ffmpeg'));
+        $tmpAudio = sys_get_temp_dir() . '/clip_whisper_' . md5($audioFilePath) . '_' . time() . '.mp3';
+
+        $extractCmd = sprintf(
+            '%s -y -i %s -vn -ar 16000 -ac 1 -b:a 64k %s %s 2>/dev/null',
+            escapeshellarg($ffmpegPath),
+            escapeshellarg($audioFilePath),
+            $maxDuration > 0 ? sprintf('-t %.3f', $maxDuration) : '',
+            escapeshellarg($tmpAudio)
+        );
+        exec($extractCmd, $_, $extractCode);
+
+        if ($extractCode !== 0 || !file_exists($tmpAudio) || filesize($tmpAudio) < 100) {
+            @unlink($tmpAudio);
+            return [];
+        }
+
+        try {
+            $client = new \GuzzleHttp\Client();
+            $response = $client->post('https://api.openai.com/v1/audio/transcriptions', [
+                'headers' => [
+                    'Authorization' => 'Bearer ' . $apiKey,
+                ],
+                'multipart' => [
+                    ['name' => 'file', 'contents' => fopen($tmpAudio, 'r'), 'filename' => 'clip.mp3'],
+                    ['name' => 'model', 'contents' => 'whisper-1'],
+                    ['name' => 'language', 'contents' => 'vi'],
+                    ['name' => 'response_format', 'contents' => 'verbose_json'],
+                    ['name' => 'timestamp_granularities[]', 'contents' => 'segment'],
+                ],
+                'timeout' => 120,
+            ]);
+
+            $result = json_decode($response->getBody()->getContents(), true);
+            $segments = $result['segments'] ?? [];
+
+            Log::info('Clipping Whisper transcription done', [
+                'file' => basename($audioFilePath),
+                'segments' => count($segments),
+                'duration' => $result['duration'] ?? null,
+            ]);
+
+            // Map to simple format
+            $mapped = [];
+            foreach ($segments as $seg) {
+                $text = trim((string)($seg['text'] ?? ''));
+                if ($text === '') continue;
+
+                $mapped[] = [
+                    'start' => (float)($seg['start'] ?? 0),
+                    'end'   => (float)($seg['end'] ?? 0),
+                    'text'  => $text,
+                ];
+            }
+
+            return $mapped;
+        } catch (\Throwable $e) {
+            Log::warning('Clipping Whisper transcription failed', ['error' => $e->getMessage()]);
+            return [];
+        } finally {
+            @unlink($tmpAudio);
+        }
+    }
+
+    /**
+     * Group Whisper segments into subtitle chunks suitable for display.
+     * Each chunk: max ~40 chars, 2-3s duration.
+     */
+    private function groupTranscriptionForSubtitles(array $segments, int $maxChars = 40): array
+    {
+        if (empty($segments)) return [];
+
+        $chunks = [];
+        $currentText = '';
+        $currentStart = null;
+        $currentEnd = null;
+
+        foreach ($segments as $seg) {
+            $text = trim($seg['text']);
+            if ($text === '') continue;
+
+            // Split long segments into sentences/phrases
+            $sentences = preg_split('/(?<=[.!?。…,;:])\s*/u', $text, -1, PREG_SPLIT_NO_EMPTY);
+            if (empty($sentences)) $sentences = [$text];
+
+            $segStart = (float)$seg['start'];
+            $segEnd = (float)$seg['end'];
+            $segDuration = max(0.1, $segEnd - $segStart);
+            $segChars = mb_strlen($text);
+
+            $charSoFar = 0;
+            foreach ($sentences as $sentence) {
+                $sentence = trim($sentence);
+                if ($sentence === '') continue;
+
+                $sentChars = mb_strlen($sentence);
+                $sentFraction = $segChars > 0 ? $sentChars / $segChars : 0;
+                $sentStart = $segStart + ($charSoFar / max(1, $segChars)) * $segDuration;
+                $sentEnd = $sentStart + $sentFraction * $segDuration;
+                $charSoFar += $sentChars;
+
+                $candidate = $currentText === '' ? $sentence : ($currentText . ' ' . $sentence);
+
+                if (mb_strlen($candidate) > $maxChars && $currentText !== '') {
+                    // Flush current
+                    $chunks[] = [
+                        'start' => $currentStart,
+                        'end'   => $currentEnd,
+                        'text'  => $currentText,
+                    ];
+                    $currentText = $sentence;
+                    $currentStart = $sentStart;
+                    $currentEnd = $sentEnd;
+                } else {
+                    if ($currentStart === null) $currentStart = $sentStart;
+                    $currentEnd = $sentEnd;
+                    $currentText = $candidate;
+                }
+            }
+        }
+
+        // Flush remaining
+        if ($currentText !== '' && $currentStart !== null) {
+            $chunks[] = [
+                'start' => $currentStart,
+                'end'   => $currentEnd,
+                'text'  => $currentText,
+            ];
+        }
+
+        return $chunks;
+    }
+
+    /**
+     * Get ASS subtitle style presets for narration text.
+     * Each preset returns: [PrimaryColour, OutlineColour, BackColour, BorderStyle, Outline, Shadow, FontSize, Spacing]
+     * ASS Color format: &HAABBGGRR
+     */
+    private function getSubtitleStylePresets(): array
+    {
+        return [
+            // Default: clean white text, black outline
+            'default' => [
+                'primary'     => '&H00FFFFFF',
+                'secondary'   => '&H00FFFFFF',
+                'outline'     => '&H00000000',
+                'back'        => '&H80000000',
+                'bold'        => 1,
+                'border_style'=> 1,
+                'outline_w'   => 3,
+                'shadow'      => 2,
+                'fontsize'    => 48,
+                'spacing'     => 0,
+                'label'       => 'Mặc định (trắng)',
+            ],
+            // Highlight Green: bright green text with thick dark outline (TikTok viral style)
+            'highlight_green' => [
+                'primary'     => '&H0000FF00', // green
+                'secondary'   => '&H0000FF00',
+                'outline'     => '&H00000000', // black
+                'back'        => '&H90000000',
+                'bold'        => 1,
+                'border_style'=> 1,
+                'outline_w'   => 5,
+                'shadow'      => 3,
+                'fontsize'    => 54,
+                'spacing'     => 1,
+                'label'       => 'Highlight xanh lá (viral)',
+            ],
+            // Highlight Yellow: bright yellow text with thick dark outline
+            'highlight_yellow' => [
+                'primary'     => '&H0000FFFF', // yellow (BGR)
+                'secondary'   => '&H0000DDFF',
+                'outline'     => '&H00000000',
+                'back'        => '&H90000000',
+                'bold'        => 1,
+                'border_style'=> 1,
+                'outline_w'   => 5,
+                'shadow'      => 3,
+                'fontsize'    => 54,
+                'spacing'     => 1,
+                'label'       => 'Highlight vàng (viral)',
+            ],
+            // Highlight Red: red text with thick dark outline
+            'highlight_red' => [
+                'primary'     => '&H000000FF', // red (BGR)
+                'secondary'   => '&H000000FF',
+                'outline'     => '&H00000000',
+                'back'        => '&H90000000',
+                'bold'        => 1,
+                'border_style'=> 1,
+                'outline_w'   => 5,
+                'shadow'      => 3,
+                'fontsize'    => 54,
+                'spacing'     => 1,
+                'label'       => 'Highlight đỏ (viral)',
+            ],
+            // Boxed: white text with semi-transparent background box
+            'boxed' => [
+                'primary'     => '&H00FFFFFF',
+                'secondary'   => '&H00FFFFFF',
+                'outline'     => '&H00000000',
+                'back'        => '&H96000000', // semi-transparent black box
+                'bold'        => 1,
+                'border_style'=> 3, // opaque box behind text
+                'outline_w'   => 12,
+                'shadow'      => 0,
+                'fontsize'    => 48,
+                'spacing'     => 1,
+                'label'       => 'Nền hộp đen',
+            ],
+            // Neon Blue: cyan/blue glow effect
+            'neon_blue' => [
+                'primary'     => '&H00FFFF00', // cyan (BGR)
+                'secondary'   => '&H00FFD000',
+                'outline'     => '&H00CC3300', // dark blue glow
+                'back'        => '&H80000000',
+                'bold'        => 1,
+                'border_style'=> 1,
+                'outline_w'   => 5,
+                'shadow'      => 4,
+                'fontsize'    => 52,
+                'spacing'     => 1,
+                'label'       => 'Neon xanh dương',
+            ],
+        ];
+    }
+
+    private function createClippingAssSubtitleFile(
+        int $bookId,
+        string $clipId,
+        string $hookTitle,
+        string $ctaNarration,
+        float $mainDuration,
+        float $ctaDuration,
+        array $transcriptionChunks = [],
+        string $subtitleStyle = 'highlight_green',
+        int $subtitleY = 1280
+    ): array {
+        $subtitleDir = $this->getClippingDir($bookId) . '/subtitles';
+        if (!is_dir($subtitleDir)) {
+            mkdir($subtitleDir, 0755, true);
+        }
+
+        $filename = $clipId . '_fx_' . time() . '.ass';
+        $absPath = $subtitleDir . '/' . $filename;
+        $relPath = 'books/' . $bookId . '/clipping/subtitles/' . $filename;
+
+        $mainDuration = max(1.0, $mainDuration);
+        $ctaDuration = max(1.5, $ctaDuration);
+        $totalDuration = $mainDuration + $ctaDuration;
+
+        $hookEnd = min(max(2.5, $mainDuration - 0.4), 5.8);
+        $labelEnd = max(2.0, min($mainDuration - 0.6, 6.2));
+        $ctaStart = max(0.1, $mainDuration);
+
+        $hookText = $this->formatAssText($hookTitle, 24);
+        if ($hookText === '') {
+            $hookText = 'Trích đoạn audiobook';
+        }
+        $ctaText = $this->formatAssText($ctaNarration, 34);
+
+        // Resolve subtitle style preset
+        $presets = $this->getSubtitleStylePresets();
+        $style = $presets[$subtitleStyle] ?? $presets['highlight_green'];
+
+        // For karaoke effect: make SecondaryColour semi-transparent based on primary
+        $primaryColor = (string)($style['primary'] ?? '&H00FFFFFF');
+        $secondaryForKaraoke = preg_replace('/^&H../', '&H80', $primaryColor);
+        if (!is_string($secondaryForKaraoke) || strpos($secondaryForKaraoke, '&H') !== 0) {
+            $secondaryForKaraoke = '&H80FFFFFF';
+        }
+
+        // Center-align narration and place via \pos override (an5), margins not used for middle alignment
+        $narrationStyleLine = sprintf(
+            "Style: Narration,DejaVu Sans,%d,%s,%s,%s,%s,%d,0,0,0,100,100,%d,0,%d,%d,%d,5,60,60,0,1",
+            $style['fontsize'],
+            $primaryColor,
+            $secondaryForKaraoke,
+            $style['outline'],
+            $style['back'],
+            $style['bold'],
+            $style['spacing'],
+            $style['border_style'],
+            $style['outline_w'],
+            $style['shadow']
+        );
+
+        $assContent = "[Script Info]\n";
+        $assContent .= "Title: Clipping FX\n";
+        $assContent .= "ScriptType: v4.00+\n";
+        $assContent .= "WrapStyle: 2\n";
+        $assContent .= "PlayResX: 1080\n";
+        $assContent .= "PlayResY: 1920\n";
+        $assContent .= "ScaledBorderAndShadow: yes\n\n";
+        $assContent .= "[V4+ Styles]\n";
+        $assContent .= "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n";
+        $assContent .= "Style: Hook,DejaVu Sans,72,&H00FFFFFF,&H00FFFFFF,&H00111111,&H60000000,1,0,0,0,100,100,0,0,1,4,1,8,70,70,130,1\n";
+        $assContent .= "Style: Label,DejaVu Sans,40,&H00FFFFFF,&H00FFFFFF,&H00111111,&H50000000,1,0,0,0,100,100,0,0,1,3,0,2,90,90,360,1\n";
+        $assContent .= "Style: Cta,DejaVu Sans,52,&H0000F0FF,&H0000F0FF,&H00111111,&H64000000,1,0,0,0,100,100,0,0,1,4,1,2,80,80,170,1\n";
+        // Narration subtitle: dynamic style based on user selection
+        $assContent .= $narrationStyleLine . "\n\n";
+        $assContent .= "[Events]\n";
+        $assContent .= "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n";
+
+        // Hook title (top area, first few seconds)
+        $assContent .= sprintf(
+            "Dialogue: 0,%s,%s,Hook,,0,0,0,,{\\fad(180,220)\\t(0,420,\\fscx106\\fscy106)\\t(420,900,\\fscx100\\fscy100)}%s\n",
+            $this->formatAssTime(0.0),
+            $this->formatAssTime($hookEnd),
+            $hookText
+        );
+        $assContent .= sprintf(
+            "Dialogue: 0,%s,%s,Label,,0,0,0,,{\\an5\\pos(540,960)\\alpha&H24&\\fad(150,300)}TRÍCH ĐOẠN AUDIOBOOK\n",
+            $this->formatAssTime(0.2),
+            $this->formatAssTime($labelEnd)
+        );
+
+        // Helper: build karaoke per-word sequence with explicit line-wrap using \N
+        // to avoid losing text when a subtitle chunk is too long for one line.
+        $buildKaraoke = function(string $text, float $durSec, int $maxLineChars = 18): string {
+            $plain = trim((string) preg_replace('/\s+/u', ' ', $text));
+            if ($plain === '') {
+                return '';
+            }
+
+            $allWords = preg_split('/\s+/u', $plain, -1, PREG_SPLIT_NO_EMPTY) ?: [];
+            if (empty($allWords)) {
+                return '';
+            }
+
+            $lines = [];
+            $currentLineWords = [];
+            $currentLineLen = 0;
+
+            foreach ($allWords as $word) {
+                $wordLen = mb_strlen($word);
+                $candidateLen = $currentLineLen === 0 ? $wordLen : ($currentLineLen + 1 + $wordLen);
+
+                if ($candidateLen > $maxLineChars && !empty($currentLineWords)) {
+                    $lines[] = $currentLineWords;
+                    $currentLineWords = [$word];
+                    $currentLineLen = $wordLen;
+                    continue;
+                }
+
+                $currentLineWords[] = $word;
+                $currentLineLen = $candidateLen;
+            }
+
+            if (!empty($currentLineWords)) {
+                $lines[] = $currentLineWords;
+            }
+
+            $totalWordCount = count($allWords);
+            $totalCs = max(10, (int) round($durSec * 100));
+            $base = (int) floor($totalCs / $totalWordCount);
+            $rem = $totalCs - $base * $totalWordCount;
+
+            $wordIndex = 0;
+            $lineParts = [];
+
+            foreach ($lines as $lineWords) {
+                $wordParts = [];
+                foreach ($lineWords as $word) {
+                    $k = $base + ($wordIndex === $totalWordCount - 1 ? $rem : 0);
+                    $escapedWord = str_replace('\\', '\\\\', $word);
+                    $escapedWord = str_replace('{', '\\{', $escapedWord);
+                    $escapedWord = str_replace('}', '\\}', $escapedWord);
+                    $wordParts[] = '{\\k' . max(1, $k) . '}' . $escapedWord;
+                    $wordIndex++;
+                }
+                $lineParts[] = implode(' ', $wordParts);
+            }
+
+            return implode('\\N', $lineParts);
+        };
+
+        // Transcription narration subtitles (positioned via pos)
+        // 1080x1920 → center x=540, y configurable (default lower-third)
+        if (!empty($transcriptionChunks)) {
+            foreach ($transcriptionChunks as $chunk) {
+                $start = max(0.0, (float)($chunk['start'] ?? 0));
+                $end = min($mainDuration, (float)($chunk['end'] ?? 0));
+                if ($end <= $start || $end - $start < 0.15) continue;
+
+                $rawText = trim((string)($chunk['text'] ?? ''));
+                if ($rawText === '') continue;
+
+                $kara = $buildKaraoke($rawText, max(0.15, $end - $start), 18);
+                if ($kara === '') continue;
+
+                $assContent .= sprintf(
+                    "Dialogue: 1,%s,%s,Narration,,0,0,0,,{\\an5\\pos(540,%d)\\fad(80,80)}%s\n",
+                    $this->formatAssTime($start),
+                    $this->formatAssTime($end),
+                    $subtitleY,
+                    $kara
+                );
+            }
+        }
+
+        // CTA narration (during CTA segment, after main clip)
+        $assContent .= sprintf(
+            "Dialogue: 0,%s,%s,Cta,,0,0,0,,{\\fad(240,360)\\t(0,360,\\fscx103\\fscy103)\\t(360,760,\\fscx100\\fscy100)}%s\n",
+            $this->formatAssTime($ctaStart),
+            $this->formatAssTime($totalDuration),
+            $ctaText
+        );
+
+        file_put_contents($absPath, $assContent);
+
+        return [
+            'absolute_path' => $absPath,
+            'relative_path' => $relPath,
+        ];
+    }
+
+    private function composeClippingMainSegment(
+        string $ffmpegPath,
+        string $clipPath,
+        ?string $imagePath,
+        ?string $animatedBgPath,
+        float $mainDuration,
+        string $outputPath
+    ): void {
+        $mainDuration = max(1.0, $mainDuration);
+        $fadeDuration = min(1.4, max(0.8, $mainDuration * 0.08));
+        $fadeStart = max(0.0, $mainDuration - $fadeDuration);
+
+        if ($animatedBgPath && file_exists($animatedBgPath)) {
+            $filterComplex = sprintf(
+                "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,fps=30,format=yuv420p[v];[1:a]atrim=0:%.3f,asetpts=PTS-STARTPTS,aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,afade=t=out:st=%.3f:d=%.3f[a]",
+                $mainDuration,
+                $fadeStart,
+                $fadeDuration
+            );
+
+            $cmd = sprintf(
+                '%s -y -stream_loop -1 -i %s -i %s -t %.3f -filter_complex %s -map "[v]" -map "[a]" -c:v libx264 -preset veryfast -crf 23 -c:a aac -b:a 192k -pix_fmt yuv420p -shortest %s 2>&1',
+                escapeshellarg($ffmpegPath),
+                escapeshellarg($animatedBgPath),
+                escapeshellarg($clipPath),
+                $mainDuration,
+                escapeshellarg($filterComplex),
+                escapeshellarg($outputPath)
+            );
+
+            $this->runFfmpegCommand($cmd, 'Không thể tạo đoạn clipping chính từ video motion background.');
+            return;
+        }
+
+        if ($imagePath && file_exists($imagePath)) {
+            $filterComplex = sprintf(
+                "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,zoompan=z='min(1.08,max(1.0,1+0.015*sin(2*PI*on/(30*8))))':d=1:x='iw/2-(iw/zoom/2)+sin(on/35)*6':y='ih/2-(ih/zoom/2)+cos(on/45)*6':s=1080x1920:fps=30,format=yuv420p[v];[1:a]atrim=0:%.3f,asetpts=PTS-STARTPTS,aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,afade=t=out:st=%.3f:d=%.3f[a]",
+                $mainDuration,
+                $fadeStart,
+                $fadeDuration
+            );
+
+            $cmd = sprintf(
+                '%s -y -loop 1 -i %s -i %s -t %.3f -filter_complex %s -map "[v]" -map "[a]" -c:v libx264 -preset veryfast -crf 23 -c:a aac -b:a 192k -pix_fmt yuv420p -shortest %s 2>&1',
+                escapeshellarg($ffmpegPath),
+                escapeshellarg($imagePath),
+                escapeshellarg($clipPath),
+                $mainDuration,
+                escapeshellarg($filterComplex),
+                escapeshellarg($outputPath)
+            );
+
+            $this->runFfmpegCommand($cmd, 'Không thể tạo đoạn clipping chính từ ảnh minh họa.');
+            return;
+        }
+
+        $filterComplex = sprintf(
+            '[0:v]scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps=30,format=yuv420p[v];[0:a]atrim=0:%.3f,asetpts=PTS-STARTPTS,aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,afade=t=out:st=%.3f:d=%.3f[a]',
+            $mainDuration,
+            $fadeStart,
+            $fadeDuration
+        );
+
+        $cmd = sprintf(
+            '%s -y -i %s -t %.3f -filter_complex %s -map "[v]" -map "[a]" -c:v libx264 -preset veryfast -crf 23 -c:a aac -b:a 192k -pix_fmt yuv420p -shortest %s 2>&1',
+            escapeshellarg($ffmpegPath),
+            escapeshellarg($clipPath),
+            $mainDuration,
+            escapeshellarg($filterComplex),
+            escapeshellarg($outputPath)
+        );
+
+        $this->runFfmpegCommand($cmd, 'Không thể tạo đoạn clipping chính từ video gốc.');
+    }
+
+    private function composeClippingCtaSegment(
+        string $ffmpegPath,
+        ?string $animationPath,
+        ?string $imagePath,
+        string $ctaAudioPath,
+        float $ctaDuration,
+        string $outputPath
+    ): void {
+        $ctaDuration = max(1.5, $ctaDuration);
+
+        if ($animationPath && file_exists($animationPath)) {
+            $vf = 'scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,fps=30,format=yuv420p';
+            $cmd = sprintf(
+                '%s -y -stream_loop -1 -i %s -i %s -t %.3f -vf %s -map 0:v:0 -map 1:a:0 -c:v libx264 -preset veryfast -crf 23 -c:a aac -b:a 192k -pix_fmt yuv420p -shortest %s 2>&1',
+                escapeshellarg($ffmpegPath),
+                escapeshellarg($animationPath),
+                escapeshellarg($ctaAudioPath),
+                $ctaDuration,
+                escapeshellarg($vf),
+                escapeshellarg($outputPath)
+            );
+            $this->runFfmpegCommand($cmd, 'Không thể tạo đoạn CTA từ animation 9:16.');
+            return;
+        }
+
+        if ($imagePath && file_exists($imagePath)) {
+            $vf = "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,zoompan=z='min(1.06,max(1.0,1+0.01*sin(2*PI*on/(30*6))))':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1080x1920:fps=30,format=yuv420p";
+            $cmd = sprintf(
+                '%s -y -loop 1 -i %s -i %s -t %.3f -vf %s -map 0:v:0 -map 1:a:0 -c:v libx264 -preset veryfast -crf 23 -c:a aac -b:a 192k -pix_fmt yuv420p -shortest %s 2>&1',
+                escapeshellarg($ffmpegPath),
+                escapeshellarg($imagePath),
+                escapeshellarg($ctaAudioPath),
+                $ctaDuration,
+                escapeshellarg($vf),
+                escapeshellarg($outputPath)
+            );
+            $this->runFfmpegCommand($cmd, 'Không thể tạo đoạn CTA fallback từ ảnh minh họa.');
+            return;
+        }
+
+        $cmd = sprintf(
+            '%s -y -f lavfi -i %s -i %s -t %.3f -vf %s -map 0:v:0 -map 1:a:0 -c:v libx264 -preset veryfast -crf 23 -c:a aac -b:a 192k -pix_fmt yuv420p -shortest %s 2>&1',
+            escapeshellarg($ffmpegPath),
+            escapeshellarg("color=c=black:s=1080x1920:r=30:d={$ctaDuration}"),
+            escapeshellarg($ctaAudioPath),
+            $ctaDuration,
+            escapeshellarg('format=yuv420p'),
+            escapeshellarg($outputPath)
+        );
+        $this->runFfmpegCommand($cmd, 'Không thể tạo đoạn CTA nền đen.');
+    }
+
+    public function listClippingVideos(AudioBook $audioBook)
+    {
+        $videos = [];
+
+        // 1. Model-level video fields
+        $fields = [
+            'full_book_video'          => 'Video sách đầy đủ',
+            'review_video'             => 'Video review',
+            'description_scene_video'  => 'Video giới thiệu (scene)',
+            'description_lipsync_video'=> 'Video giới thiệu (lipsync)',
+        ];
+        foreach ($fields as $field => $label) {
+            $path = $audioBook->$field ?? null;
+            if (!$path) continue;
+            $absPath = storage_path('app/public/' . $path);
+            if (!file_exists($absPath)) continue;
+            $duration = $this->getVideoDuration($absPath);
+            if ($duration < 10) continue;
+            $videos[] = [
+                'field'        => $field,
+                'label'        => $label,
+                'path'         => $path,
+                'url'          => asset('storage/' . $path),
+                'duration'     => round($duration, 1),
+                'duration_fmt' => gmdate('H:i:s', (int)$duration),
+            ];
+        }
+
+        // 2. Segment videos (same as auto-publish)
+        foreach ($audioBook->videoSegments()->orderBy('sort_order')->get() as $segment) {
+            if (!$segment->video_path || $segment->status !== 'completed') continue;
+            $absPath = storage_path('app/public/' . $segment->video_path);
+            if (!file_exists($absPath)) continue;
+            $duration = $segment->video_duration ?: $this->getVideoDuration($absPath);
+            if ($duration < 10) continue;
+            $videos[] = [
+                'field'        => 'segment_' . $segment->id,
+                'label'        => 'Segment: ' . ($segment->name ?: 'Phần ' . $segment->sort_order),
+                'path'         => $segment->video_path,
+                'url'          => asset('storage/' . $segment->video_path),
+                'duration'     => round($duration, 1),
+                'duration_fmt' => gmdate('H:i:s', (int)$duration),
+            ];
+        }
+
+        // 3. Chapter videos
+        foreach ($audioBook->chapters()->orderBy('chapter_number')->get() as $chapter) {
+            if (!$chapter->video_path) continue;
+            $absPath = storage_path('app/public/' . $chapter->video_path);
+            if (!file_exists($absPath)) continue;
+            $duration = $chapter->total_duration ?: $this->getVideoDuration($absPath);
+            if ($duration < 10) continue;
+            $videos[] = [
+                'field'        => 'chapter_' . $chapter->id,
+                'label'        => 'Chương ' . $chapter->chapter_number . ': ' . $chapter->title,
+                'path'         => $chapter->video_path,
+                'url'          => asset('storage/' . $chapter->video_path),
+                'duration'     => round($duration, 1),
+                'duration_fmt' => gmdate('H:i:s', (int)$duration),
+            ];
+        }
+
+        return response()->json(['success' => true, 'videos' => $videos]);
+    }
+
+    public function listClippingBackgroundAudios(AudioBook $audioBook)
+    {
+        $options = $this->collectClippingBackgroundAudioOptions($audioBook);
+        $mappedOptions = array_map(function ($item) {
+            $path = ltrim((string)($item['path'] ?? ''), '/');
+
+            return [
+                'path' => $path,
+                'label' => (string)($item['label'] ?? basename($path)),
+                'type' => (string)($item['type'] ?? 'library'),
+                'url' => $path !== '' ? asset('storage/' . $path) : null,
+            ];
+        }, $options);
+
+        $autoSelected = $this->resolveClippingBackgroundAudio($audioBook);
+
+        return response()->json([
+            'success' => true,
+            'options' => array_values($mappedOptions),
+            'auto_selected_path' => $autoSelected['relative_path'] ?? null,
+            'auto_selected_url' => !empty($autoSelected['relative_path']) ? asset('storage/' . $autoSelected['relative_path']) : null,
+        ]);
+    }
+
+    public function listClippingCtaAnimations(AudioBook $audioBook)
+    {
+        $options = $this->collectClippingAnimationOptions($audioBook->id);
+        $mappedOptions = array_map(function ($item) {
+            $path = ltrim((string)($item['relative_path'] ?? ''), '/');
+            $width = (int)($item['width'] ?? 0);
+            $height = (int)($item['height'] ?? 0);
+
+            return [
+                'path' => $path,
+                'label' => basename($path),
+                'url' => $path !== '' ? asset('storage/' . $path) : null,
+                'width' => $width,
+                'height' => $height,
+                'ratio' => ($width > 0 && $height > 0) ? round($width / $height, 6) : null,
+                'score' => isset($item['score']) ? round((float)$item['score'], 6) : null,
+                'source' => (string)($item['source'] ?? 'unknown'),
+            ];
+        }, $options);
+
+        $autoSelected = $options[0] ?? null;
+
+        return response()->json([
+            'success' => true,
+            'options' => array_values($mappedOptions),
+            'auto_selected_path' => $autoSelected['relative_path'] ?? null,
+            'auto_selected_url' => !empty($autoSelected['relative_path']) ? asset('storage/' . $autoSelected['relative_path']) : null,
+        ]);
+    }
+
+    public function listClips(AudioBook $audioBook)
+    {
+        $clips = $this->loadClips($audioBook->id);
+        $baseUrl = rtrim(asset('storage'), '/') . '/';
+        $mapped = array_map(function ($clip) use ($baseUrl) {
+            return array_merge($clip, [
+                'clip_url'          => !empty($clip['clip_path'])           ? $baseUrl . $clip['clip_path']           : null,
+                'image_url'         => !empty($clip['image_path'])          ? $baseUrl . $clip['image_path']          : null,
+                'image_animation_url' => !empty($clip['image_animation_path']) ? $baseUrl . $clip['image_animation_path'] : null,
+                'composed_url'      => !empty($clip['composed_path'])       ? $baseUrl . $clip['composed_path']       : null,
+                'cta_audio_url'     => !empty($clip['cta_audio_path'])      ? $baseUrl . $clip['cta_audio_path']      : null,
+                'cta_animation_url' => !empty($clip['cta_animation_path'])  ? $baseUrl . $clip['cta_animation_path']  : null,
+                'cta_animation_selected_url' => !empty($clip['cta_animation_selected_path']) ? $baseUrl . $clip['cta_animation_selected_path'] : null,
+                'ass_subtitle_url'  => !empty($clip['ass_subtitle_path'])   ? $baseUrl . $clip['ass_subtitle_path']   : null,
+                'bg_audio_url'      => !empty($clip['bg_audio_path'])       ? $baseUrl . $clip['bg_audio_path']       : null,
+            ]);
+        }, $clips);
+
+        return response()->json(['success' => true, 'clips' => array_values($mapped)]);
+    }
+
+    public function updateClipSettings(Request $request, AudioBook $audioBook, string $clipId)
+    {
+        $clips = $this->loadClips($audioBook->id);
+        $clip  = $this->findClip($clips, $clipId);
+        if (!$clip) {
+            return response()->json(['success' => false, 'error' => 'Clip không tồn tại.'], 404);
+        }
+
+        $validated = $request->validate([
+            'cta_animation_mode' => 'nullable|string|in:auto,custom',
+            'cta_animation_path' => 'nullable|string|max:500',
+            'subtitle_style' => 'nullable|string|in:default,highlight_green,highlight_yellow,highlight_red,boxed,neon_blue',
+            'subtitle_position' => 'nullable|string|in:lower_third,middle,bottom',
+        ]);
+
+        $updatePayload = [];
+
+        $hasCtaMode = array_key_exists('cta_animation_mode', $validated);
+        $hasCtaPath = array_key_exists('cta_animation_path', $validated)
+            && !empty($validated['cta_animation_path']);
+
+        if ($hasCtaMode || $hasCtaPath) {
+            $ctaAnimationMode = strtolower((string)($validated['cta_animation_mode'] ?? ($clip['cta_animation_mode'] ?? 'auto')));
+            if (!$hasCtaMode && $hasCtaPath) {
+                $ctaAnimationMode = 'custom';
+            }
+
+            $ctaAnimationPathInput = $hasCtaPath
+                ? ltrim((string)$validated['cta_animation_path'], '/')
+                : ltrim((string)($clip['cta_animation_selected_path'] ?? ''), '/');
+
+            if ($ctaAnimationMode === 'custom') {
+                if ($ctaAnimationPathInput === '') {
+                    return response()->json([
+                        'success' => false,
+                        'error' => 'Bạn chưa chọn animation CTA.',
+                    ], 422);
+                }
+
+                $resolvedAnimation = $this->resolveClippingAnimationByPath($audioBook, $ctaAnimationPathInput);
+                if (!$resolvedAnimation) {
+                    return response()->json([
+                        'success' => false,
+                        'error' => 'Animation CTA đã chọn không hợp lệ hoặc không đúng định dạng dọc.',
+                    ], 422);
+                }
+
+                $ctaAnimationPathInput = (string)($resolvedAnimation['relative_path'] ?? $ctaAnimationPathInput);
+            }
+
+            $updatePayload['cta_animation_mode'] = $ctaAnimationMode === 'custom' ? 'custom' : 'auto';
+            $updatePayload['cta_animation_selected_path'] = $ctaAnimationMode === 'custom' ? $ctaAnimationPathInput : null;
+        }
+
+        if (!empty($validated['subtitle_style'])) {
+            $updatePayload['subtitle_style'] = (string)$validated['subtitle_style'];
+        }
+
+        if (!empty($validated['subtitle_position'])) {
+            $updatePayload['subtitle_position'] = (string)$validated['subtitle_position'];
+        }
+
+        if (!empty($updatePayload)) {
+            $this->updateClipInList($clips, $clipId, $updatePayload);
+            $this->saveClips($audioBook->id, $clips);
+        }
+
+        $updatedClip = $this->findClip($clips, $clipId) ?? [];
+
+        return response()->json([
+            'success' => true,
+            'clip' => $updatedClip,
+            'cta_animation_selected_url' => !empty($updatedClip['cta_animation_selected_path'])
+                ? asset('storage/' . $updatedClip['cta_animation_selected_path'])
+                : null,
+        ]);
+    }
+
+    public function generateClips(Request $request, AudioBook $audioBook)
+    {
+        $request->validate([
+            'source_field' => 'required|string',
+            'count'        => 'required|integer|min:1|max:20',
+            'clip_duration'=> 'nullable|integer|min:30|max:120',
+        ]);
+
+        $sourceField = $request->input('source_field');
+        $count       = (int) $request->input('count', 3);
+        $clipDuration= (int) $request->input('clip_duration', 60);
+
+        // Resolve path for model fields, segment_X, or chapter_X
+        $sourcePath = null;
+        if (str_starts_with($sourceField, 'segment_')) {
+            $segId = (int) str_replace('segment_', '', $sourceField);
+            $seg = $audioBook->videoSegments()->find($segId);
+            $sourcePath = $seg?->video_path ?? null;
+        } elseif (str_starts_with($sourceField, 'chapter_')) {
+            $chapId = (int) str_replace('chapter_', '', $sourceField);
+            $chap = $audioBook->chapters()->find($chapId);
+            $sourcePath = $chap?->video_path ?? null;
+        } else {
+            $sourcePath = $audioBook->$sourceField ?? null;
+        }
+
+        if (!$sourcePath) {
+            return response()->json(['success' => false, 'error' => 'Video nguồn không tồn tại.'], 422);
+        }
+
+        $absSourcePath = storage_path('app/public/' . $sourcePath);
+        if (!file_exists($absSourcePath)) {
+            return response()->json(['success' => false, 'error' => 'File video nguồn không tìm thấy.'], 422);
+        }
+
+        $totalDuration = $this->getVideoDuration($absSourcePath);
+        if ($totalDuration < $clipDuration + 10) {
+            return response()->json(['success' => false, 'error' => 'Video quá ngắn để cắt clip.'], 422);
+        }
+
+        $ffmpegPath = config('services.ffmpeg.path', env('FFMPEG_PATH', 'ffmpeg'));
+        $clipsDir   = $this->getClippingDir($audioBook->id) . '/clips';
+        $clips      = $this->loadClips($audioBook->id);
+
+        // Generate random non-overlapping start times
+        $usableEnd    = $totalDuration - $clipDuration - 5;
+        $usableStart  = 5; // skip intro
+        $startTimes   = [];
+        $maxAttempts  = $count * 10;
+        $attempts     = 0;
+
+        while (count($startTimes) < $count && $attempts < $maxAttempts) {
+            $attempts++;
+            $candidate = round(mt_rand((int)($usableStart * 10), (int)($usableEnd * 10)) / 10, 1);
+            // Check no overlap with existing
+            $overlap = false;
+            foreach ($startTimes as $existing) {
+                if (abs($existing - $candidate) < $clipDuration) {
+                    $overlap = true;
+                    break;
+                }
+            }
+            if (!$overlap) $startTimes[] = $candidate;
+        }
+
+        $newClips  = [];
+        $failed    = 0;
+
+        foreach ($startTimes as $i => $startTime) {
+            $clipId   = 'clip_' . ($i + 1) . '_' . time() . '_' . mt_rand(100, 999);
+            $filename = $clipId . '.mp4';
+            $absClipPath = $clipsDir . '/' . $filename;
+            $relClipPath = 'books/' . $audioBook->id . '/clipping/clips/' . $filename;
+
+            $cmd = sprintf(
+                '%s -y -ss %s -i %s -t %d -c:v libx264 -c:a aac -preset fast -crf 23 %s 2>&1',
+                escapeshellarg($ffmpegPath),
+                $startTime,
+                escapeshellarg($absSourcePath),
+                $clipDuration,
+                escapeshellarg($absClipPath)
+            );
+
+            exec($cmd, $output, $returnCode);
+
+            if ($returnCode !== 0 || !file_exists($absClipPath)) {
+                $failed++;
+                Log::error("Clipping: FFmpeg failed for clip {$clipId}", ['output' => implode("\n", array_slice($output, -3))]);
+                continue;
+            }
+
+            $actualDuration = $this->getVideoDuration($absClipPath);
+            $clip = [
+                'id'             => $clipId,
+                'source_field'   => $sourceField,
+                'source_path'    => $sourcePath,
+                'start_time'     => $startTime,
+                'duration'       => round($actualDuration, 1),
+                'clip_path'      => $relClipPath,
+                'hook_title'     => null,
+                'cta'            => null,
+                'cta_narration'  => null,
+                'image_prompt'   => null,
+                'image_path'     => null,
+                'image_animation_path' => null,
+                'image_animation_task_id' => null,
+                'image_animation_status' => null,
+                'image_animation_prompt' => null,
+                'image_animation_provider' => null,
+                'image_animation_error' => null,
+                'cta_audio_path' => null,
+                'cta_animation_path' => null,
+                'cta_animation_mode' => 'auto',
+                'cta_animation_selected_path' => null,
+                'ass_subtitle_path' => null,
+                'bg_audio_path'  => null,
+                'bg_audio_mode'  => null,
+                'bg_audio_volume'=> null,
+                'subtitle_style' => 'highlight_green',
+                'subtitle_position' => 'lower_third',
+                'composed_path'  => null,
+                'status'         => 'clipped',
+                'created_at'     => now()->toDateTimeString(),
+                'updated_at'     => now()->toDateTimeString(),
+            ];
+
+            $clips[]    = $clip;
+            $newClips[] = $clip;
+        }
+
+        $this->saveClips($audioBook->id, $clips);
+
+        return response()->json([
+            'success'   => true,
+            'generated' => count($newClips),
+            'failed'    => $failed,
+            'clips'     => array_map(fn($c) => array_merge($c, [
+                'clip_url' => asset('storage/' . $c['clip_path']),
+            ]), $newClips),
+        ]);
+    }
+
+    public function generateClipHookTitle(Request $request, AudioBook $audioBook, string $clipId)
+    {
+        // If not from background job, queue and return immediately
+        if (!$request->has('_from_job')) {
+            \Illuminate\Support\Facades\Cache::put(
+                \App\Jobs\GenerateClipTitleJob::cacheKey($audioBook->id, $clipId),
+                [
+                    'status' => 'queued',
+                    'percent' => 0,
+                    'message' => 'Đã đưa vào hàng đợi tạo tiêu đề...',
+                    'clip_id' => $clipId,
+                    'updated_at' => now()->toIso8601String(),
+                ],
+                now()->addHours(2)
+            );
+            \App\Jobs\GenerateClipTitleJob::dispatch($audioBook->id, $clipId, $request->all());
+
+            return response()->json([
+                'success' => true,
+                'queued' => true,
+                'message' => 'Đã đưa vào hàng đợi. Bạn có thể tắt trình duyệt.',
+            ]);
+        }
+
+        $clips = $this->loadClips($audioBook->id);
+        $clip  = $this->findClip($clips, $clipId);
+        if (!$clip) {
+            return response()->json(['success' => false, 'error' => 'Clip không tồn tại.'], 404);
+        }
+
+        $apiKey = config('services.gemini.api_key') ?: config('services.gemini.tts_api_key');
+        if (!$apiKey) {
+            return response()->json(['success' => false, 'error' => 'Gemini API key chưa được cấu hình.'], 500);
+        }
+
+        $bookTitle   = $audioBook->title ?? 'audiobook';
+        $channelName = optional($audioBook->youtubeChannel)->title ?? '';
+        $category    = $audioBook->category ?? '';
+
+        // Extract audio snippet from clip for Gemini to listen to
+        $clipAbsPath = $clip['clip_path'] ? storage_path('app/public/' . $clip['clip_path']) : null;
+        $audioB64    = null;
+        $tmpAudio    = null;
+
+        if ($clipAbsPath && file_exists($clipAbsPath)) {
+            $tmpAudio = sys_get_temp_dir() . '/clip_audio_' . $clipId . '.mp3';
+            $ffmpeg   = config('services.ffmpeg.ffmpeg_path', 'ffmpeg');
+            $cmd = sprintf(
+                '%s -y -i %s -vn -ar 16000 -ac 1 -b:a 32k %s 2>/dev/null',
+                escapeshellarg($ffmpeg),
+                escapeshellarg($clipAbsPath),
+                escapeshellarg($tmpAudio)
+            );
+            exec($cmd);
+            if (file_exists($tmpAudio) && filesize($tmpAudio) > 0) {
+                $audioB64 = base64_encode(file_get_contents($tmpAudio));
+            }
+        }
+
+        $prompt = "Bạn là chuyên gia viết tiêu đề video viral cho YouTube Shorts và TikTok bằng tiếng Việt.\n\n";
+
+        if ($audioB64) {
+            $prompt .= "Hãy lắng nghe đoạn audio từ sách nói '{$bookTitle}'";
+            if ($category) $prompt .= " (thể loại: {$category})";
+            $prompt .= ".\n\n";
+            $prompt .= "Dựa vào NỘI DUNG THỰC SỰ bạn nghe được trong audio, hãy tạo:\n";
+        } else {
+            $prompt .= "Tôi có một đoạn clip từ sách nói '{$bookTitle}'";
+            if ($category) $prompt .= " (thể loại: {$category})";
+            $prompt .= ".\n\nHãy tạo:\n";
+        }
+
+        $prompt .= "1. **HOOK TITLE**: Một câu tiêu đề ngắn gọn (dưới 80 ký tự), giật tít, tạo tò mò mạnh mẽ dựa trên nội dung clip. Ví dụ phong cách: 'Bí mật mà...', 'Không ai nói cho bạn biết...', 'Lý do tại sao...', 'Điều gì xảy ra khi...'.\n";
+        $prompt .= "2. **CTA**: Một câu kêu gọi nghe đầy đủ, BẮT BUỘC có cụm 'Mời bạn', ví dụ: 'Mời bạn nghe trọn bộ «{$bookTitle}»" . ($channelName ? " trên kênh {$channelName}" : '') . "'\n\n";
+        $prompt .= "Trả về JSON duy nhất:\n{\"hook_title\": \"...\", \"cta\": \"...\"}";
+
+        try {
+            $parts = [];
+            if ($audioB64) {
+                $parts[] = ['inline_data' => ['mime_type' => 'audio/mp3', 'data' => $audioB64]];
+            }
+            $parts[] = ['text' => $prompt];
+
+            $url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={$apiKey}";
+            $response = \Illuminate\Support\Facades\Http::timeout(60)->post($url, [
+                'contents'         => [['parts' => $parts]],
+                'generationConfig' => ['temperature' => 0.85, 'maxOutputTokens' => 300],
+            ]);
+
+            // Clean up temp audio
+            if ($tmpAudio && file_exists($tmpAudio)) {
+                unlink($tmpAudio);
+            }
+
+            $result = $response->json();
+            $text   = $result['candidates'][0]['content']['parts'][0]['text'] ?? '';
+            $text   = preg_replace('/```json\s*/i', '', $text);
+            $text   = preg_replace('/```\s*/', '', $text);
+            $parsed = json_decode(trim($text), true);
+
+            $hookTitle = $parsed['hook_title'] ?? trim($text);
+            $ctaRaw    = $parsed['cta'] ?? "Mời bạn nghe trọn bộ «{$bookTitle}»" . ($channelName ? " trên kênh {$channelName}" : '') . '.';
+            $cta       = $this->ensureCtaHasMoiBan($ctaRaw, $bookTitle, $channelName);
+
+            $this->updateClipInList($clips, $clipId, [
+                'hook_title' => $hookTitle,
+                'cta'        => $cta,
+                'status'     => 'titled',
+            ]);
+            $this->saveClips($audioBook->id, $clips);
+
+            return response()->json(['success' => true, 'hook_title' => $hookTitle, 'cta' => $cta]);
+        } catch (\Exception $e) {
+            if ($tmpAudio && file_exists($tmpAudio)) {
+                unlink($tmpAudio);
+            }
+            return response()->json(['success' => false, 'error' => $e->getMessage()], 500);
+        }
+    }
+
+    public function getGenerateClipTitleProgress(AudioBook $audioBook, string $clipId)
+    {
+        $cacheKey = \App\Jobs\GenerateClipTitleJob::cacheKey($audioBook->id, $clipId);
+        $progress = \Illuminate\Support\Facades\Cache::get($cacheKey);
+        if (!$progress) {
+            $clips = $this->loadClips($audioBook->id);
+            $clip  = $this->findClip($clips, $clipId);
+            if ($clip && !empty($clip['hook_title'])) {
+                return response()->json([
+                    'success' => true,
+                    'status' => 'completed',
+                    'percent' => 100,
+                    'message' => 'Đã tạo tiêu đề!',
+                    'clip_id' => $clipId,
+                    'result' => [ 'hook_title' => $clip['hook_title'], 'cta' => $clip['cta'] ?? null ],
+                ]);
+            }
+            return response()->json([
+                'success' => true,
+                'status' => 'idle',
+                'percent' => 0,
+                'message' => 'Không có tiến trình nào đang chạy.',
+                'clip_id' => $clipId,
+            ]);
+        }
+        return response()->json(array_merge(['success' => true], $progress));
+    }
+
+    public function generateClipImage(Request $request, AudioBook $audioBook, string $clipId)
+    {
+        // If not called from job, dispatch to queue and return immediately
+        if (!$request->has('_from_job')) {
+            \Illuminate\Support\Facades\Cache::put(
+                \App\Jobs\GenerateClipImageJob::cacheKey($audioBook->id, $clipId),
+                [
+                    'status' => 'queued',
+                    'percent' => 0,
+                    'message' => 'Đã đưa vào hàng đợi tạo ảnh...',
+                    'clip_id' => $clipId,
+                    'updated_at' => now()->toIso8601String(),
+                ],
+                now()->addHours(2)
+            );
+
+            \App\Jobs\GenerateClipImageJob::dispatch($audioBook->id, $clipId, $request->all());
+
+            return response()->json([
+                'success' => true,
+                'queued' => true,
+                'message' => 'Đã đưa vào hàng đợi. Bạn có thể tắt trình duyệt.',
+            ]);
+        }
+
+        $clips = $this->loadClips($audioBook->id);
+        $clip  = $this->findClip($clips, $clipId);
+        if (!$clip) {
+            return response()->json(['success' => false, 'error' => 'Clip không tồn tại.'], 404);
+        }
+
+        $bookTitle    = $audioBook->title ?? '';
+        $category     = $audioBook->category ?? '';
+        $author       = $audioBook->author ?? '';
+        $description  = $audioBook->description ?? '';
+        $hookTitle    = $clip['hook_title'] ?? '';
+        $customPrompt = trim($request->input('image_prompt', ''));
+
+        $apiKey = config('services.gemini.api_key') ?: config('services.gemini.tts_api_key');
+
+        // Step 1: Extract audio from clip to understand content
+        $clipAbsPath = !empty($clip['clip_path']) ? storage_path('app/public/' . $clip['clip_path']) : null;
+        $audioB64    = null;
+        $tmpAudio    = null;
+
+        if ($clipAbsPath && file_exists($clipAbsPath)) {
+            $tmpAudio = sys_get_temp_dir() . '/clip_img_audio_' . $clipId . '.mp3';
+            $ffmpeg   = config('services.ffmpeg.ffmpeg_path', 'ffmpeg');
+            $cmd = sprintf(
+                '%s -y -i %s -vn -ar 16000 -ac 1 -b:a 32k %s 2>/dev/null',
+                escapeshellarg($ffmpeg),
+                escapeshellarg($clipAbsPath),
+                escapeshellarg($tmpAudio)
+            );
+            exec($cmd);
+            if (file_exists($tmpAudio) && filesize($tmpAudio) > 0) {
+                $audioB64 = base64_encode(file_get_contents($tmpAudio));
+            }
+            if ($tmpAudio && file_exists($tmpAudio)) unlink($tmpAudio);
+        }
+
+        // Step 2: Ask Gemini to generate an image prompt from audio content
+        if (!$customPrompt && $apiKey && $audioB64) {
+            // Build book context block so Gemini respects the cultural/historical setting
+            $bookContext  = "Tên sách: {$bookTitle}\n";
+            if ($author)      $bookContext .= "Tác giả: {$author}\n";
+            if ($category)    $bookContext .= "Thể loại: {$category}\n";
+            if ($description) $bookContext .= "Giới thiệu sách: " . mb_substr($description, 0, 600) . "\n";
+
+            $parts = [
+                ['inline_data' => ['mime_type' => 'audio/mp3', 'data' => $audioB64]],
+                ['text' =>
+                    "Bạn đang nghe một đoạn sách nói tiếng Việt. Dưới đây là thông tin về cuốn sách:\n\n"
+                    . $bookContext . "\n"
+                    . "QUAN TRỌNG: Hãy đọc kỹ phần giới thiệu sách để hiểu đúng bối cảnh văn hóa, lịch sử, địa lý của câu chuyện. "
+                    . "Ví dụ: nếu sách có bối cảnh Trung Quốc cổ đại thì nhân vật phải là người Châu Á trang phục cổ trang Trung Hoa, "
+                    . "nếu là châu Âu thì trang phục châu Âu, v.v. Tuyệt đối không dùng nhân vật sai bối cảnh.\n\n"
+                    . "Dựa vào nội dung audio vừa nghe, hãy viết một **image generation prompt bằng tiếng Anh** để tạo ảnh minh họa:\n"
+                    . "- Mô tả cụ thể cảnh, nhân vật, trang phục, bối cảnh phù hợp với audio VÀ bối cảnh sách\n"
+                    . "- Phong cách: cinematic, dramatic lighting, high detail, vertical 9:16\n"
+                    . "- Không chữ trong ảnh (no text, no letters)\n"
+                    . "- Dưới 120 từ\n\n"
+                    . ($hookTitle ? "Tiêu đề clip: \"{$hookTitle}\"\n\n" : '')
+                    . "Chỉ trả về prompt, không giải thích thêm."
+                ],
+            ];
+
+            try {
+                $url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={$apiKey}";
+                $resp = \Illuminate\Support\Facades\Http::timeout(60)->post($url, [
+                    'contents'         => [['parts' => $parts]],
+                    'generationConfig' => ['temperature' => 0.8, 'maxOutputTokens' => 200],
+                ]);
+                $generatedPrompt = trim($resp->json()['candidates'][0]['content']['parts'][0]['text'] ?? '');
+                if ($generatedPrompt) {
+                    $customPrompt = $generatedPrompt;
+                }
+            } catch (\Exception $e) {
+                // Fallback below
+            }
+        }
+
+        // Fallback prompt if audio not available or Gemini failed
+        if (!$customPrompt) {
+            $base = $hookTitle ?: "A dramatic scene from the audiobook '{$bookTitle}'";
+            $context = '';
+            if ($description) {
+                // Use first 300 chars of description to hint at cultural context
+                $context = ' Set in the world described as: ' . mb_substr(strip_tags($description), 0, 300);
+            }
+            $customPrompt = $base . $context . '. Cinematic, dramatic lighting, high detail, vertical 9:16, no text, no letters.';
+        }
+
+        // Step 3: Generate image using GeminiImageService
+        $imageService = app(\App\Services\GeminiImageService::class);
+
+        $outputDir  = $this->getClippingDir($audioBook->id) . '/images';
+        if (!is_dir($outputDir)) mkdir($outputDir, 0755, true);
+
+        $filename   = $clipId . '_cover_' . time() . '.png';
+        $outputPath = $outputDir . '/' . $filename;
+        $relPath    = 'books/' . $audioBook->id . '/clipping/images/' . $filename;
+
+        $result = $imageService->generateShortVerticalImage($customPrompt, $outputPath);
+
+        if (!$result['success']) {
+            return response()->json(['success' => false, 'error' => $result['error'] ?? 'Không thể tạo ảnh.'], 500);
+        }
+
+        if (!empty($clip['image_animation_path'])) {
+            $this->deleteShortVideoAssetFile((string)$clip['image_animation_path']);
+        }
+
+        $this->updateClipInList($clips, $clipId, [
+            'image_path'   => $relPath,
+            'image_prompt' => $customPrompt,
+            'image_animation_path' => null,
+            'image_animation_task_id' => null,
+            'image_animation_status' => null,
+            'image_animation_prompt' => null,
+            'image_animation_provider' => null,
+            'image_animation_error' => null,
+            'status'       => 'imaged',
+        ]);
+        $this->saveClips($audioBook->id, $clips);
+
+        return response()->json([
+            'success'      => true,
+            'image_path'   => $relPath,
+            'image_url'    => asset('storage/' . $relPath),
+            'image_prompt' => $customPrompt,
+        ]);
+    }
+
+    public function getGenerateClipImageProgress(AudioBook $audioBook, string $clipId)
+    {
+        $cacheKey = \App\Jobs\GenerateClipImageJob::cacheKey($audioBook->id, $clipId);
+        $progress = \Illuminate\Support\Facades\Cache::get($cacheKey);
+
+        if (!$progress) {
+            // Fallback: if image already present in clips list
+            $clips = $this->loadClips($audioBook->id);
+            $clip  = $this->findClip($clips, $clipId);
+            if ($clip && !empty($clip['image_path'])) {
+                return response()->json([
+                    'success' => true,
+                    'status' => 'completed',
+                    'percent' => 100,
+                    'message' => 'Đã tạo ảnh!',
+                    'clip_id' => $clipId,
+                    'result' => [
+                        'image_url' => asset('storage/' . $clip['image_path']),
+                    ],
+                ]);
+            }
+
+            return response()->json([
+                'success' => true,
+                'status' => 'idle',
+                'percent' => 0,
+                'message' => 'Không có tiến trình nào đang chạy.',
+                'clip_id' => $clipId,
+            ]);
+        }
+
+        return response()->json(array_merge(['success' => true], $progress));
+    }
+
+    public function startClipImageSeedance(Request $request, AudioBook $audioBook, string $clipId)
+    {
+        $validated = $request->validate([
+            'prompt' => 'nullable|string|max:1000',
+            'duration' => 'nullable|integer|min:3|max:10',
+        ]);
+
+        $clips = $this->loadClips($audioBook->id);
+        $clip = $this->findClip($clips, $clipId);
+        if (!$clip) {
+            return response()->json(['success' => false, 'error' => 'Clip không tồn tại.'], 404);
+        }
+
+        $imagePath = ltrim((string)($clip['image_path'] ?? ''), '/');
+        if ($imagePath === '') {
+            return response()->json([
+                'success' => false,
+                'error' => 'Clip chưa có ảnh minh họa. Hãy tạo ảnh trước khi animate.',
+            ], 422);
+        }
+
+        $absImagePath = storage_path('app/public/' . $imagePath);
+        if (!file_exists($absImagePath)) {
+            return response()->json([
+                'success' => false,
+                'error' => 'Ảnh minh họa không tồn tại trên server.',
+            ], 422);
+        }
+
+        $duration = (int)($validated['duration'] ?? 5);
+        if ($duration <= 0) {
+            $duration = 5;
+        }
+
+        $bookTitle = trim((string)($audioBook->title ?? ''));
+        $hookTitle = trim((string)($clip['hook_title'] ?? ''));
+        $defaultPrompt =
+            'Analyze this image and animate only subtle background/environment motion. '
+            . 'Keep character pose and composition stable. '
+            . 'Use gentle parallax, soft dust or fog drift, slight light flicker, and minimal camera breathing. '
+            . 'No action scene, no strong body movement, no camera cuts. '
+            . 'Cinematic vertical background motion for audiobook clip with seamless loop feeling.';
+
+        if ($bookTitle !== '' || $hookTitle !== '') {
+            $defaultPrompt .= ' Context: ' . trim($bookTitle . ' ' . $hookTitle) . '.';
+        }
+
+        $prompt = trim((string)($validated['prompt'] ?? ''));
+        if ($prompt === '') {
+            $prompt = $defaultPrompt;
+        }
+
+        $seedanceService = app(\App\Services\SeedanceAIService::class);
+        $taskResult = $seedanceService->createImageToVideoTask($imagePath, $prompt, [
+            'duration' => $duration,
+            'ratio' => '9:16',
+            'watermark' => false,
+            'generate_audio' => false,
+        ]);
+
+        if (empty($taskResult['success'])) {
+            return response()->json([
+                'success' => false,
+                'error' => (string)($taskResult['error'] ?? 'Không thể khởi tạo tác vụ Seedance.'),
+            ], 500);
+        }
+
+        $this->updateClipInList($clips, $clipId, [
+            'image_animation_task_id' => (string)($taskResult['task_id'] ?? ''),
+            'image_animation_status' => 'processing',
+            'image_animation_prompt' => $prompt,
+            'image_animation_provider' => 'seedance',
+            'image_animation_error' => null,
+        ]);
+        $this->saveClips($audioBook->id, $clips);
+
+        return response()->json([
+            'success' => true,
+            'queued' => true,
+            'task_id' => (string)($taskResult['task_id'] ?? ''),
+            'message' => 'Đã gửi Seedance tạo chuyển động nền cho ảnh. Đang xử lý...',
+        ]);
+    }
+
+    public function getClipImageSeedanceProgress(AudioBook $audioBook, string $clipId)
+    {
+        $clips = $this->loadClips($audioBook->id);
+        $clip = $this->findClip($clips, $clipId);
+        if (!$clip) {
+            return response()->json(['success' => false, 'error' => 'Clip không tồn tại.'], 404);
+        }
+
+        $taskId = trim((string)($clip['image_animation_task_id'] ?? ''));
+        $existingAnimationPath = trim((string)($clip['image_animation_path'] ?? ''));
+
+        if ($taskId === '') {
+            if ($existingAnimationPath !== '') {
+                return response()->json([
+                    'success' => true,
+                    'status' => 'completed',
+                    'percent' => 100,
+                    'message' => 'Đã có video motion background.',
+                    'clip_id' => $clipId,
+                    'result' => [
+                        'animation_path' => $existingAnimationPath,
+                        'animation_url' => asset('storage/' . $existingAnimationPath),
+                    ],
+                ]);
+            }
+
+            return response()->json([
+                'success' => true,
+                'status' => 'idle',
+                'percent' => 0,
+                'message' => 'Không có tiến trình animation nào đang chạy.',
+                'clip_id' => $clipId,
+            ]);
+        }
+
+        $seedanceService = app(\App\Services\SeedanceAIService::class);
+        $statusResult = $seedanceService->getTaskStatus($taskId);
+
+        if (empty($statusResult['success'])) {
+            $error = (string)($statusResult['error'] ?? 'Không thể kiểm tra trạng thái Seedance.');
+            $this->updateClipInList($clips, $clipId, [
+                'image_animation_status' => 'error',
+                'image_animation_error' => $error,
+            ]);
+            $this->saveClips($audioBook->id, $clips);
+
+            return response()->json([
+                'success' => true,
+                'status' => 'error',
+                'percent' => 100,
+                'message' => $error,
+                'clip_id' => $clipId,
+            ]);
+        }
+
+        $status = strtolower((string)($statusResult['status'] ?? 'processing'));
+
+        if ($status === 'completed') {
+            $videoUrl = trim((string)($statusResult['video_url'] ?? ''));
+            if ($videoUrl === '') {
+                $error = 'Seedance hoàn tất nhưng không trả về video URL.';
+                $this->updateClipInList($clips, $clipId, [
+                    'image_animation_status' => 'error',
+                    'image_animation_error' => $error,
+                ]);
+                $this->saveClips($audioBook->id, $clips);
+
+                return response()->json([
+                    'success' => true,
+                    'status' => 'error',
+                    'percent' => 100,
+                    'message' => $error,
+                    'clip_id' => $clipId,
+                ]);
+            }
+
+            $relPath = 'books/' . $audioBook->id . '/clipping/animations/' . $clipId . '_seedance_' . time() . '.mp4';
+
+            try {
+                $this->downloadVideoToPublicStorage($videoUrl, $relPath);
+            } catch (\Throwable $e) {
+                $error = 'Không thể tải/lưu video Seedance: ' . $e->getMessage();
+                $this->updateClipInList($clips, $clipId, [
+                    'image_animation_status' => 'error',
+                    'image_animation_error' => $error,
+                ]);
+                $this->saveClips($audioBook->id, $clips);
+
+                return response()->json([
+                    'success' => true,
+                    'status' => 'error',
+                    'percent' => 100,
+                    'message' => $error,
+                    'clip_id' => $clipId,
+                ]);
+            }
+
+            if (!empty($clip['image_animation_path']) && $clip['image_animation_path'] !== $relPath) {
+                $this->deleteShortVideoAssetFile((string)$clip['image_animation_path']);
+            }
+
+            $this->updateClipInList($clips, $clipId, [
+                'image_animation_path' => $relPath,
+                'image_animation_status' => 'completed',
+                'image_animation_task_id' => null,
+                'image_animation_error' => null,
+                'image_animation_provider' => 'seedance',
+            ]);
+            $this->saveClips($audioBook->id, $clips);
+
+            return response()->json([
+                'success' => true,
+                'status' => 'completed',
+                'percent' => 100,
+                'message' => 'Đã tạo video chuyển động nền bằng Seedance.',
+                'clip_id' => $clipId,
+                'result' => [
+                    'animation_path' => $relPath,
+                    'animation_url' => asset('storage/' . $relPath),
+                ],
+            ]);
+        }
+
+        if ($status === 'failed') {
+            $error = (string)($statusResult['error'] ?? 'Seedance xử lý thất bại.');
+            $this->updateClipInList($clips, $clipId, [
+                'image_animation_status' => 'error',
+                'image_animation_error' => $error,
+            ]);
+            $this->saveClips($audioBook->id, $clips);
+
+            return response()->json([
+                'success' => true,
+                'status' => 'error',
+                'percent' => 100,
+                'message' => $error,
+                'clip_id' => $clipId,
+            ]);
+        }
+
+        $this->updateClipInList($clips, $clipId, [
+            'image_animation_status' => 'processing',
+            'image_animation_error' => null,
+        ]);
+        $this->saveClips($audioBook->id, $clips);
+
+        return response()->json([
+            'success' => true,
+            'status' => 'processing',
+            'percent' => 55,
+            'message' => 'Seedance đang tạo chuyển động nền...',
+            'clip_id' => $clipId,
+        ]);
+    }
+
+    public function composeClip(Request $request, AudioBook $audioBook, string $clipId)
+    {
+        $clips = $this->loadClips($audioBook->id);
+        $clip  = $this->findClip($clips, $clipId);
+        if (!$clip) {
+            return response()->json(['success' => false, 'error' => 'Clip không tồn tại.'], 404);
+        }
+
+        $validated = $request->validate([
+            'background_audio_mode' => 'nullable|string|in:auto,none,custom',
+            'background_audio_path' => 'nullable|string|max:500',
+            'background_audio_volume' => 'nullable|numeric|min:0|max:0.6',
+            'cta_animation_mode' => 'nullable|string|in:auto,custom',
+            'cta_animation_path' => 'nullable|string|max:500',
+            'subtitle_style' => 'nullable|string|in:default,highlight_green,highlight_yellow,highlight_red,boxed,neon_blue',
+            'subtitle_position' => 'nullable|string|in:lower_third,middle,bottom',
+        ]);
+
+        $allowedSubtitleStyles = ['default', 'highlight_green', 'highlight_yellow', 'highlight_red', 'boxed', 'neon_blue'];
+        $allowedSubtitlePositions = ['lower_third', 'middle', 'bottom'];
+
+        $subtitleStyle = (string)($validated['subtitle_style'] ?? ($clip['subtitle_style'] ?? 'highlight_green'));
+        if (!in_array($subtitleStyle, $allowedSubtitleStyles, true)) {
+            $subtitleStyle = 'highlight_green';
+        }
+
+        $subtitlePosition = (string)($validated['subtitle_position'] ?? ($clip['subtitle_position'] ?? 'lower_third'));
+        if (!in_array($subtitlePosition, $allowedSubtitlePositions, true)) {
+            $subtitlePosition = 'lower_third';
+        }
+
+        $bgAudioMode = strtolower((string)($validated['background_audio_mode'] ?? 'auto'));
+        $bgAudioPathInput = isset($validated['background_audio_path'])
+            ? ltrim((string)$validated['background_audio_path'], '/')
+            : null;
+        $bgAudioVolumeDb = -30.0;
+        $bgAudioVolume = pow(10, $bgAudioVolumeDb / 20); // ≈ 0.0316
+
+        $ctaAnimationMode = strtolower((string)($validated['cta_animation_mode'] ?? ($clip['cta_animation_mode'] ?? 'auto')));
+        $ctaAnimationPathInput = isset($validated['cta_animation_path'])
+            ? ltrim((string)$validated['cta_animation_path'], '/')
+            : ltrim((string)($clip['cta_animation_selected_path'] ?? ''), '/');
+
+        if ($bgAudioMode === 'custom' && !$bgAudioPathInput) {
+            return response()->json([
+                'success' => false,
+                'error' => 'Bạn chưa chọn file âm thanh nền.',
+            ], 422);
+        }
+
+        if ($ctaAnimationMode === 'custom' && $ctaAnimationPathInput === '') {
+            return response()->json([
+                'success' => false,
+                'error' => 'Bạn chưa chọn animation CTA.',
+            ], 422);
+        }
+
+        $clipPath = !empty($clip['clip_path'])
+            ? storage_path('app/public/' . $clip['clip_path'])
+            : null;
+
+        if (!$clipPath || !file_exists($clipPath)) {
+            return response()->json(['success' => false, 'error' => 'File clip không tồn tại.'], 422);
+        }
+
+        // If NOT called from background job, dispatch job and return immediately
+        if (!$request->has('_from_job')) {
+            $jobPayload = array_merge($validated, ['_from_job' => true]);
+
+            // Mark clip status as composing
+            $this->updateClipInList($clips, $clipId, [
+                'status' => 'composing',
+            ]);
+            $this->saveClips($audioBook->id, $clips);
+
+            // Set initial progress
+            \Illuminate\Support\Facades\Cache::put(
+                \App\Jobs\ComposeClipJob::cacheKey($audioBook->id, $clipId),
+                [
+                    'status' => 'queued',
+                    'percent' => 0,
+                    'message' => 'Đang chờ xử lý trong hàng đợi...',
+                    'clip_id' => $clipId,
+                    'updated_at' => now()->toIso8601String(),
+                ],
+                now()->addHours(4)
+            );
+
+            \App\Jobs\ComposeClipJob::dispatch($audioBook->id, $clipId, $jobPayload);
+
+            return response()->json([
+                'success' => true,
+                'queued' => true,
+                'message' => 'Đã đưa vào hàng đợi xử lý nền. Bạn có thể tắt trình duyệt.',
+                'clip_id' => $clipId,
+            ]);
+        }
+
+        // === Below runs inside background job ===
+
+        $ffmpegPath = config('services.ffmpeg.path', env('FFMPEG_PATH', 'ffmpeg'));
+        $hookTitle = trim((string)($clip['hook_title'] ?? $audioBook->title ?? 'Trích đoạn audiobook'));
+        if ($hookTitle === '') {
+            $hookTitle = 'Trích đoạn audiobook';
+        }
+
+        $clipDuration = (float)($clip['duration'] ?? 0.0);
+        if ($clipDuration <= 0) {
+            $clipDuration = $this->getVideoDuration($clipPath);
+        }
+        if ($clipDuration <= 0) {
+            return response()->json(['success' => false, 'error' => 'Không xác định được thời lượng clip để ghép.'], 422);
+        }
+
+        $clipNumber = $this->getClipNumberFromId($clipId);
+        $ctaNarration = $this->buildClipCtaNarration($audioBook, $clip, $clipNumber);
+
+        $imagePath = !empty($clip['image_path'])
+            ? storage_path('app/public/' . $clip['image_path'])
+            : null;
+        if ($imagePath && !file_exists($imagePath)) {
+            $imagePath = null;
+        }
+
+        $animatedBgPath = !empty($clip['image_animation_path'])
+            ? storage_path('app/public/' . ltrim((string)$clip['image_animation_path'], '/'))
+            : null;
+        if ($animatedBgPath && !file_exists($animatedBgPath)) {
+            $animatedBgPath = null;
+        }
+        if ($animatedBgPath) {
+            $imagePath = null;
+        }
+
+        $outputDir = $this->getClippingDir($audioBook->id) . '/composed';
+        if (!is_dir($outputDir)) {
+            mkdir($outputDir, 0755, true);
+        }
+
+        $filename = $clipId . '_final_' . time() . '.mp4';
+        $outputPath = $outputDir . '/' . $filename;
+        $relPath = 'books/' . $audioBook->id . '/clipping/composed/' . $filename;
+
+        $tempDir = storage_path('app/temp/clipping_compose_' . $audioBook->id . '_' . $clipId . '_' . time());
+        if (!is_dir($tempDir)) {
+            mkdir($tempDir, 0755, true);
+        }
+
+        try {
+            $mainSegmentPath = $tempDir . '/main_segment.mp4';
+            $ctaSegmentPath = $tempDir . '/cta_segment.mp4';
+            $concatListPath = $tempDir . '/concat_list.txt';
+            $mergedPath = $tempDir . '/merged.mp4';
+            $mixedPath = $tempDir . '/mixed.mp4';
+
+            $ctaAudio = $this->createClipCtaAudio($audioBook, $clipId, $ctaNarration);
+            $ctaAudioPath = (string)$ctaAudio['absolute_path'];
+            $ctaAudioRelPath = (string)$ctaAudio['relative_path'];
+            $ctaDuration = max(2.0, (float)($ctaAudio['duration'] ?? 0.0));
+
+            $animationModeUsed = 'auto';
+            $animationSelectedPath = null;
+            $animation = null;
+
+            if ($ctaAnimationMode === 'custom' && $ctaAnimationPathInput !== '') {
+                $resolvedAnimation = $this->resolveClippingAnimationByPath($audioBook, $ctaAnimationPathInput);
+                if (!$resolvedAnimation) {
+                    return response()->json([
+                        'success' => false,
+                        'error' => 'Animation CTA đã chọn không hợp lệ hoặc không đúng định dạng dọc.',
+                    ], 422);
+                }
+
+                $animation = $resolvedAnimation;
+                $animationModeUsed = 'custom';
+                $animationSelectedPath = (string)($resolvedAnimation['relative_path'] ?? $ctaAnimationPathInput);
+            }
+
+            if (!$animation) {
+                $animation = $this->findBestClippingAnimation($audioBook->id);
+                $animationModeUsed = 'auto';
+                $animationSelectedPath = null;
+            }
+
+            $animationPath = $animation['absolute_path'] ?? null;
+            $animationRelPath = $animation['relative_path'] ?? null;
+
+            $this->composeClippingMainSegment(
+                $ffmpegPath,
+                $clipPath,
+                $imagePath,
+                $animatedBgPath,
+                $clipDuration,
+                $mainSegmentPath
+            );
+
+            $this->composeClippingCtaSegment(
+                $ffmpegPath,
+                $animationPath,
+                $imagePath,
+                $ctaAudioPath,
+                $ctaDuration,
+                $ctaSegmentPath
+            );
+
+            // Use concat filter instead of concat demuxer to handle
+            // stream parameter mismatches (sample rate, channels, timebase)
+            $concatFilter = '[0:v][0:a][1:v][1:a]concat=n=2:v=1:a=1[vout][aout]';
+
+            $concatCmd = sprintf(
+                '%s -y -i %s -i %s -filter_complex %s -map "[vout]" -map "[aout]" -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 192k -ar 44100 -ac 2 -pix_fmt yuv420p %s 2>&1',
+                escapeshellarg($ffmpegPath),
+                escapeshellarg($mainSegmentPath),
+                escapeshellarg($ctaSegmentPath),
+                escapeshellarg($concatFilter),
+                escapeshellarg($mergedPath)
+            );
+            $this->runFfmpegCommand($concatCmd, 'Không thể nối đoạn chính và đoạn CTA.');
+
+            $finalInputPath = $mergedPath;
+            $bgAudio = null;
+            $bgAudioRelPath = null;
+            $bgAudioModeUsed = $bgAudioMode;
+
+            if ($bgAudioMode === 'none') {
+                $bgAudio = null;
+            } elseif ($bgAudioMode === 'custom') {
+                $bgAudio = $this->resolveClippingBackgroundAudioByPath($audioBook, $bgAudioPathInput);
+                if (!$bgAudio) {
+                    return response()->json([
+                        'success' => false,
+                        'error' => 'File âm thanh nền đã chọn không hợp lệ hoặc không tồn tại.',
+                    ], 422);
+                }
+            } else {
+                $bgAudioModeUsed = 'auto';
+                $bgAudio = $this->resolveClippingBackgroundAudio($audioBook);
+            }
+
+            if ($bgAudio && !empty($bgAudio['relative_path'])) {
+                $bgAudioRelPath = (string)$bgAudio['relative_path'];
+            }
+
+            if (
+                $bgAudio
+                && !empty($bgAudio['absolute_path'])
+                && file_exists($bgAudio['absolute_path'])
+                && $bgAudioVolume > 0.0001
+            ) {
+                $mixFilter = sprintf(
+                    '[0:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[voice];[1:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,volume=%.1fdB[bg];[voice][bg]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[aout]',
+                    $bgAudioVolumeDb
+                );
+
+                $mixCmd = sprintf(
+                    '%s -y -i %s -stream_loop -1 -i %s -filter_complex %s -map 0:v:0 -map "[aout]" -c:v copy -c:a aac -b:a 192k -ar 44100 -ac 2 %s 2>&1',
+                    escapeshellarg($ffmpegPath),
+                    escapeshellarg($mergedPath),
+                    escapeshellarg($bgAudio['absolute_path']),
+                    escapeshellarg($mixFilter),
+                    escapeshellarg($mixedPath)
+                );
+                $this->runFfmpegCommand($mixCmd, 'Không thể trộn âm thanh nền cho clipping.');
+                $finalInputPath = $mixedPath;
+            }
+
+            // Transcribe clip audio using Whisper for narration subtitles
+            $transcriptionChunks = [];
+            try {
+                $rawSegments = $this->transcribeClipAudio($clipPath, $clipDuration);
+                $transcriptionChunks = $this->groupTranscriptionForSubtitles($rawSegments, 36);
+                Log::info('Clipping transcription result', [
+                    'clip_id' => $clipId,
+                    'raw_segments' => count($rawSegments),
+                    'subtitle_chunks' => count($transcriptionChunks),
+                ]);
+            } catch (\Throwable $e) {
+                Log::warning('Clipping transcription skipped', [
+                    'clip_id' => $clipId,
+                    'error' => $e->getMessage(),
+                ]);
+            }
+
+            $subtitleY = 1450; // centered X=540, Y in 1400-1550 range
+            if ($subtitlePosition === 'middle') {
+                $subtitleY = 1400;
+            } elseif ($subtitlePosition === 'bottom') {
+                $subtitleY = 1550;
+            }
+
+            $assSubtitle = $this->createClippingAssSubtitleFile(
+                $audioBook->id,
+                $clipId,
+                $hookTitle,
+                $ctaNarration,
+                $clipDuration,
+                $ctaDuration,
+                $transcriptionChunks,
+                $subtitleStyle,
+                $subtitleY
+            );
+            $assSubtitlePath = (string)$assSubtitle['absolute_path'];
+            $assSubtitleRelPath = (string)$assSubtitle['relative_path'];
+
+            $assFilterPath = str_replace(['\\', ':', "'"], ['\\\\', '\\:', "\\'"], $assSubtitlePath);
+            // Use simple double-quote shell escaping for -vf argument.
+            // escapeshellarg with inner quotes causes FFmpeg to misinterpret the path.
+            $subtitleCmd = sprintf(
+                '%s -y -i %s -vf "ass=%s" -map 0:v:0 -map 0:a:0 -c:v libx264 -preset fast -crf 23 -c:a copy -movflags +faststart %s 2>&1',
+                escapeshellarg($ffmpegPath),
+                escapeshellarg($finalInputPath),
+                $assFilterPath,
+                escapeshellarg($outputPath)
+            );
+
+            Log::info('Clipping ASS burn command', ['clip_id' => $clipId, 'cmd' => $subtitleCmd]);
+
+            $subtitleOutput = [];
+            exec($subtitleCmd, $subtitleOutput, $subtitleCode);
+            $subtitleEffect = 'ass';
+
+            if ($subtitleCode !== 0 || !file_exists($outputPath)) {
+                Log::warning('Clipping ASS burn failed, fallback to direct output', [
+                    'clip_id' => $clipId,
+                    'code' => $subtitleCode,
+                    'output' => implode("\n", array_slice($subtitleOutput, -10)),
+                    'ass_path' => $assSubtitlePath,
+                ]);
+
+                $fallbackCmd = sprintf(
+                    '%s -y -i %s -c:v copy -c:a copy %s 2>&1',
+                    escapeshellarg($ffmpegPath),
+                    escapeshellarg($finalInputPath),
+                    escapeshellarg($outputPath)
+                );
+                $this->runFfmpegCommand($fallbackCmd, 'Không thể hoàn thiện clipping (fallback).');
+                $subtitleEffect = 'fallback_copy';
+            }
+
+            if (!empty($clip['composed_path']) && $clip['composed_path'] !== $relPath) {
+                $this->deleteShortVideoAssetFile($clip['composed_path']);
+            }
+            if (!empty($clip['cta_audio_path']) && $clip['cta_audio_path'] !== $ctaAudioRelPath) {
+                $this->deleteShortVideoAssetFile($clip['cta_audio_path']);
+            }
+            if (!empty($clip['ass_subtitle_path']) && $clip['ass_subtitle_path'] !== $assSubtitleRelPath) {
+                $this->deleteShortVideoAssetFile($clip['ass_subtitle_path']);
+            }
+
+            $this->updateClipInList($clips, $clipId, [
+                'cta' => $ctaNarration,
+                'cta_narration' => $ctaNarration,
+                'cta_audio_path' => $ctaAudioRelPath,
+                'cta_animation_path' => $animationRelPath,
+                'cta_animation_mode' => $animationModeUsed,
+                'cta_animation_selected_path' => $animationSelectedPath,
+                'ass_subtitle_path' => $assSubtitleRelPath,
+                'bg_audio_path' => $bgAudioRelPath,
+                'bg_audio_mode' => $bgAudioModeUsed,
+                'bg_audio_volume' => $bgAudioRelPath ? round($bgAudioVolume, 3) : null,
+                'subtitle_style' => $subtitleStyle,
+                'subtitle_position' => $subtitlePosition,
+                'composed_path' => $relPath,
+                'status' => 'composed',
+            ]);
+            $this->saveClips($audioBook->id, $clips);
+
+            return response()->json([
+                'success' => true,
+                'composed_path' => $relPath,
+                'composed_url' => asset('storage/' . $relPath),
+                'cta_audio_path' => $ctaAudioRelPath,
+                'cta_animation_path' => $animationRelPath,
+                'cta_animation_mode' => $animationModeUsed,
+                'cta_animation_selected_path' => $animationSelectedPath,
+                'ass_subtitle_path' => $assSubtitleRelPath,
+                'bg_audio_path' => $bgAudioRelPath,
+                'bg_audio_mode' => $bgAudioModeUsed,
+                'bg_audio_volume' => $bgAudioRelPath ? round($bgAudioVolume, 3) : null,
+                'subtitle_style' => $subtitleStyle,
+                'subtitle_position' => $subtitlePosition,
+                'subtitle_effect' => $subtitleEffect,
+            ]);
+        } catch (\Throwable $e) {
+            Log::error('Clipping compose pipeline failed', [
+                'clip_id' => $clipId,
+                'error' => $e->getMessage(),
+            ]);
+
+            return response()->json([
+                'success' => false,
+                'error' => $e->getMessage(),
+            ], 500);
+        } finally {
+            if (is_dir($tempDir)) {
+                $files = glob($tempDir . '/*') ?: [];
+                foreach ($files as $file) {
+                    @unlink($file);
+                }
+                @rmdir($tempDir);
+            }
+        }
+    }
+
+    public function getComposeClipProgress(AudioBook $audioBook, string $clipId)
+    {
+        $cacheKey = \App\Jobs\ComposeClipJob::cacheKey($audioBook->id, $clipId);
+        $progress = \Illuminate\Support\Facades\Cache::get($cacheKey);
+
+        if (!$progress) {
+            // No job in progress - check clip status from clips list
+            $clips = $this->loadClips($audioBook->id);
+            $clip = $this->findClip($clips, $clipId);
+            if ($clip && ($clip['status'] ?? '') === 'composed') {
+                return response()->json([
+                    'success' => true,
+                    'status' => 'completed',
+                    'percent' => 100,
+                    'message' => 'Đã ghép video hoàn tất.',
+                    'clip_id' => $clipId,
+                    'result' => [
+                        'composed_url' => !empty($clip['composed_path']) ? asset('storage/' . $clip['composed_path']) : null,
+                    ],
+                ]);
+            }
+
+            return response()->json([
+                'success' => true,
+                'status' => 'idle',
+                'percent' => 0,
+                'message' => 'Không có tiến trình nào đang chạy.',
+                'clip_id' => $clipId,
+            ]);
+        }
+
+        return response()->json(array_merge(['success' => true], $progress));
+    }
+
+    public function deleteClip(Request $request, AudioBook $audioBook, string $clipId)
+    {
+        $clips = $this->loadClips($audioBook->id);
+        $clip  = $this->findClip($clips, $clipId);
+        if (!$clip) {
+            return response()->json(['success' => false, 'error' => 'Clip không tồn tại.'], 404);
+        }
+
+        foreach (['clip_path', 'image_path', 'image_animation_path', 'cta_audio_path', 'ass_subtitle_path', 'composed_path'] as $field) {
+            if (!empty($clip[$field])) {
+                $abs = storage_path('app/public/' . $clip[$field]);
+                if (file_exists($abs)) @unlink($abs);
+            }
+        }
+
+        $clips = array_values(array_filter($clips, fn($c) => ($c['id'] ?? '') !== $clipId));
+        $this->saveClips($audioBook->id, $clips);
+
+        return response()->json(['success' => true]);
     }
 }

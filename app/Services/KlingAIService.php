@@ -11,15 +11,17 @@ use Illuminate\Support\Facades\Storage;
 class KlingAIService
 {
     private string $apiKey;
-    private string $baseUrl = 'https://api.aimlapi.com/v2';
+    private string $baseUrl;
     private Client $client;
 
     public function __construct()
     {
-        $this->apiKey = env('AIMLAPI_KEY', '');
+        $this->apiKey = (string) config('services.aiml.api_key', '');
+        $configuredBaseUrl = rtrim((string) config('services.aiml.base_url', 'https://api.aimlapi.com'), '/');
+        $this->baseUrl = str_ends_with($configuredBaseUrl, '/v2') ? $configuredBaseUrl : ($configuredBaseUrl . '/v2');
 
         $this->client = new Client([
-            'base_uri' => $this->baseUrl,
+            'base_uri' => $this->baseUrl . '/',
             'timeout' => 120,
             'verify' => false
         ]);

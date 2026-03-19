@@ -30,6 +30,7 @@ class AudioBook extends Model
         'tts_voice_gender',
         'tts_voice_name',
         'tts_style_instruction',
+        'art_style_instruction',
         'tts_speed',
         'pause_between_chunks',
         'intro_music',
@@ -51,7 +52,10 @@ class AudioBook extends Model
         'youtube_video_description',
         'youtube_video_tags',
         'full_book_video',
-        'full_book_video_duration'
+        'full_book_video_duration',
+        'review_script',
+        'review_video',
+        'review_video_duration'
     ];
 
     protected $casts = [

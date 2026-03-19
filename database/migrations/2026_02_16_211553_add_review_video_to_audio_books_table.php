@@ -6,24 +6,19 @@ use Illuminate\Support\Facades\Schema;
 
 return new class extends Migration
 {
-    /**
-     * Run the migrations.
-     */
     public function up(): void
     {
         Schema::table('audio_books', function (Blueprint $table) {
-            $table->decimal('tts_speed', 3, 2)->default(1.00)->after('tts_style_instruction');
-            $table->decimal('pause_between_chunks', 3, 1)->default(0)->after('tts_speed');
+            $table->longText('review_script')->nullable()->after('description_scene_video_duration');
+            $table->string('review_video')->nullable()->after('review_script');
+            $table->float('review_video_duration')->nullable()->after('review_video');
         });
     }
 
-    /**
-     * Reverse the migrations.
-     */
     public function down(): void
     {
         Schema::table('audio_books', function (Blueprint $table) {
-            $table->dropColumn(['tts_speed', 'pause_between_chunks']);
+            $table->dropColumn(['review_script', 'review_video', 'review_video_duration']);
         });
     }
 };

@@ -52,6 +52,9 @@ class GenerateThumbnailJob implements ShouldQueue
         $customAuthor = $this->options['custom_author'] ?? null;
         $textStyling = $this->options['text_styling'] ?? [];
         $overridePrompt = $this->options['override_prompt'] ?? null;
+        $imageProvider = strtolower((string) ($this->options['image_provider'] ?? 'gemini'));
+        $imageProvider = $imageProvider === 'flux' ? 'flux' : 'gemini';
+        $providerLabel = $imageProvider === 'flux' ? 'Flux' : 'Gemini';
 
         try {
             $imageService = app(GeminiImageService::class);
@@ -66,6 +69,7 @@ class GenerateThumbnailJob implements ShouldQueue
                 'channel_name' => '',
                 'cover_image' => $audioBook->cover_image,
                 'text_styling' => $textStyling,
+                'prefer_portrait' => (bool)($this->options['prefer_portrait'] ?? true),
             ];
 
             // Use cover image
@@ -97,15 +101,15 @@ class GenerateThumbnailJob implements ShouldQueue
             if ($withText) {
                 $this->updateProgress([
                     'status' => 'processing',
-                    'message' => 'AI đang tạo thumbnail có chữ với Gemini...',
+                    'message' => "AI đang tạo thumbnail có chữ với {$providerLabel}...",
                 ]);
-                $result = $imageService->generateThumbnailWithText($bookInfo, $style, $chapterNumber, $customPrompt, $overridePrompt);
+                $result = $imageService->generateThumbnailWithText($bookInfo, $style, $chapterNumber, $customPrompt, $overridePrompt, $imageProvider);
             } else {
                 $this->updateProgress([
                     'status' => 'processing',
-                    'message' => 'AI đang tạo hình nền với Gemini...',
+                    'message' => "AI đang tạo hình nền với {$providerLabel}...",
                 ]);
-                $result = $imageService->generateThumbnail($bookInfo, $style, $chapterNumber, $customPrompt, $overridePrompt);
+                $result = $imageService->generateThumbnail($bookInfo, $style, $chapterNumber, $customPrompt, $overridePrompt, $imageProvider);
             }
 
             $this->handleResult($result, $audioBook->id);

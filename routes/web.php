@@ -129,7 +129,10 @@ Route::middleware('auth')->prefix('audiobooks')->name('audiobooks.')->group(func
     Route::put('{audioBook}', [AudioBookController::class, 'update'])->name('update');
     Route::delete('{audioBook}', [AudioBookController::class, 'destroy'])->name('destroy');
     Route::post('{audioBook}/update-tts-settings', [AudioBookController::class, 'updateTtsSettings'])->name('update.tts.settings');
+    Route::post('{audioBook}/find-replace', [AudioBookController::class, 'findReplace'])->name('find.replace');
+    Route::post('{audioBook}/fix-leading-initial-space', [AudioBookController::class, 'fixLeadingInitialSpace'])->name('fix.leading.initial.space');
     Route::post('{audioBook}/upload-music', [AudioBookController::class, 'uploadMusic'])->name('upload.music');
+    Route::post('{audioBook}/select-music-file', [AudioBookController::class, 'selectMusicFile'])->name('select.music.file');
     Route::post('{audioBook}/delete-music', [AudioBookController::class, 'deleteMusic'])->name('delete.music');
     Route::post('{audioBook}/update-music-settings', [AudioBookController::class, 'updateMusicSettings'])->name('update.music.settings');
     Route::post('{audioBook}/update-wave-settings', [AudioBookController::class, 'updateWaveSettings'])->name('update.wave.settings');
@@ -137,11 +140,26 @@ Route::middleware('auth')->prefix('audiobooks')->name('audiobooks.')->group(func
     Route::post('{audioBook}/update-description', [AudioBookController::class, 'updateDescription'])->name('update.description');
     Route::post('{audioBook}/rewrite-description', [AudioBookController::class, 'rewriteDescription'])->name('rewrite.description');
     Route::post('{audioBook}/generate-description-audio', [AudioBookController::class, 'generateDescriptionAudio'])->name('generate.description.audio');
+    Route::get('{audioBook}/description-audio-progress', [AudioBookController::class, 'getDescriptionAudioProgress'])->name('description.audio.progress');
     Route::post('{audioBook}/generate-description-video', [AudioBookController::class, 'generateDescriptionVideo'])->name('generate.description.video');
     Route::post('{audioBook}/generate-description-video-async', [AudioBookController::class, 'startDescriptionVideoJob'])->name('generate.description.video.async');
     Route::get('{audioBook}/description-video-progress', [AudioBookController::class, 'getDescriptionVideoProgress'])->name('description.video.progress');
     Route::delete('{audioBook}/delete-description-audio', [AudioBookController::class, 'deleteDescriptionAudio'])->name('delete.description.audio');
     Route::delete('{audioBook}/delete-description-video', [AudioBookController::class, 'deleteDescriptionVideo'])->name('delete.description.video');
+
+    // Book Review Video (~15 min)
+    Route::post('{audioBook}/review-video/start', [AudioBookController::class, 'startBookReviewVideoJob'])->name('review.video.start');
+    Route::get('{audioBook}/review-video/progress', [AudioBookController::class, 'getBookReviewVideoProgress'])->name('review.video.progress');
+    Route::delete('{audioBook}/review-video', [AudioBookController::class, 'deleteBookReviewVideo'])->name('review.video.delete');
+    Route::get('{audioBook}/review-video/chunks', [AudioBookController::class, 'getReviewChunks'])->name('review.video.chunks');
+    Route::put('{audioBook}/review-video/chunks/{index}/prompt', [AudioBookController::class, 'updateReviewChunkPrompt'])->name('review.video.chunks.prompt');
+    Route::post('{audioBook}/review-video/chunks/{index}/regenerate-image', [AudioBookController::class, 'regenerateReviewChunkImage'])->name('review.video.chunks.regenerate');
+    Route::post('{audioBook}/review-video/chunks/{index}/translate-prompt', [AudioBookController::class, 'translateReviewChunkPrompt'])->name('review.video.chunks.translate');
+    Route::post('{audioBook}/review-video/chunks/{index}/split', [AudioBookController::class, 'splitReviewChunk'])->name('review.video.chunks.split');
+    Route::post('{audioBook}/review-video/generate-assets', [AudioBookController::class, 'startReviewAssetsJob'])->name('review.video.generate.assets');
+    Route::get('{audioBook}/review-video/assets-progress', [AudioBookController::class, 'getReviewAssetsProgress'])->name('review.video.assets.progress');
+    Route::post('{audioBook}/review-video/translate-all', [AudioBookController::class, 'translateAllReviewPrompts'])->name('review.video.translate.all');
+    Route::post('{audioBook}/review-video/open-studio', [AudioBookController::class, 'openReviewScriptStudio'])->name('review.video.open.studio');
 
     // Full Book Video (merge all chapters + description into one video)
     Route::post('{audioBook}/generate-fullbook-video-async', [AudioBookController::class, 'startFullBookVideoJob'])->name('generate.fullbook.video.async');
@@ -155,8 +173,46 @@ Route::middleware('auth')->prefix('audiobooks')->name('audiobooks.')->group(func
     Route::get('{audioBook}/video-segments/progress', [AudioBookController::class, 'getBatchVideoProgress'])->name('video.segments.progress');
     Route::delete('{audioBook}/video-segments/{segment}', [AudioBookController::class, 'deleteVideoSegment'])->name('video.segments.delete');
 
+    // Short Video (AI shorts up to 60s, 9:16)
+    Route::get('{audioBook}/short-videos', [AudioBookController::class, 'getShortVideos'])->name('short.videos.index');
+    Route::post('{audioBook}/short-videos/generate-plans', [AudioBookController::class, 'generateShortVideoPlans'])->name('short.videos.generate.plans');
+    Route::post('{audioBook}/short-videos/generate-assets', [AudioBookController::class, 'generateShortVideoAssets'])->name('short.videos.generate.assets');
+    Route::post('{audioBook}/short-videos/generate-tts', [AudioBookController::class, 'generateShortVideoTts'])->name('short.videos.generate.tts');
+    Route::post('{audioBook}/short-videos/generate-images', [AudioBookController::class, 'generateShortVideoImages'])->name('short.videos.generate.images');
+    Route::post('{audioBook}/short-videos/download-resources', [AudioBookController::class, 'downloadSelectedShortResources'])->name('short.videos.download.resources');
+    Route::get('{audioBook}/short-videos/{index}/workspace', [AudioBookController::class, 'getShortVideoWorkspace'])->name('short.videos.workspace.show');
+    Route::post('{audioBook}/short-videos/{index}/workspace/build', [AudioBookController::class, 'buildShortVideoWorkspace'])->name('short.videos.workspace.build');
+    Route::put('{audioBook}/short-videos/{index}/workspace/shots/{shotIndex}', [AudioBookController::class, 'updateShortVideoShot'])->name('short.videos.workspace.shots.update');
+    Route::post('{audioBook}/short-videos/{index}/workspace/generate-shot-tts', [AudioBookController::class, 'generateShortVideoShotTts'])->name('short.videos.workspace.generate.shot.tts');
+    Route::post('{audioBook}/short-videos/{index}/workspace/generate-shot-images', [AudioBookController::class, 'generateShortVideoShotImages'])->name('short.videos.workspace.generate.shot.images');
+    Route::post('{audioBook}/short-videos/{index}/workspace/kling/start', [AudioBookController::class, 'startShortVideoShotKling'])->name('short.videos.workspace.kling.start');
+    Route::post('{audioBook}/short-videos/{index}/workspace/kling/poll', [AudioBookController::class, 'pollShortVideoShotKling'])->name('short.videos.workspace.kling.poll');
+    Route::post('{audioBook}/short-videos/{index}/workspace/compose-auto', [AudioBookController::class, 'composeShortVideoFromShots'])->name('short.videos.workspace.compose.auto');
+    Route::post('{audioBook}/short-videos/{index}/workspace/download-package', [AudioBookController::class, 'downloadShortVideoWorkspacePackage'])->name('short.videos.workspace.download.package');
+    Route::post('{audioBook}/short-videos/{index}/generate-image-prompt', [AudioBookController::class, 'generateShortVideoImagePrompt'])->name('short.videos.generate.image.prompt');
+    Route::put('{audioBook}/short-videos/{index}', [AudioBookController::class, 'updateShortVideo'])->name('short.videos.update');
+    Route::delete('{audioBook}/short-videos/{index}', [AudioBookController::class, 'deleteShortVideo'])->name('short.videos.delete');
+
+    // Clipping Routes
+    Route::get('{audioBook}/clipping/videos', [AudioBookController::class, 'listClippingVideos'])->name('clipping.videos');
+    Route::get('{audioBook}/clipping/background-audios', [AudioBookController::class, 'listClippingBackgroundAudios'])->name('clipping.background.audios');
+    Route::get('{audioBook}/clipping/cta-animations', [AudioBookController::class, 'listClippingCtaAnimations'])->name('clipping.cta.animations');
+    Route::get('{audioBook}/clipping/clips', [AudioBookController::class, 'listClips'])->name('clipping.clips');
+    Route::post('{audioBook}/clipping/generate', [AudioBookController::class, 'generateClips'])->name('clipping.generate');
+    Route::post('{audioBook}/clipping/{clipId}/settings', [AudioBookController::class, 'updateClipSettings'])->name('clipping.settings');
+    Route::post('{audioBook}/clipping/{clipId}/generate-title', [AudioBookController::class, 'generateClipHookTitle'])->name('clipping.generate.title');
+    Route::get('{audioBook}/clipping/{clipId}/generate-title-progress', [AudioBookController::class, 'getGenerateClipTitleProgress'])->name('clipping.generate.title.progress');
+    Route::post('{audioBook}/clipping/{clipId}/generate-image', [AudioBookController::class, 'generateClipImage'])->name('clipping.generate.image');
+    Route::get('{audioBook}/clipping/{clipId}/generate-image-progress', [AudioBookController::class, 'getGenerateClipImageProgress'])->name('clipping.generate.image.progress');
+    Route::post('{audioBook}/clipping/{clipId}/animate-image', [AudioBookController::class, 'startClipImageSeedance'])->name('clipping.animate.image');
+    Route::get('{audioBook}/clipping/{clipId}/animate-image-progress', [AudioBookController::class, 'getClipImageSeedanceProgress'])->name('clipping.animate.image.progress');
+    Route::post('{audioBook}/clipping/{clipId}/compose', [AudioBookController::class, 'composeClip'])->name('clipping.compose');
+    Route::get('{audioBook}/clipping/{clipId}/compose-progress', [AudioBookController::class, 'getComposeClipProgress'])->name('clipping.compose.progress');
+    Route::delete('{audioBook}/clipping/{clipId}', [AudioBookController::class, 'deleteClip'])->name('clipping.delete');
+
     // YouTube Media Generation Routes (AI Image/Video)
     Route::get('{audioBook}/media', [AudioBookController::class, 'getMedia'])->name('media.index');
+    Route::post('{audioBook}/media/upload', [AudioBookController::class, 'uploadMedia'])->name('media.upload');
     Route::post('{audioBook}/media/preview-thumbnail-prompt', [AudioBookController::class, 'previewThumbnailPrompt'])->name('media.preview.thumbnail.prompt');
     Route::post('{audioBook}/media/generate-thumbnail', [AudioBookController::class, 'generateThumbnail'])->name('media.generate.thumbnail');
     Route::get('{audioBook}/media/thumbnail-progress', [AudioBookController::class, 'getThumbnailProgress'])->name('media.thumbnail.progress');
@@ -196,6 +252,7 @@ Route::middleware('auth')->prefix('audiobooks')->name('audiobooks.')->group(func
     Route::put('{audioBook}/chapters/{chapter}', [AudioBookChapterController::class, 'update'])->name('chapters.update');
     Route::delete('{audioBook}/chapters/{chapter}', [AudioBookChapterController::class, 'destroy'])->name('chapters.destroy');
     Route::post('{audioBook}/chapters/{chapter}/generate-tts', [AudioBookChapterController::class, 'generateTts'])->name('chapters.generate-tts');
+    Route::post('{audioBook}/chapters/{chapter}/tts-preview', [AudioBookChapterController::class, 'ttsPreview'])->name('chapters.tts-preview');
     Route::post('{audioBook}/chapters/{chapter}/generate-tts-chunks', [AudioBookChapterController::class, 'generateTtsChunks'])->name('chapters.generate-tts-chunks');
     Route::post('{audioBook}/chapters/tts/start', [AudioBookChapterController::class, 'startTtsBatch'])->name('chapters.tts.start');
     Route::get('{audioBook}/chapters/tts/progress', [AudioBookChapterController::class, 'getTtsBatchProgress'])->name('chapters.tts.progress');
@@ -206,6 +263,9 @@ Route::middleware('auth')->prefix('audiobooks')->name('audiobooks.')->group(func
     Route::delete('{audioBook}/chapters/{chapter}/chunks/{chunk}/delete-audio', [AudioBookChapterController::class, 'deleteChunkAudio'])->name('chapters.chunks.delete-audio');
     Route::post('{audioBook}/chapters/{chapter}/merge-audio', [AudioBookChapterController::class, 'mergeChapterAudioEndpoint'])->name('chapters.merge-audio');
     Route::delete('{audioBook}/chapters/{chapter}/delete-audio', [AudioBookChapterController::class, 'deleteAudio'])->name('chapters.delete-audio');
+    Route::post('{audioBook}/chapters/{chapter}/boost-audio', [AudioBookChapterController::class, 'boostChapterAudio'])->name('chapters.boost-audio');
+    Route::post('{audioBook}/chapters/boost-audio/batch', [AudioBookChapterController::class, 'boostAudioBatch'])->name('chapters.boost-audio.batch');
+    Route::get('{audioBook}/chapters/boost-audio/progress', [AudioBookChapterController::class, 'getBoostAudioProgress'])->name('chapters.boost-audio.progress');
 
     // Scrape chapters from book URL
     Route::post('scrape-chapters', [AudioBookController::class, 'scrapeChapters'])->name('scrape.chapters');
@@ -312,6 +372,14 @@ Route::get('/test-transcript/{videoId}', function ($videoId) {
         'first_3' => array_slice($transcript, 0, 3),
         'last_3' => array_slice($transcript, -3)
     ]);
+});
+
+// Art Style Presets (user-level custom presets)
+Route::middleware('auth')->prefix('art-style-presets')->name('art-style-presets.')->group(function () {
+    Route::get('/', [\App\Http\Controllers\ArtStylePresetController::class, 'index'])->name('index');
+    Route::post('/', [\App\Http\Controllers\ArtStylePresetController::class, 'store'])->name('store');
+    Route::put('{preset}', [\App\Http\Controllers\ArtStylePresetController::class, 'update'])->name('update');
+    Route::delete('{preset}', [\App\Http\Controllers\ArtStylePresetController::class, 'destroy'])->name('destroy');
 });
 
 require __DIR__ . '/auth.php';

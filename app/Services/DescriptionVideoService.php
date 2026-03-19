@@ -291,7 +291,7 @@ class DescriptionVideoService
     /**
      * Generate image for a single chunk.
      */
-    public function generateChunkImage(int $bookId, int $chunkIndex, string $prompt): array
+    public function generateChunkImage(int $bookId, int $chunkIndex, string $prompt, string $imageProvider = 'gemini'): array
     {
         $workDir = $this->getWorkDir($bookId);
         $imagesDir = $workDir . '/images';
@@ -307,13 +307,14 @@ class DescriptionVideoService
             unlink($outputPath);
         }
 
-        $result = $this->imageService->generateImage($prompt, $outputPath, '16:9');
+        $result = $this->imageService->generateImage($prompt, $outputPath, '16:9', $imageProvider);
 
         if ($result['success']) {
             // Update chunks JSON
             $chunks = $this->loadChunks($bookId);
             if ($chunks && isset($chunks[$chunkIndex])) {
                 $chunks[$chunkIndex]['image_path'] = $outputPath;
+                $chunks[$chunkIndex]['image_provider'] = $imageProvider;
                 $this->saveChunks($bookId, $chunks);
             }
 

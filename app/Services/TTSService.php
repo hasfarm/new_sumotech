@@ -101,7 +101,8 @@ class TTSService
             'n_hanoi_female_nguyetnga2_book_vc' => 'HN – Nguyệt Nga Podcast (sách)',
         ],
         'male' => [
-            'sg_male_trungkien_vdts_48k-fhg' => 'SG – Trung Kiên (48k)',
+        'n_hanoi_male_thedong_education_vc' => 'HN – Thế Đông (giáo dục)',
+        'sg_male_trungkien_vdts_48k-fhg' => 'SG – Trung Kiên (48k)',
             'hue_male_duyphuong_full_48k-fhg' => 'Huế – Duy Phương (48k)',
             'sg_male_minhhoang_full_48k-fhg' => 'SG – Minh Hoàng (48k)',
             'hn_male_manhdung_news_48k-fhg' => 'HN – Mạnh Dũng (48k, tin tức)',
@@ -117,6 +118,15 @@ class TTSService
             'n_hanoi_male_baotrungmc_news_vc' => 'HN – Bảo Trung MC (tin tức)',
         ],
     ];
+
+    private function safeLog(string $level, string $message, array $context = []): void
+    {
+        try {
+            Log::log($level, $message, $context);
+        } catch (\Throwable $logException) {
+            error_log('[TTSService] Log write failed: ' . $logException->getMessage() . ' | message: ' . $message);
+        }
+    }
 
     /**
      * Get available voices for gender
@@ -207,7 +217,7 @@ class TTSService
                 return (float) $output[0];
             }
 
-            Log::warning('Failed to get audio duration via ffprobe', [
+            $this->safeLog('warning', 'Failed to get audio duration via ffprobe', [
                 'path' => $audioPath,
                 'return_code' => $returnCode,
                 'output' => $output
@@ -220,7 +230,7 @@ class TTSService
 
             return $estimatedDuration;
         } catch (Exception $e) {
-            Log::error('Get audio duration error', [
+            $this->safeLog('error', 'Get audio duration error', [
                 'error' => $e->getMessage(),
                 'path' => $audioPath
             ]);
@@ -259,7 +269,7 @@ class TTSService
                 $finalText = $styleInstruction . "\n\n" . $text;
             }
 
-            Log::info('TTS Generation', [
+            $this->safeLog('info', 'TTS Generation', [
                 'index' => $index,
                 'provider' => $provider,
                 'voice_gender' => $voiceGender,
@@ -271,7 +281,7 @@ class TTSService
 
             if ($provider === 'openai') {
                 // Use OpenAI API directly
-                $apiKey = env('OPENAI_API_KEY');
+                $apiKey = config('services.openai.api_key');
 
                 if ($apiKey) {
                     return $this->generateWithOpenAIDirectTTS($finalText, $index, $voiceGender, $voiceName, $apiKey, $projectId, $speed);
@@ -279,7 +289,7 @@ class TTSService
 
                 throw new Exception('Missing OPENAI_API_KEY for OpenAI TTS. Please set OPENAI_API_KEY in .env');
             } elseif ($provider === 'gemini') {
-                $geminiApiKey = env('GEMINI_API_KEY', env('GEMINI_TTS_API_KEY'));
+                $geminiApiKey = config('services.gemini.api_key') ?: config('services.gemini.tts_api_key');
 
                 if (!$geminiApiKey) {
                     throw new Exception('Missing GEMINI_API_KEY for Gemini TTS');
@@ -290,8 +300,8 @@ class TTSService
                 // Use local edge-tts (no API key needed)
                 return $this->generateWithEdgeTTS($finalText, $index, $voiceGender, $voiceName, $projectId, $speed);
             } elseif ($provider === 'vbee') {
-                $vbeeAppId = config('services.vbee.app_id') ?? env('VBEE_TTS_APP_ID');
-                $vbeeToken = config('services.vbee.token') ?? env('VBEE_TTS_TOKEN');
+                $vbeeAppId = config('services.vbee.app_id');
+                $vbeeToken = config('services.vbee.token');
 
                 if (!$vbeeAppId || !$vbeeToken) {
                     throw new Exception('Missing VBEE_TTS_APP_ID or VBEE_TTS_TOKEN. Please set both in .env');
@@ -299,7 +309,7 @@ class TTSService
 
                 return $this->generateWithVbeeTTS($text, $index, $voiceGender, $voiceName, $vbeeAppId, $vbeeToken, $projectId, $speed);
             } else {
-                $apiKey = env('GOOGLE_TTS_API_KEY');
+                $apiKey = config('services.google_tts.api_key');
                 if ($apiKey) {
                     return $this->generateWithGoogleTTS($finalText, $index, $voiceGender, $voiceName, $apiKey, $projectId, $speed);
                 }
@@ -308,7 +318,7 @@ class TTSService
             // No valid provider configured - throw error instead of mock
             throw new Exception("No valid TTS provider configured. Please set up API keys for: openai, gemini, or microsoft");
         } catch (Exception $e) {
-            Log::error('TTS Generation Error', ['error' => $e->getMessage()]);
+            $this->safeLog('error', 'TTS Generation Error', ['error' => $e->getMessage()]);
             // Always throw error - never fallback to mock audio in production
             // This prevents silent failures that create corrupt audio files
             throw $e;
@@ -366,7 +376,7 @@ class TTSService
             $folder = $projectId ? "public/projects/{$projectId}" : "public/dubsync/tts";
             $filename = "{$folder}/s{$index}_" . time() . ".mp3";
             Storage::put($filename, $audioData);
-            Log::info('TTS Generated Successfully', ['file' => $filename]);
+            $this->safeLog('info', 'TTS Generated Successfully', ['file' => $filename]);
 
             // Log API usage
             ApiUsageService::logTTS(
@@ -381,7 +391,7 @@ class TTSService
             return $filename;
         }
 
-        Log::error('Google TTS Error', ['http_code' => $httpCode, 'response' => $response]);
+        $this->safeLog('error', 'Google TTS Error', ['http_code' => $httpCode, 'response' => $response]);
 
         // Log failure
         ApiUsageService::logFailure(
@@ -434,7 +444,7 @@ class TTSService
         curl_close($ch);
 
         if ($httpCode !== 200 || !$response) {
-            Log::error('OpenAI TTS Error', [
+            $this->safeLog('error', 'OpenAI TTS Error', [
                 'http_code' => $httpCode,
                 'content_type' => $contentType,
                 'curl_error' => $curlError,
@@ -475,7 +485,7 @@ class TTSService
         $folder = $projectId ? "public/projects/{$projectId}" : "public/dubsync/tts";
         $filename = "{$folder}/s{$index}_" . time() . "_openai.mp3";
         Storage::put($filename, $audioData);
-        Log::info('OpenAI TTS Generated Successfully', ['file' => $filename, 'voice' => $selectedVoice]);
+        $this->safeLog('info', 'OpenAI TTS Generated Successfully', ['file' => $filename, 'voice' => $selectedVoice]);
 
         // Log API usage
         ApiUsageService::logTTS(
@@ -514,7 +524,7 @@ class TTSService
             'speed' => $speed
         ];
 
-        Log::info('OpenAI Direct TTS Request', [
+        $this->safeLog('info', 'OpenAI Direct TTS Request', [
             'voice' => $selectedVoice,
             'text_length' => strlen($text),
             'model' => 'tts-1-hd'
@@ -548,7 +558,7 @@ class TTSService
                 }
             }
 
-            Log::error('OpenAI Direct TTS Error', [
+            $this->safeLog('error', 'OpenAI Direct TTS Error', [
                 'http_code' => $httpCode,
                 'content_type' => $contentType,
                 'curl_error' => $curlError,
@@ -574,7 +584,7 @@ class TTSService
         $filename = "{$folder}/s{$index}_" . time() . "_openai_direct.mp3";
         Storage::put($filename, $audioData);
 
-        Log::info('OpenAI Direct TTS Generated Successfully', [
+        $this->safeLog('info', 'OpenAI Direct TTS Generated Successfully', [
             'file' => $filename,
             'voice' => $selectedVoice,
             'size' => strlen($audioData)
@@ -650,7 +660,7 @@ class TTSService
         // Build command
         $command = "\"{$pythonPath}\" \"{$scriptPath}\" --text \"{$escapedText}\" --out \"{$outputPath}\" --voice \"{$selectedVoice}\" --rate \"{$rateStr}\" 2>&1";
 
-        Log::info('Edge TTS Command', [
+        $this->safeLog('info', 'Edge TTS Command', [
             'voice' => $selectedVoice,
             'text_length' => strlen($text),
             'output' => $outputPath
@@ -659,7 +669,7 @@ class TTSService
         \exec($command, $output, $returnCode);
 
         if ($returnCode !== 0 || !file_exists($outputPath)) {
-            Log::error('Edge TTS Error', [
+            $this->safeLog('error', 'Edge TTS Error', [
                 'return_code' => $returnCode,
                 'output' => $output,
                 'command' => $command
@@ -776,7 +786,7 @@ class TTSService
             $folder = $projectId ? "public/projects/{$projectId}" : "public/dubsync/tts";
             $filename = "{$folder}/s{$index}_" . time() . "_gemini.{$ext}";
             Storage::put($filename, $audioData);
-            Log::info('Gemini TTS Generated Successfully', [
+            $this->safeLog('info', 'Gemini TTS Generated Successfully', [
                 'file' => $filename,
                 'voice' => $selectedVoice,
                 'mimeType' => $mimeType
@@ -784,7 +794,7 @@ class TTSService
             return $filename;
         }
 
-        Log::error('Gemini TTS Error', [
+        $this->safeLog('error', 'Gemini TTS Error', [
             'http_code' => $httpCode,
             'response' => $response,
             'voice' => $selectedVoice
@@ -819,7 +829,7 @@ class TTSService
         $placeholderContent = "Mock audio for: " . substr($text, 0, 50) . $voiceInfo;
         Storage::put($filename, $placeholderContent);
 
-        Log::info('Mock TTS Generated', [
+        $this->safeLog('info', 'Mock TTS Generated', [
             'file' => $filename,
             'voice' => $voiceName ?? $voiceGender,
             'provider' => $provider
@@ -889,7 +899,7 @@ class TTSService
         for ($retry = 0; $retry <= $maxRetries; $retry++) {
             try {
                 if ($retry > 0) {
-                    Log::info('Vbee TTS: Retry attempt', ['retry' => $retry, 'index' => $index]);
+                    $this->safeLog('info', 'Vbee TTS: Retry attempt', ['retry' => $retry, 'index' => $index]);
                     sleep(5 * $retry); // backoff: 5s, 10s
                 }
                 return $this->doVbeeTTSRequest($currentText, $index, $voiceGender, $voiceName, $appId, $token, $projectId, $speed);
@@ -898,13 +908,13 @@ class TTSService
 
                 // On hate speech rejection → AI rewrite then retry
                 if (str_contains($e->getMessage(), 'hate speech')) {
-                    Log::info('Vbee TTS: Hate speech detected, attempting AI rewrite', [
+                    $this->safeLog('info', 'Vbee TTS: Hate speech detected, attempting AI rewrite', [
                         'index' => $index,
                         'text_length' => mb_strlen($currentText),
                     ]);
                     $rewritten = $this->rewriteForTTS($currentText);
                     if ($rewritten && $rewritten !== $currentText) {
-                        Log::info('Vbee TTS: Text rewritten by AI', [
+                        $this->safeLog('info', 'Vbee TTS: Text rewritten by AI', [
                             'index' => $index,
                             'original_length' => mb_strlen($currentText),
                             'rewritten_length' => mb_strlen($rewritten),
@@ -912,7 +922,7 @@ class TTSService
                         $currentText = $rewritten;
                         continue; // retry with rewritten text
                     }
-                    Log::warning('Vbee TTS: AI rewrite returned no change, giving up');
+                    $this->safeLog('warning', 'Vbee TTS: AI rewrite returned no change, giving up');
                     throw $e;
                 }
 
@@ -921,7 +931,7 @@ class TTSService
                     throw $e;
                 }
 
-                Log::warning('Vbee TTS: Attempt failed', [
+                $this->safeLog('warning', 'Vbee TTS: Attempt failed', [
                     'retry' => $retry,
                     'index' => $index,
                     'error' => $e->getMessage(),
@@ -938,9 +948,9 @@ class TTSService
      */
     private function rewriteForTTS(string $text): ?string
     {
-        $apiKey = env('GEMINI_API_KEY');
+        $apiKey = config('services.gemini.api_key');
         if (!$apiKey) {
-            Log::warning('Vbee TTS rewrite: No GEMINI_API_KEY configured');
+            $this->safeLog('warning', 'Vbee TTS rewrite: No GEMINI_API_KEY configured');
             return null;
         }
 
@@ -986,7 +996,7 @@ PROMPT;
 
             if ($rewritten) {
                 $rewritten = trim($rewritten);
-                Log::info('Vbee TTS rewrite: Success', [
+                $this->safeLog('info', 'Vbee TTS rewrite: Success', [
                     'original_preview' => mb_substr($text, 0, 100),
                     'rewritten_preview' => mb_substr($rewritten, 0, 100),
                 ]);
@@ -994,7 +1004,7 @@ PROMPT;
 
             return $rewritten;
         } catch (\Throwable $e) {
-            Log::error('Vbee TTS rewrite: AI rewrite failed', ['error' => $e->getMessage()]);
+            $this->safeLog('error', 'Vbee TTS rewrite: AI rewrite failed', ['error' => $e->getMessage()]);
             return null;
         }
     }
@@ -1014,7 +1024,7 @@ PROMPT;
     ): string {
         $voiceCode = $this->resolveVbeeVoice($voiceGender, $voiceName);
 
-        Log::info('Vbee TTS: Starting', [
+        $this->safeLog('info', 'Vbee TTS: Starting', [
             'voice_code' => $voiceCode,
             'text_length' => mb_strlen($text),
             'index' => $index,
@@ -1022,7 +1032,7 @@ PROMPT;
 
         // Step 1: Submit TTS request
         $client = new \GuzzleHttp\Client();
-        $callbackUrl = rtrim(env('APP_URL', 'http://localhost'), '/') . '/api/vbee-callback';
+        $callbackUrl = rtrim(config('app.url', 'http://localhost'), '/') . '/api/vbee-callback';
 
         $response = $client->post('https://vbee.vn/api/v1/tts', [
             'headers' => [
@@ -1054,7 +1064,7 @@ PROMPT;
             throw new Exception('Vbee TTS: No request_id returned');
         }
 
-        Log::info('Vbee TTS: Request submitted', ['request_id' => $requestId]);
+        $this->safeLog('info', 'Vbee TTS: Request submitted', ['request_id' => $requestId]);
 
         // Step 2: Poll for completion (max ~3 minutes)
         $audioLink = null;
@@ -1071,7 +1081,7 @@ PROMPT;
                     'timeout' => 15,
                 ]);
             } catch (\Throwable $pollEx) {
-                Log::warning('Vbee TTS: Poll request error', [
+                $this->safeLog('warning', 'Vbee TTS: Poll request error', [
                     'attempt' => $attempt + 1,
                     'request_id' => $requestId,
                     'error' => $pollEx->getMessage(),
@@ -1090,7 +1100,7 @@ PROMPT;
                 $errorMsg = $pollBody['result']['error_message']
                     ?? $pollBody['error_message']
                     ?? json_encode($pollBody['result'] ?? $pollBody);
-                Log::error('Vbee TTS: FAILURE response', [
+                $this->safeLog('error', 'Vbee TTS: FAILURE response', [
                     'request_id' => $requestId,
                     'error_message' => $errorMsg,
                     'full_response' => $pollBody,
@@ -1100,7 +1110,7 @@ PROMPT;
 
             // IN_PROGRESS — keep polling
             if ($attempt % 5 === 0) {
-                Log::debug('Vbee TTS: Polling', ['attempt' => $attempt + 1, 'status' => $status, 'request_id' => $requestId]);
+                $this->safeLog('debug', 'Vbee TTS: Polling', ['attempt' => $attempt + 1, 'status' => $status, 'request_id' => $requestId]);
             }
         }
 
@@ -1108,7 +1118,7 @@ PROMPT;
             throw new Exception('Vbee TTS: Timeout waiting for audio after ' . ($maxAttempts * $pollInterval) . 's (request ' . $requestId . ')');
         }
 
-        Log::info('Vbee TTS: Audio ready', ['audio_link' => $audioLink]);
+        $this->safeLog('info', 'Vbee TTS: Audio ready', ['audio_link' => $audioLink]);
 
         // Step 3: Download the audio file (link expires after 3 minutes)
         $audioData = $client->get($audioLink, ['timeout' => 30])->getBody()->getContents();
@@ -1118,7 +1128,7 @@ PROMPT;
         $filename = "{$folder}/s{$index}_" . time() . "_vbee.mp3";
         Storage::put($filename, $audioData);
 
-        Log::info('Vbee TTS: Saved audio', ['file' => $filename, 'size' => strlen($audioData)]);
+        $this->safeLog('info', 'Vbee TTS: Saved audio', ['file' => $filename, 'size' => strlen($audioData)]);
 
         // Track API usage
         if ($projectId) {
@@ -1129,7 +1139,7 @@ PROMPT;
                     'request_id' => $requestId,
                 ]);
             } catch (\Throwable $e) {
-                Log::warning('Vbee TTS: Failed to track usage', ['error' => $e->getMessage()]);
+                $this->safeLog('warning', 'Vbee TTS: Failed to track usage', ['error' => $e->getMessage()]);
             }
         }
 

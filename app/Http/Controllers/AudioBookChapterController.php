@@ -6,7 +6,9 @@ use App\Models\AudioBook;
 use App\Models\AudioBookChapter;
 use App\Models\AudioBookChapterChunk;
 use App\Services\TTSService;
+use App\Services\ChapterAudioBoostService;
 use App\Jobs\GenerateChapterTtsBatchJob;
+use App\Jobs\BoostChapterAudioBatchJob;
 use Illuminate\Http\Request;
 use Symfony\Component\Process\Process;
 use Illuminate\Support\Facades\Log;
@@ -476,6 +478,58 @@ class AudioBookChapterController extends Controller
     /**
      * Generate audio for a single chunk
      */
+    /**
+     * Generate a quick TTS preview for a selected text snippet (up to 500 chars).
+     * Returns base64-encoded audio data so the browser can play it inline.
+     */
+    public function ttsPreview(Request $request, AudioBook $audioBook, AudioBookChapter $chapter)
+    {
+        $data = $request->validate([
+            'text'         => 'required|string|min:1|max:500',
+            'voice_name'   => 'nullable|string|max:100',
+            'voice_gender' => 'nullable|string|in:male,female',
+            'provider'     => 'nullable|string|in:openai,gemini,microsoft,vbee,google',
+            'speed'        => 'nullable|numeric|between:0.5,2.0',
+        ]);
+
+        $text     = $data['text'];
+        $voice    = $data['voice_name']   ?? $chapter->tts_voice ?? 'vi-VN-HoaiMyNeural';
+        $gender   = $data['voice_gender'] ?? $audioBook->tts_voice_gender ?? 'female';
+        $provider = $data['provider']     ?? $audioBook->tts_provider ?? 'microsoft';
+        $speed    = (float) ($data['speed'] ?? $audioBook->tts_speed ?? 1.0);
+
+        try {
+            $audioPath = $this->ttsService->generateAudio(
+                $text,
+                rand(100000, 999999),
+                $gender,
+                $voice,
+                $provider,
+                null,  // no style instruction for preview
+                null,  // no project id
+                $speed
+            );
+
+            $fullPath = storage_path('app/' . $audioPath);
+
+            if (!file_exists($fullPath)) {
+                return response()->json(['error' => 'Không tạo được audio preview'], 500);
+            }
+
+            $audioBase64 = base64_encode(file_get_contents($fullPath));
+            unlink($fullPath);
+
+            return response()->json([
+                'success'   => true,
+                'audio_b64' => $audioBase64,
+                'mime_type' => 'audio/mpeg',
+            ]);
+        } catch (\Exception $e) {
+            Log::error('TTS Preview error', ['error' => $e->getMessage()]);
+            return response()->json(['error' => $e->getMessage()], 500);
+        }
+    }
+
     public function generateSingleChunk(Request $request, AudioBook $audioBook, AudioBookChapter $chapter, AudioBookChapterChunk $chunk)
     {
         try {
@@ -930,6 +984,17 @@ class AudioBookChapterController extends Controller
             unlink($sourcePath); // Clean up original
         }
 
+        // Boost TTS voice volume by +16dB for clarity
+        if (file_exists($outputPath)) {
+            $boostedPath = $outputPath . '.boosted.mp3';
+            $boostCmd = "ffmpeg -y -i \"{$outputPath}\" -af \"volume=16dB\" -c:a libmp3lame -b:a 192k \"{$boostedPath}\" 2>&1";
+            exec($boostCmd, $boostOut, $boostCode);
+            if ($boostCode === 0 && file_exists($boostedPath)) {
+                unlink($outputPath);
+                rename($boostedPath, $outputPath);
+            }
+        }
+
         // Get audio duration using ffprobe if available
         $duration = $this->getAudioDuration($outputPath);
 
@@ -1076,18 +1141,8 @@ class AudioBookChapterController extends Controller
                 mkdir($outputDir, 0755, true);
             }
 
-            // Generate silence file if pause_between_chunks > 0
-            $pauseDuration = (float) ($audioBook->pause_between_chunks ?? 0);
+            // Pause between chunks is disabled: always concatenate voice chunks directly.
             $silenceFile = null;
-            if ($pauseDuration > 0) {
-                $silenceFile = $outputDir . DIRECTORY_SEPARATOR . "silence_{$chapterNum}.mp3";
-                $silenceCmd = "ffmpeg -y -f lavfi -i anullsrc=r=44100:cl=stereo -t {$pauseDuration} -q:a 9 \"{$silenceFile}\" 2>&1";
-                exec($silenceCmd, $silenceOutput, $silenceReturnCode);
-                if ($silenceReturnCode !== 0 || !file_exists($silenceFile)) {
-                    Log::warning("Failed to create silence file", ['output' => $silenceOutput]);
-                    $silenceFile = null;
-                }
-            }
 
             // Create list file for ffmpeg concat
             $listFile = $outputDir . DIRECTORY_SEPARATOR . "concat_list_{$chapterNum}.txt";
@@ -1103,11 +1158,6 @@ class AudioBookChapterController extends Controller
                     $escapedPath = str_replace("'", "'\\''", str_replace('\\', '/', $chunkPath));
                     $listContent .= "file '{$escapedPath}'\n";
 
-                    // Add silence between chunks (not after the last one)
-                    if ($silenceFile && $chunkCount < $totalChunkCount) {
-                        $escapedSilence = str_replace("'", "'\\''", str_replace('\\', '/', $silenceFile));
-                        $listContent .= "file '{$escapedSilence}'\n";
-                    }
                 }
             }
 
@@ -1134,7 +1184,8 @@ class AudioBookChapterController extends Controller
             }
 
             // Step 1: Merge all voice chunks into single voice file
-            $command = "ffmpeg -f concat -safe 0 -i \"{$listFile}\" -c copy \"{$voiceOnlyPath}\" 2>&1";
+            // Note: must re-encode (not -c copy) to eliminate MP3 encoder-delay gaps between chunks
+            $command = "ffmpeg -f concat -safe 0 -i \"{$listFile}\" -ar 44100 -ac 2 -c:a libmp3lame -b:a 192k \"{$voiceOnlyPath}\" 2>&1";
             Log::info("Merging chapter voice audio", ['command' => $command]);
 
             exec($command, $output, $returnCode);
@@ -1201,11 +1252,29 @@ class AudioBookChapterController extends Controller
                 $chapter->total_duration = $totalDuration;
             }
 
+            // Cleanup: after full chapter merge is successful, delete per-chunk audio files
+            $deletedChunkFiles = 0;
+            foreach ($chunks as $chunk) {
+                if (!$chunk->audio_file) {
+                    continue;
+                }
+
+                $chunkPath = storage_path('app/public/' . $chunk->audio_file);
+                if (file_exists($chunkPath)) {
+                    @unlink($chunkPath);
+                    $deletedChunkFiles++;
+                }
+
+                $chunk->audio_file = null;
+                $chunk->save();
+            }
+
             Log::info("Successfully merged {$chunks->count()} chunks into {$mergedFilename}", [
                 'has_intro' => $hasIntro,
                 'has_outro' => $hasOutro,
                 'voice_duration' => $voiceDuration,
-                'total_duration' => $totalDuration
+                'total_duration' => $totalDuration,
+                'deleted_chunk_files' => $deletedChunkFiles
             ]);
 
             return 'books/' . $bookId . '/' . $mergedFilename;
@@ -1347,5 +1416,86 @@ class AudioBookChapterController extends Controller
             Log::error("Error adding intro/outro music: " . $e->getMessage());
             return null;
         }
+    }
+
+    /**
+     * Boost volume of a single chapter's audio file by +16dB
+     */
+    public function boostChapterAudio(Request $request, AudioBook $audioBook, AudioBookChapter $chapter)
+    {
+        $db = (int) $request->input('db', 16);
+        if ($db < 1 || $db > 24) {
+            return response()->json([
+                'success' => false,
+                'error' => 'Giá trị dB không hợp lệ (1-24).'
+            ], 422);
+        }
+
+        if (!$chapter->audio_file) {
+            return response()->json(['success' => false, 'error' => 'Chương chưa có file audio'], 404);
+        }
+
+        $boostService = app(ChapterAudioBoostService::class);
+        $result = $boostService->boostChapter($audioBook, $chapter, $db);
+
+        if (!$result['success']) {
+            return response()->json([
+                'success' => false,
+                'error' => $result['error'] ?? 'Không thể boost audio.'
+            ], 422);
+        }
+
+        return response()->json([
+            'success' => true,
+            'mode' => $result['mode'] ?? 'voice-remix',
+            'message' => $result['message'] ?? 'Boost thành công, nhạc nền được giữ nguyên mức ban đầu.',
+        ]);
+    }
+
+    /**
+     * Boost volume of multiple chapters' audio files in batch (background job)
+     */
+    public function boostAudioBatch(Request $request, AudioBook $audioBook)
+    {
+        $request->validate([
+            'chapter_ids' => 'required|array|min:1',
+            'chapter_ids.*' => 'integer',
+        ]);
+
+        $db = (int) $request->input('db', 16);
+        $chapterIds = $request->input('chapter_ids');
+
+        // Reset progress cache
+        Cache::put("boost_batch_progress_{$audioBook->id}", [
+            'status'  => 'queued',
+            'percent' => 0,
+            'message' => 'Đã đưa vào hàng đợi, bạn có thể tắt trình duyệt.',
+            'done'    => 0,
+            'total'   => count($chapterIds),
+            'success' => 0,
+            'failed'  => 0,
+        ], now()->addHours(6));
+        Cache::put("boost_batch_logs_{$audioBook->id}", [], now()->addHours(6));
+
+        BoostChapterAudioBatchJob::dispatch($audioBook->id, $chapterIds, $db);
+
+        return response()->json([
+            'success' => true,
+            'queued'  => true,
+            'message' => 'Đã đưa vào hàng đợi xử lý.',
+        ]);
+    }
+
+    /**
+     * Get boost audio batch progress from cache
+     */
+    public function getBoostAudioProgress(AudioBook $audioBook)
+    {
+        $progress = Cache::get("boost_batch_progress_{$audioBook->id}");
+        if (!$progress) {
+            return response()->json(['success' => true, 'status' => 'idle']);
+        }
+        $progress['logs'] = Cache::get("boost_batch_logs_{$audioBook->id}", []);
+        return response()->json(array_merge(['success' => true], $progress));
     }
 }
