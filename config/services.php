@@ -40,6 +40,22 @@ return [
 
     'openai' => [
         'api_key' => env('OPENAI_API_KEY'),
+        'base_url' => env('OPENAI_BASE_URL', 'https://api.openai.com/v1'),
+        'embedding_model' => env('OPENAI_EMBEDDING_MODEL', 'text-embedding-3-small'),
+    ],
+
+    'qdrant' => [
+        'url' => env('QDRANT_URL', 'http://127.0.0.1:6333'),
+        'api_key' => env('QDRANT_API_KEY'),
+        'collection' => env('QDRANT_COLLECTION', 'audiobook_chapter_chunks'),
+        'distance' => env('QDRANT_DISTANCE', 'Cosine'),
+        'timeout' => (int) env('QDRANT_TIMEOUT', 30),
+        'openai_timeout' => (int) env('QDRANT_OPENAI_TIMEOUT', 60),
+        'enrich_with_llm' => (bool) env('QDRANT_ENRICH_WITH_LLM', false),
+        'enrich_low_confidence_min_character_tags' => (int) env('QDRANT_ENRICH_MIN_CHARACTER_TAGS', 2),
+        'enrich_low_confidence_min_importance_score' => (float) env('QDRANT_ENRICH_MIN_IMPORTANCE_SCORE', 0.55),
+        'enrich_low_confidence_min_text_length' => (int) env('QDRANT_ENRICH_MIN_TEXT_LENGTH', 120),
+        'enrich_low_confidence_required_signals' => (int) env('QDRANT_ENRICH_LOW_CONF_REQUIRED_SIGNALS', 2),
     ],
 
     'google_tts' => [
@@ -55,6 +71,8 @@ return [
         'api_key' => env('AIML_API_KEY', env('AIMLAPI_KEY')),
         'base_url' => env('AIML_BASE_URL', 'https://api.aimlapi.com'),
         'flux_model' => env('AIML_FLUX_MODEL', 'flux/schnell'),
+        'flux_pro_model' => env('AIML_FLUX_PRO_MODEL', 'flux-pro'),
+        'flux_1_1_pro_model' => env('AIML_FLUX_1_1_PRO_MODEL', 'flux-1.1-pro'),
     ],
 
     'seedance' => [

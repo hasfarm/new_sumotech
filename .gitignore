@@ -22,3 +22,14 @@ yarn-error.log
 /.venv
 /.venv311
 /nul
+
+# Qdrant local runtime (generated when running qdrant.exe locally)
+/.qdrant-initialized
+/storage/aliases/
+/storage/collections/
+/storage/raft_state.json
+/storage/snapshots/
+/storage/tools/qdrant/
+
+# Sensitive restore scripts
+storage/scripts/restore_*

@@ -33,6 +33,11 @@
             <div class="bg-white overflow-hidden shadow-sm sm:rounded-lg">
                 <div class="p-6 text-gray-900">
                     @if ($projects->count() > 0)
+                        <form id="bulkDeleteForm" action="{{ route('projects.bulk.destroy') }}" method="POST" class="hidden">
+                            @csrf
+                            <div id="bulkDeleteIdsContainer"></div>
+                        </form>
+
                         <div class="flex items-center justify-between mb-4">
                             <div class="flex items-center gap-4">
                                 <div class="text-sm text-gray-600">View:</div>
@@ -44,6 +49,23 @@
                                     <button id="cardViewBtn"
                                         class="px-4 py-2 text-sm font-medium bg-gray-100 text-gray-900 hover:bg-gray-200">
                                         Cards
+                                    </button>
+                                </div>
+
+                                <div class="flex items-center gap-2 ml-2">
+                                    <label class="inline-flex items-center gap-2 text-sm text-gray-700 cursor-pointer">
+                                        <input type="checkbox" id="selectAllProjectsCheckbox" class="rounded border-gray-300 text-red-600 focus:ring-red-500">
+                                        <span>Chọn tất cả</span>
+                                    </label>
+                                    <button type="button" id="bulkDownloadBtn"
+                                        class="px-3 py-2 text-sm font-medium bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition disabled:opacity-50 disabled:cursor-not-allowed"
+                                        disabled>
+                                        Download selected videos (0)
+                                    </button>
+                                    <button type="button" id="bulkDeleteBtn"
+                                        class="px-3 py-2 text-sm font-medium bg-red-600 text-white rounded-lg hover:bg-red-700 transition disabled:opacity-50 disabled:cursor-not-allowed"
+                                        disabled>
+                                        Delete selected (0)
                                     </button>
                                 </div>
                             </div>
@@ -62,6 +84,14 @@
                             </div>
                         </div>
 
+                        <div id="bulkDownloadProgressPanel" class="hidden mb-4 border border-blue-200 bg-blue-50 rounded-lg p-4">
+                            <div class="flex items-center justify-between mb-2">
+                                <h4 class="text-sm font-semibold text-blue-900">Bulk Download Progress</h4>
+                                <span id="bulkDownloadSummary" class="text-xs text-blue-700">Waiting...</span>
+                            </div>
+                            <div id="bulkDownloadProgressList" class="space-y-2"></div>
+                        </div>
+
                         <!-- Card View (default) -->
                         <div id="projectsCardView" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
                             @foreach ($projects as $project)
@@ -69,6 +99,13 @@
                                     data-project-id="{{ $project->id }}">
                                     <!-- Thumbnail -->
                                     <div class="relative h-40 bg-gray-200 overflow-hidden">
+                                        <div class="absolute top-3 left-3 z-10 bg-white/90 rounded px-2 py-1 shadow">
+                                            <input type="checkbox" class="project-select-checkbox rounded border-gray-300 text-red-600 focus:ring-red-500"
+                                                value="{{ $project->id }}"
+                                                data-project-title="{{ $project->youtube_title_vi ?? $project->youtube_title ?? $project->video_id }}"
+                                                aria-label="Select project {{ $project->id }}">
+                                        </div>
+
                                         @if ($project->youtube_thumbnail)
                                             <img src="{{ $project->youtube_thumbnail }}" alt="Project thumbnail"
                                                 class="w-full h-full object-cover">
@@ -129,7 +166,7 @@
                                     <!-- Content -->
                                     <div class="p-4">
                                         <h3 class="text-sm font-semibold text-gray-900 truncate mb-2">
-                                            {{ $project->youtube_title ?? $project->video_id }}
+                                            {{ $project->youtube_title_vi ?? $project->youtube_title ?? $project->video_id }}
                                         </h3>
 
                                         <p class="text-xs text-gray-600 mb-2 max-h-10 overflow-hidden">
@@ -186,6 +223,13 @@
                             @foreach ($projects as $project)
                                 <div class="project-item bg-white border border-gray-200 rounded-lg p-4 flex flex-wrap gap-4"
                                     data-project-id="{{ $project->id }}">
+                                    <div class="flex items-start pt-1">
+                                        <input type="checkbox" class="project-select-checkbox rounded border-gray-300 text-red-600 focus:ring-red-500"
+                                            value="{{ $project->id }}"
+                                            data-project-title="{{ $project->youtube_title_vi ?? $project->youtube_title ?? $project->video_id }}"
+                                            aria-label="Select project {{ $project->id }}">
+                                    </div>
+
                                     <div class="w-40 h-24 bg-gray-200 rounded overflow-hidden flex-shrink-0">
                                         @if ($project->youtube_thumbnail)
                                             <img src="{{ $project->youtube_thumbnail }}" alt="Project thumbnail"
@@ -209,7 +253,7 @@
                                         <div class="flex items-start justify-between gap-3">
                                             <div class="min-w-0">
                                                 <h3 class="text-sm font-semibold text-gray-900 truncate">
-                                                    {{ $project->youtube_title ?? 'No title available.' }}
+                                                    {{ $project->youtube_title_vi ?? $project->youtube_title ?? 'No title available.' }}
                                                 </h3>
                                                 <p class="text-xs text-gray-600 mt-1 max-h-10 overflow-hidden">
                                                     {{ $project->youtube_description ?? 'No description available.' }}
@@ -337,52 +381,276 @@
                 });
             }
 
-            const deleteForms = document.querySelectorAll('.delete-project-form');
-            deleteForms.forEach((form) => {
-                form.addEventListener('submit', async (e) => {
-                    e.preventDefault();
-                    if (!confirm('Are you sure?')) {
+            // Single delete uses standard form submit so Laravel can handle redirect + flash messages.
+
+            const selectAllProjectsCheckbox = document.getElementById('selectAllProjectsCheckbox');
+            const bulkDownloadBtn = document.getElementById('bulkDownloadBtn');
+            const bulkDeleteBtn = document.getElementById('bulkDeleteBtn');
+            const bulkDeleteForm = document.getElementById('bulkDeleteForm');
+            const bulkDeleteIdsContainer = document.getElementById('bulkDeleteIdsContainer');
+            const bulkDownloadProgressPanel = document.getElementById('bulkDownloadProgressPanel');
+            const bulkDownloadProgressList = document.getElementById('bulkDownloadProgressList');
+            const bulkDownloadSummary = document.getElementById('bulkDownloadSummary');
+
+            const csrfToken = document.querySelector('meta[name="csrf-token"]')?.content || '';
+            let isBulkDownloading = false;
+
+            const getAllProjectCheckboxes = () => Array.from(document.querySelectorAll('.project-select-checkbox'));
+
+            const getUniqueProjectIds = () => {
+                const ids = new Set();
+                getAllProjectCheckboxes().forEach((checkbox) => {
+                    ids.add(String(checkbox.value));
+                });
+                return ids;
+            };
+
+            const getSelectedProjectIds = () => {
+                const ids = new Set();
+                getAllProjectCheckboxes().forEach((checkbox) => {
+                    if (checkbox.checked) {
+                        ids.add(String(checkbox.value));
+                    }
+                });
+                return Array.from(ids);
+            };
+
+            const getSelectedProjectInfos = () => {
+                const selectedIds = getSelectedProjectIds();
+                return selectedIds.map((id) => {
+                    const checkbox = document.querySelector(`.project-select-checkbox[value="${id}"]`);
+                    const rawTitle = checkbox?.dataset?.projectTitle || `Project #${id}`;
+                    return {
+                        id,
+                        title: rawTitle.trim() || `Project #${id}`,
+                    };
+                });
+            };
+
+            const escapeHtml = (value) => String(value)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#039;');
+
+            const updateBulkDeleteState = () => {
+                if (!bulkDeleteBtn) return;
+
+                const selectedIds = getSelectedProjectIds();
+                const allIds = Array.from(getUniqueProjectIds());
+                const selectedCount = selectedIds.length;
+                const allCount = allIds.length;
+
+                bulkDeleteBtn.disabled = selectedCount === 0 || isBulkDownloading;
+                bulkDeleteBtn.textContent = `Delete selected (${selectedCount})`;
+
+                if (bulkDownloadBtn) {
+                    bulkDownloadBtn.disabled = selectedCount === 0 || isBulkDownloading;
+                    bulkDownloadBtn.textContent = isBulkDownloading
+                        ? `Downloading... (${selectedCount})`
+                        : `Download selected videos (${selectedCount})`;
+                }
+
+                if (selectAllProjectsCheckbox) {
+                    selectAllProjectsCheckbox.checked = allCount > 0 && selectedCount === allCount;
+                    selectAllProjectsCheckbox.indeterminate = selectedCount > 0 && selectedCount < allCount;
+                }
+            };
+
+            getAllProjectCheckboxes().forEach((checkbox) => {
+                checkbox.addEventListener('change', function() {
+                    const id = String(this.value);
+                    const checked = this.checked;
+
+                    // Keep card/list checkboxes for the same project in sync.
+                    document.querySelectorAll(`.project-select-checkbox[value="${id}"]`).forEach((el) => {
+                        el.checked = checked;
+                    });
+
+                    updateBulkDeleteState();
+                });
+            });
+
+            if (selectAllProjectsCheckbox) {
+                selectAllProjectsCheckbox.addEventListener('change', function() {
+                    const checked = this.checked;
+                    getAllProjectCheckboxes().forEach((checkbox) => {
+                        checkbox.checked = checked;
+                    });
+                    updateBulkDeleteState();
+                });
+            }
+
+            if (bulkDeleteBtn) {
+                bulkDeleteBtn.addEventListener('click', function() {
+                    const selectedIds = getSelectedProjectIds();
+                    if (selectedIds.length === 0 || !bulkDeleteForm || !bulkDeleteIdsContainer) {
                         return;
                     }
 
-                    const submitBtn = form.querySelector('button[type="submit"]');
-                    if (submitBtn) {
-                        submitBtn.disabled = true;
+                    if (!confirm(`Bạn có chắc muốn xóa ${selectedIds.length} project đã chọn?`)) {
+                        return;
                     }
 
-                    try {
-                        const response = await fetch(form.action, {
-                            method: 'DELETE',
-                            headers: {
-                                'X-CSRF-TOKEN': document.querySelector(
-                                    'meta[name="csrf-token"]').content,
-                                'X-Requested-With': 'XMLHttpRequest'
-                            }
-                        });
+                    bulkDeleteIdsContainer.innerHTML = '';
+                    selectedIds.forEach((id) => {
+                        const input = document.createElement('input');
+                        input.type = 'hidden';
+                        input.name = 'project_ids[]';
+                        input.value = id;
+                        bulkDeleteIdsContainer.appendChild(input);
+                    });
 
-                        const success = response.ok || response.status === 204 || response
-                            .status === 302 || response.redirected || response.status === 404;
-
-                        if (!success) {
-                            throw new Error('Delete failed');
-                        }
-
-                        const projectItem = form.closest('.project-item');
-                        if (projectItem) {
-                            projectItem.remove();
-                        }
-
-                        // Ensure UI refreshes fully
-                        window.location.reload();
-                    } catch (error) {
-                        if (submitBtn) {
-                            submitBtn.disabled = false;
-                        }
-                        // Fallback: refresh to reflect server state even if response not OK
-                        window.location.reload();
-                    }
+                    bulkDeleteForm.submit();
                 });
+            }
+
+            const createBulkProgressRow = (projectInfo) => {
+                if (!bulkDownloadProgressList) return;
+
+                const row = document.createElement('div');
+                row.className = 'bg-white border border-blue-100 rounded p-2';
+                row.dataset.projectId = projectInfo.id;
+                const safeTitle = escapeHtml(projectInfo.title);
+                row.innerHTML = `
+                    <div class="flex items-center justify-between gap-2 mb-1">
+                        <div class="text-xs font-medium text-gray-800 truncate" title="${safeTitle}">${safeTitle}</div>
+                        <div class="text-[11px] text-gray-500" data-role="status">Waiting...</div>
+                    </div>
+                    <div class="w-full bg-gray-200 rounded-full h-2 overflow-hidden">
+                        <div data-role="bar" class="h-full bg-blue-500 transition-all duration-500" style="width:0%"></div>
+                    </div>
+                    <div class="mt-1 text-[11px] text-gray-600 truncate" data-role="message">Đang chờ bắt đầu...</div>
+                `;
+                bulkDownloadProgressList.appendChild(row);
+            };
+
+            const updateBulkProgressRow = (projectId, progress) => {
+                const row = bulkDownloadProgressList?.querySelector(`[data-project-id="${projectId}"]`);
+                if (!row) return;
+
+                const bar = row.querySelector('[data-role="bar"]');
+                const statusText = row.querySelector('[data-role="status"]');
+                const messageText = row.querySelector('[data-role="message"]');
+
+                const pct = typeof progress.percent === 'number' ? Math.max(0, Math.min(100, progress.percent)) : 0;
+                if (bar) {
+                    bar.style.width = `${pct}%`;
+                    if (progress.status === 'completed') {
+                        bar.className = 'h-full bg-green-500 transition-all duration-500';
+                    } else if (progress.status === 'error') {
+                        bar.className = 'h-full bg-red-500 transition-all duration-500';
+                    } else {
+                        bar.className = 'h-full bg-blue-500 transition-all duration-500';
+                    }
+                }
+
+                if (statusText) {
+                    statusText.textContent = `${Math.floor(pct)}%`;
+                }
+
+                if (messageText) {
+                    const speed = progress.speed ? ` • ${progress.speed}` : '';
+                    messageText.textContent = (progress.message || 'Đang tải...') + speed;
+                }
+            };
+
+            const pollProjectDownloadProgress = async (projectId) => {
+                const response = await fetch(`/dubsync/projects/${projectId}/download-youtube-video-progress`, {
+                    method: 'GET',
+                    headers: {
+                        'X-CSRF-TOKEN': csrfToken,
+                    },
+                });
+                const data = await response.json();
+                return data?.progress || {};
+            };
+
+            // Dispatch job for one project, then poll until completed/error.
+            // Returns a Promise that resolves when the download finishes.
+            const runProjectDownload = (projectInfo) => new Promise(async (resolve) => {
+                updateBulkProgressRow(projectInfo.id, { status: 'processing', percent: 0, message: 'Đang xếp hàng...' });
+
+                try {
+                    // Dispatch — returns immediately with { queued: true } or { queued: false } if file exists.
+                    const response = await fetch(`/dubsync/projects/${projectInfo.id}/download-youtube-video`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json', 'X-CSRF-TOKEN': csrfToken },
+                        body: JSON.stringify({}),
+                    });
+                    const data = await response.json();
+
+                    if (!response.ok || !data.success) {
+                        throw new Error(data.error || 'Lỗi tải video');
+                    }
+
+                    // File already existed — done immediately.
+                    if (!data.queued) {
+                        updateBulkProgressRow(projectInfo.id, { status: 'completed', percent: 100, message: '✅ Video đã tồn tại' });
+                        return resolve({ success: true });
+                    }
+
+                    // Poll until completed or error.
+                    const pollTimer = setInterval(async () => {
+                        try {
+                            const progress = await pollProjectDownloadProgress(projectInfo.id);
+                            updateBulkProgressRow(projectInfo.id, progress);
+
+                            if (progress.status === 'completed') {
+                                clearInterval(pollTimer);
+                                resolve({ success: true });
+                            } else if (progress.status === 'error') {
+                                clearInterval(pollTimer);
+                                resolve({ success: false, error: progress.message });
+                            }
+                        } catch (e) {
+                            console.warn('Poll failed for project', projectInfo.id, e);
+                        }
+                    }, 1500);
+
+                } catch (error) {
+                    updateBulkProgressRow(projectInfo.id, { status: 'error', percent: 100, message: `❌ ${error.message}` });
+                    resolve({ success: false, error: error.message });
+                }
             });
+
+            if (bulkDownloadBtn) {
+                bulkDownloadBtn.addEventListener('click', async function() {
+                    if (isBulkDownloading) return;
+
+                    const selectedProjects = getSelectedProjectInfos();
+                    if (selectedProjects.length === 0) return;
+
+                    if (!confirm(`Tải source video cho ${selectedProjects.length} project đã chọn?\n\nTất cả sẽ được đưa vào hàng đợi cùng lúc.`)) return;
+
+                    isBulkDownloading = true;
+                    updateBulkDeleteState();
+
+                    if (bulkDownloadProgressPanel && bulkDownloadProgressList && bulkDownloadSummary) {
+                        bulkDownloadProgressPanel.classList.remove('hidden');
+                        bulkDownloadProgressList.innerHTML = '';
+                        bulkDownloadSummary.textContent = `Đang xếp hàng ${selectedProjects.length} video...`;
+                    }
+
+                    selectedProjects.forEach(createBulkProgressRow);
+
+                    // Dispatch all jobs at once, poll all in parallel.
+                    const results = await Promise.all(selectedProjects.map(runProjectDownload));
+
+                    const successCount = results.filter(r => r.success).length;
+                    const failCount   = results.length - successCount;
+
+                    if (bulkDownloadSummary) {
+                        bulkDownloadSummary.textContent = `Hoàn tất: ${successCount} thành công, ${failCount} lỗi`;
+                    }
+
+                    isBulkDownloading = false;
+                    updateBulkDeleteState();
+                });
+            }
+
+            updateBulkDeleteState();
 
             const listBtn = document.getElementById('listViewBtn');
             const cardBtn = document.getElementById('cardViewBtn');

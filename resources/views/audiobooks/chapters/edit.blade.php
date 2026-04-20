@@ -5,7 +5,7 @@
         <div class="max-w-4xl mx-auto sm:px-6 lg:px-8">
             <div class="flex justify-between items-center mb-6">
                 <h2 class="font-semibold text-2xl text-gray-800">Sửa Chương: {{ $chapter->title }}</h2>
-                <a href="{{ route('audiobooks.show', $audioBook) }}"
+                <a href="{{ route('audiobooks.show', $audioBook) }}#chapter-{{ $chapter->id }}"
                     class="bg-gray-600 hover:bg-gray-700 text-white font-semibold py-2 px-4 rounded-lg transition duration-200">
                     Quay lại
                 </a>
@@ -170,7 +170,7 @@
                                 class="flex-1 bg-blue-600 hover:bg-blue-700 text-white font-semibold py-2 px-4 rounded-lg transition duration-200">
                                 ✓ Cập nhật Chương
                             </button>
-                            <a href="{{ route('audiobooks.show', $audioBook) }}"
+                            <a href="{{ route('audiobooks.show', $audioBook) }}#chapter-{{ $chapter->id }}"
                                 class="flex-1 text-center bg-gray-100 hover:bg-gray-200 text-gray-700 font-semibold py-2 px-4 rounded-lg transition duration-200">
                                 Hủy
                             </a>

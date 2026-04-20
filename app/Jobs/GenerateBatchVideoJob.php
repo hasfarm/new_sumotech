@@ -11,6 +11,7 @@ use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Str;
 
 class GenerateBatchVideoJob implements ShouldQueue
 {
@@ -28,6 +29,19 @@ class GenerateBatchVideoJob implements ShouldQueue
 
     public function handle(): void
     {
+        $lockKey = $this->getBatchLockKey();
+        $lockToken = (string) Str::uuid();
+
+        if (!Cache::add($lockKey, $lockToken, now()->addHours(8))) {
+            $this->addLog("Bo qua batch video: audiobook {$this->audioBookId} dang duoc xu ly boi mot job khac.");
+            $this->updateProgress([
+                'status' => 'processing',
+                'message' => 'Dang co batch video khac chay cho audiobook nay. Bo qua job trung lap.',
+            ]);
+            return;
+        }
+
+        try {
         $audioBook = AudioBook::find($this->audioBookId);
         if (!$audioBook) return;
 
@@ -138,14 +152,17 @@ class GenerateBatchVideoJob implements ShouldQueue
                 $concatListPath = $tempDir . '/concat_list.txt';
                 $concatContent = '';
                 foreach ($audioFiles as $af) {
-                    $concatContent .= "file " . escapeshellarg($af) . "\n";
+                    // FFmpeg concat demuxer expects file entries, not shell-escaped args.
+                    $normalized = str_replace('\\', '/', $af);
+                    $escaped = str_replace("'", "'\\''", $normalized);
+                    $concatContent .= "file '{$escaped}'\n";
                 }
                 file_put_contents($concatListPath, $concatContent);
 
                 $mergedVoicePath = $tempDir . '/merged_voice.mp3';
                 $concatCmd = sprintf(
                     '%s -y -f concat -safe 0 -i %s -c:a libmp3lame -b:a 192k %s 2>&1',
-                    $ffmpeg, escapeshellarg($concatListPath), escapeshellarg($mergedVoicePath)
+                    escapeshellarg($ffmpeg), escapeshellarg($concatListPath), escapeshellarg($mergedVoicePath)
                 );
 
                 $this->addLog("FFmpeg: ghep audio...");
@@ -158,7 +175,7 @@ class GenerateBatchVideoJob implements ShouldQueue
 
                 // Get voice duration
                 $dCmd = sprintf('%s -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 %s',
-                    $ffprobe, escapeshellarg($mergedVoicePath));
+                    escapeshellarg($ffprobe), escapeshellarg($mergedVoicePath));
                 $dOut = [];
                 exec($dCmd, $dOut);
                 $voiceDuration = !empty($dOut) ? (float) $dOut[0] : 0;
@@ -223,7 +240,7 @@ class GenerateBatchVideoJob implements ShouldQueue
 
                     $mixCmd = sprintf(
                         '%s -y -i %s -i %s -filter_complex "%s" -map "[mixout]" -c:a libmp3lame -b:a 192k %s 2>&1',
-                        $ffmpeg, escapeshellarg($introMusicPath),
+                        escapeshellarg($ffmpeg), escapeshellarg($introMusicPath),
                         escapeshellarg($mergedVoicePath), $audioFilterComplex,
                         escapeshellarg($mixedAudioPath)
                     );
@@ -251,7 +268,20 @@ class GenerateBatchVideoJob implements ShouldQueue
                 ]);
 
                 $outputPath = $mp4Dir . "/segment_{$segment->id}.mp4";
-                if (file_exists($outputPath)) unlink($outputPath);
+                if (file_exists($outputPath)) {
+                    // On Windows, the file may still be held by a previous FFmpeg process.
+                    // Rename first (works even with open handles), then delete.
+                    $oldPath = $outputPath . '.old_' . time();
+                    if (@rename($outputPath, $oldPath)) {
+                        @unlink($oldPath);
+                    } else {
+                        // Retry unlink with brief delay
+                        for ($retry = 0; $retry < 3; $retry++) {
+                            if (@unlink($outputPath)) break;
+                            usleep(500000); // 0.5s
+                        }
+                    }
+                }
 
                 $waveEnabled = $audioBook->wave_enabled ?? false;
                 $videoWidth = 1280;
@@ -282,14 +312,14 @@ class GenerateBatchVideoJob implements ShouldQueue
                         '%s -y -loop 1 -framerate 15 -i %s -i %s -filter_complex "%s" -map "[out]" -map 1:a ' .
                         '-c:v libx264 -preset ultrafast -tune stillimage -crf 28 -c:a aac -b:a 128k ' .
                         '-pix_fmt yuv420p -shortest -threads 0 -progress pipe:1 -stats %s',
-                        $ffmpeg, escapeshellarg($imagePath), escapeshellarg($mixedAudioPath),
+                        escapeshellarg($ffmpeg), escapeshellarg($imagePath), escapeshellarg($mixedAudioPath),
                         $filterComplex, escapeshellarg($outputPath)
                     );
                 } else {
                     $videoCmd = sprintf(
                         '%s -y -loop 1 -framerate 1 -i %s -i %s -c:v libx264 -preset ultrafast -tune stillimage -crf 28 ' .
-                        '-c:a aac -b:a 128k -pix_fmt yuv420p -r 15 -shortest -threads 0 -vf "%s" -progress pipe:1 -stats %s',
-                        $ffmpeg, escapeshellarg($imagePath), escapeshellarg($mixedAudioPath),
+                        '-c:a aac -b:a 128k -pix_fmt yuv420p -r 1 -shortest -threads 0 -vf "%s" -progress pipe:1 -stats %s',
+                        escapeshellarg($ffmpeg), escapeshellarg($imagePath), escapeshellarg($mixedAudioPath),
                         $baseFilter, escapeshellarg($outputPath)
                     );
                 }
@@ -298,16 +328,33 @@ class GenerateBatchVideoJob implements ShouldQueue
                 Log::info("Batch segment video cmd", ['segment_id' => $segment->id, 'cmd' => $videoCmd]);
 
                 $videoResult = $this->runFfmpegWithProgress($videoCmd, $totalDuration, $index, $totalSegments);
+                $returnCode = (int) ($videoResult['return_code'] ?? 1);
+                $outputExists = file_exists($outputPath);
+                $outputSize = $outputExists ? (int) filesize($outputPath) : 0;
+
+                // On Windows, proc_close() can return -1 despite FFmpeg completing successfully.
+                $isWindowsFalseNegative = $returnCode === -1 && $outputExists && $outputSize > 102400;
+                $hasValidOutput = $outputExists && $outputSize > 1024;
+
+                if ((!$hasValidOutput && !$isWindowsFalseNegative) || ($returnCode !== 0 && !$isWindowsFalseNegative)) {
+                    $tail = array_slice($videoResult['output'] ?? [], -20);
+                    if (!empty($tail)) {
+                        Log::error('Batch segment FFmpeg video output (tail)', [
+                            'segment_id' => $segment->id,
+                            'return_code' => $returnCode,
+                            'output_size' => $outputSize,
+                            'tail' => $tail,
+                        ]);
+                    }
+                    $this->cleanupDir($tempDir);
+                    throw new \Exception("FFmpeg khong the tao video. Code: {$returnCode}");
+                }
 
                 $this->cleanupDir($tempDir);
 
-                if ($videoResult['return_code'] !== 0 || !file_exists($outputPath)) {
-                    throw new \Exception("FFmpeg khong the tao video. Code: " . $videoResult['return_code']);
-                }
-
                 // Get video duration
                 $durCmd = sprintf('%s -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 %s',
-                    $ffprobe, escapeshellarg($outputPath));
+                    escapeshellarg($ffprobe), escapeshellarg($outputPath));
                 $durOut = [];
                 exec($durCmd, $durOut);
                 $videoDuration = !empty($durOut) ? (float) $durOut[0] : $totalDuration;
@@ -344,6 +391,21 @@ class GenerateBatchVideoJob implements ShouldQueue
             'message' => "Hoan tat tat ca {$totalSegments} segments!"
         ]);
         $this->addLog("========== HOAN TAT TAT CA ==========");
+        } finally {
+            $this->releaseBatchLock($lockKey, $lockToken);
+        }
+    }
+
+    private function getBatchLockKey(): string
+    {
+        return "batch_video_lock_{$this->audioBookId}";
+    }
+
+    private function releaseBatchLock(string $lockKey, string $lockToken): void
+    {
+        if (Cache::get($lockKey) === $lockToken) {
+            Cache::forget($lockKey);
+        }
     }
 
     private function updateProgress(array $data): void
@@ -455,8 +517,8 @@ class GenerateBatchVideoJob implements ShouldQueue
             \RecursiveIteratorIterator::CHILD_FIRST
         );
         foreach ($items as $item) {
-            $item->isDir() ? rmdir($item->getRealPath()) : unlink($item->getRealPath());
+            $item->isDir() ? @rmdir($item->getRealPath()) : @unlink($item->getRealPath());
         }
-        rmdir($dir);
+        @rmdir($dir);
     }
 }

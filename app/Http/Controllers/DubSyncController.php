@@ -2,7 +2,10 @@
 
 namespace App\Http\Controllers;
 
+use App\Jobs\GenerateDubSyncBatchTtsJob;
 use App\Models\DubSyncProject;
+use App\Services\GeminiImageService;
+use App\Services\TranslationService;
 use App\Services\TTSService;
 use App\Services\ApiUsageService;
 use Illuminate\Http\Request;
@@ -63,7 +66,9 @@ class DubSyncController extends Controller
                 $voices = [
                     'google' => \App\Services\TTSService::getAllVoices('google'),
                     'openai' => \App\Services\TTSService::getAllVoices('openai'),
-                    'gemini' => \App\Services\TTSService::getAllVoices('gemini')
+                    'gemini' => \App\Services\TTSService::getAllVoices('gemini'),
+                    'microsoft' => \App\Services\TTSService::getAllVoices('microsoft'),
+                    'vbee' => \App\Services\TTSService::getAllVoices('vbee')
                 ];
             } elseif ($gender === 'all') {
                 $voices = \App\Services\TTSService::getAllVoices($provider);
@@ -106,14 +111,79 @@ class DubSyncController extends Controller
         ]);
 
         try {
-            $youtubeUrl = $request->youtube_url;
-            \Log::info('Processing YouTube URL', ['url' => $youtubeUrl]);
+            $videoUrl = $request->youtube_url;
+            \Log::info('Processing video URL', ['url' => $videoUrl]);
 
-            $videoId = $this->extractVideoId($youtubeUrl);
+            $isBilibili = $this->isBilibiliVideoUrl($videoUrl);
+
+            if ($isBilibili) {
+                // Extract BV ID for storage
+                if (preg_match('/\/video\/(BV[a-zA-Z0-9]+)/i', $videoUrl, $bvMatch)) {
+                    $videoId = 'bili:' . $bvMatch[1];
+                } else {
+                    return response()->json(['error' => 'Bilibili URL không hợp lệ. Ví dụ: https://www.bilibili.com/video/BV1xxxx'], 400);
+                }
+
+                // Create a temporary project to use fetchBilibiliTranscriptData
+                $project = DubSyncProject::create([
+                    'user_id'            => auth()->id(),
+                    'youtube_channel_id' => $request->input('youtube_channel_id'),
+                    'video_id'           => $videoId,
+                    'youtube_url'        => $videoUrl,
+                    'status'             => 'new',
+                ]);
+
+                try {
+                    // Fetch metadata via yt-dlp --dump-json
+                    $ytDlpPath = env('YTDLP_PATH', 'python -m yt_dlp');
+                    $metaJson  = [];
+                    exec(sprintf('%s --dump-json --no-playlist %s 2>/dev/null', $ytDlpPath, escapeshellarg($videoUrl)), $metaJson);
+                    $metaRaw  = json_decode(implode('', $metaJson), true) ?? [];
+                    $metadata = [
+                        'title'       => $metaRaw['title']     ?? null,
+                        'thumbnail'   => $metaRaw['thumbnail'] ?? null,
+                        'duration'    => isset($metaRaw['duration']) ? gmdate('H:i:s', (int) $metaRaw['duration']) : null,
+                        'description' => $metaRaw['description'] ?? null,
+                    ];
+
+                    $bilibiliData = $this->fetchBilibiliTranscriptData($project);
+                    $transcript   = $bilibiliData['transcript'];
+
+                    $cleanedTranscript = app('App\Services\TranscriptCleanerService')->clean($transcript);
+                    $segments = app('App\Services\TranscriptSegmentationService')->segment($cleanedTranscript);
+
+                    $project->update([
+                        'youtube_title'       => $metadata['title']       ?? null,
+                        'youtube_thumbnail'   => $metadata['thumbnail']   ?? null,
+                        'youtube_duration'    => $metadata['duration']    ?? null,
+                        'youtube_description' => $metadata['description'] ?? null,
+                        'original_transcript' => $transcript,
+                        'segments'            => $segments,
+                        'status'              => 'transcribed',
+                    ]);
+                } catch (\Exception $e) {
+                    $project->update(['status' => 'error']);
+                    throw $e;
+                }
+
+                \Log::info('Bilibili project created', ['project_id' => $project->id, 'segments' => count($segments)]);
+
+                return response()->json([
+                    'success'            => true,
+                    'project_id'         => $project->id,
+                    'video_id'           => $videoId,
+                    'metadata'           => $metadata,
+                    'segments'           => $segments,
+                    'processing_complete' => true,
+                ]);
+            }
+
+            // ── YouTube flow ──────────────────────────────────────────────────
+            $videoId = $this->extractVideoId($videoUrl);
 
             if (!$videoId) {
-                \Log::warning('Invalid video ID', ['url' => $youtubeUrl]);
-                return response()->json(['error' => 'Invalid YouTube URL'], 400);
+                \Log::warning('Invalid video ID', ['url' => $videoUrl]);
+                return response()->json(['error' => 'URL không hợp lệ. Hỗ trợ YouTube và Bilibili.'], 400);
             }
 
             // Step 0: Get YouTube metadata (title, description, duration, thumbnail)
@@ -135,7 +205,7 @@ class DubSyncController extends Controller
                 'user_id' => auth()->id(),
                 'youtube_channel_id' => $request->input('youtube_channel_id'),
                 'video_id' => $videoId,
-                'youtube_url' => $youtubeUrl,
+                'youtube_url' => $videoUrl,
                 'youtube_title' => $metadata['title'] ?? null,
                 'youtube_description' => $metadata['description'] ?? null,
                 'youtube_thumbnail' => $metadata['thumbnail'] ?? null,
@@ -171,25 +241,23 @@ class DubSyncController extends Controller
             abort(403, 'Unauthorized');
         }
 
-        $videoId = $project->video_id ?: $this->extractVideoId($project->youtube_url);
-        if (!$videoId) {
-            return redirect()->back()->withErrors(['error' => 'Invalid YouTube URL']);
-        }
-
         try {
-            $metadata = app('App\\Services\\YouTubeTranscriptService')->getMetadata($videoId);
-            $transcript = app('App\\Services\\YouTubeTranscriptService')->getTranscript($videoId);
-            $cleanedTranscript = app('App\\Services\\TranscriptCleanerService')->clean($transcript);
-            $segments = app('App\\Services\\TranscriptSegmentationService')->segment($cleanedTranscript);
+            [$videoId, $metadata, $transcript, $segments, $translatedSegments] = $this->buildTranscriptPayloadForProject($project);
+            $resolvedTitleVi = $this->resolveVietnameseTitleForUpdate(
+                (string) ($project->youtube_title_vi ?? ''),
+                (string) ($metadata['title_vi'] ?? '')
+            );
 
             $project->update([
                 'video_id' => $videoId,
                 'youtube_title' => $metadata['title'] ?? $project->youtube_title,
+                'youtube_title_vi' => $resolvedTitleVi,
                 'youtube_description' => $metadata['description'] ?? $project->youtube_description,
                 'youtube_thumbnail' => $metadata['thumbnail'] ?? $project->youtube_thumbnail,
                 'youtube_duration' => $metadata['duration'] ?? $project->youtube_duration,
                 'original_transcript' => $transcript,
                 'segments' => $segments,
+                'translated_segments' => $translatedSegments,
                 'status' => 'transcribed',
             ]);
 
@@ -209,27 +277,25 @@ class DubSyncController extends Controller
             return response()->json(['success' => false, 'error' => 'Unauthorized'], 403);
         }
 
-        $videoId = $project->video_id ?: $this->extractVideoId($project->youtube_url);
-        if (!$videoId) {
-            return response()->json(['success' => false, 'error' => 'Invalid YouTube URL'], 422);
-        }
-
         try {
             $project->update(['status' => 'processing']);
 
-            $metadata = app('App\\Services\\YouTubeTranscriptService')->getMetadata($videoId);
-            $transcript = app('App\\Services\\YouTubeTranscriptService')->getTranscript($videoId);
-            $cleanedTranscript = app('App\\Services\\TranscriptCleanerService')->clean($transcript);
-            $segments = app('App\\Services\\TranscriptSegmentationService')->segment($cleanedTranscript);
+            [$videoId, $metadata, $transcript, $segments, $translatedSegments] = $this->buildTranscriptPayloadForProject($project);
+            $resolvedTitleVi = $this->resolveVietnameseTitleForUpdate(
+                (string) ($project->youtube_title_vi ?? ''),
+                (string) ($metadata['title_vi'] ?? '')
+            );
 
             $project->update([
                 'video_id' => $videoId,
                 'youtube_title' => $metadata['title'] ?? $project->youtube_title,
+                'youtube_title_vi' => $resolvedTitleVi,
                 'youtube_description' => $metadata['description'] ?? $project->youtube_description,
                 'youtube_thumbnail' => $metadata['thumbnail'] ?? $project->youtube_thumbnail,
                 'youtube_duration' => $metadata['duration'] ?? $project->youtube_duration,
                 'original_transcript' => $transcript,
                 'segments' => $segments,
+                'translated_segments' => $translatedSegments,
                 'status' => 'transcribed',
             ]);
 
@@ -244,6 +310,426 @@ class DubSyncController extends Controller
     }
 
     /**
+     * Build transcript + segmented payload for project source.
+     * Supports YouTube and Bilibili videos.
+     */
+    private function buildTranscriptPayloadForProject(DubSyncProject $project): array
+    {
+        $sourceUrl = trim((string) ($project->youtube_url ?? ''));
+        $isBilibili = $this->isBilibiliVideoUrl($sourceUrl) || str_starts_with((string) $project->video_id, 'bili:');
+
+        if ($isBilibili) {
+            $bilibiliData = $this->fetchBilibiliTranscriptData($project);
+            $transcript = $bilibiliData['transcript'];
+            $cleanedTranscript = app('App\\Services\\TranscriptCleanerService')->clean($transcript);
+            $segments = app('App\\Services\\TranscriptSegmentationService')->segment($cleanedTranscript);
+
+            $translatedSegments = [];
+            $translatedTitleVi = null;
+
+            $sourceLang = (string) ($bilibiliData['language'] ?? 'auto');
+            if ($sourceLang !== 'vi' && !$this->isLikelyVietnameseTranscript($segments)) {
+                $translator = app(TranslationService::class);
+                $translatedSegments = $translator->translateSegments($segments, 'google', $project->id, $sourceLang);
+
+                if (!empty($project->youtube_title) && preg_match('/\\p{Han}/u', $project->youtube_title) === 1) {
+                    $translatedTitleVi = $translator->translateText($project->youtube_title, 'zh-CN', 'vi', 'google');
+                }
+            }
+
+            return [
+                $project->video_id,
+                [
+                    'title' => $project->youtube_title,
+                    'title_vi' => $translatedTitleVi,
+                    'description' => $project->youtube_description,
+                    'thumbnail' => $project->youtube_thumbnail,
+                    'duration' => $project->youtube_duration,
+                ],
+                $transcript,
+                $segments,
+                $translatedSegments,
+            ];
+        }
+
+        $videoId = $project->video_id ?: $this->extractVideoId($sourceUrl);
+        if (!$videoId) {
+            throw new \Exception('Invalid source URL');
+        }
+
+        $metadata = app('App\\Services\\YouTubeTranscriptService')->getMetadata($videoId);
+        $transcript = app('App\\Services\\YouTubeTranscriptService')->getTranscript($videoId);
+        $cleanedTranscript = app('App\\Services\\TranscriptCleanerService')->clean($transcript);
+        $segments = app('App\\Services\\TranscriptSegmentationService')->segment($cleanedTranscript);
+
+        return [$videoId, $metadata, $transcript, $segments, []];
+    }
+
+    private function isBilibiliVideoUrl(string $url): bool
+    {
+        return preg_match('/(?:bilibili\\.com\\/video\\/|b23\\.tv\\/)/i', $url) === 1;
+    }
+
+    private function resolveBilibiliVideoUrl(DubSyncProject $project): string
+    {
+        $url = trim((string) ($project->youtube_url ?? ''));
+        if ($this->isBilibiliVideoUrl($url)) {
+            return $url;
+        }
+
+        $videoId = trim((string) ($project->video_id ?? ''));
+        if (str_starts_with($videoId, 'bili:')) {
+            $bvid = trim(substr($videoId, 5));
+            if ($bvid !== '') {
+                return "https://www.bilibili.com/video/{$bvid}";
+            }
+        }
+
+        throw new \Exception('Bilibili URL khong hop le');
+    }
+
+    private function fetchBilibiliTranscriptData(DubSyncProject $project): array
+    {
+        $videoUrl = $this->resolveBilibiliVideoUrl($project);
+        $ytDlpPath = env('YTDLP_PATH', 'python -m yt_dlp');
+
+        $tmpRoot = storage_path('app/tmp');
+        if (!is_dir($tmpRoot)) {
+            mkdir($tmpRoot, 0755, true);
+        }
+
+        $tmpDir = $tmpRoot . DIRECTORY_SEPARATOR . 'bili_subs_' . $project->id . '_' . time();
+        mkdir($tmpDir, 0755, true);
+
+        $outputTemplate = $tmpDir . DIRECTORY_SEPARATOR . '%(id)s.%(ext)s';
+        $command = sprintf(
+            '%s --skip-download --write-subs --write-auto-subs --sub-langs "vi,zh-Hans,zh-CN,zh,zh-TW,en" --sub-format "vtt" --no-playlist --no-part -o %s %s 2>&1',
+            $ytDlpPath,
+            '"' . $outputTemplate . '"',
+            escapeshellarg($videoUrl)
+        );
+
+        $output = [];
+        $returnCode = 0;
+        exec($command, $output, $returnCode);
+
+        if ($returnCode !== 0) {
+            $this->cleanupDirectory($tmpDir);
+            throw new \Exception('Khong lay duoc subtitle tu Bilibili: ' . implode("\n", array_slice($output, -5)));
+        }
+
+        $vttFiles = glob($tmpDir . DIRECTORY_SEPARATOR . '*.vtt') ?: [];
+        if (empty($vttFiles)) {
+            $fallback = $this->transcribeBilibiliFromAudio($videoUrl, $ytDlpPath, $tmpDir);
+            $this->cleanupDirectory($tmpDir);
+
+            if (!empty($fallback['transcript'])) {
+                return $fallback;
+            }
+
+            throw new \Exception('Bilibili video khong co subtitle va khong the transcribe tu audio.');
+        }
+
+        $selected = $this->pickBestBilibiliSubtitleFile($vttFiles);
+        $language = $selected['language'];
+        $transcript = $this->parseVttTranscript($selected['path']);
+
+        if (empty($transcript)) {
+            $fallback = $this->transcribeBilibiliFromAudio($videoUrl, $ytDlpPath, $tmpDir);
+            $this->cleanupDirectory($tmpDir);
+
+            if (!empty($fallback['transcript'])) {
+                return $fallback;
+            }
+
+            throw new \Exception('Subtitle Bilibili rong va khong the transcribe tu audio.');
+        }
+
+        $this->cleanupDirectory($tmpDir);
+
+        return [
+            'language' => $language,
+            'transcript' => $transcript,
+        ];
+    }
+
+    private function transcribeBilibiliFromAudio(string $videoUrl, string $ytDlpPath, string $tmpDir): array
+    {
+        $apiKey = (string) config('services.openai.api_key', '');
+        if ($apiKey === '') {
+            return ['language' => 'unknown', 'transcript' => []];
+        }
+
+        $ffmpegPath = env('FFMPEG_PATH', '');
+        $ffmpegLocationArg = '';
+        if ($ffmpegPath !== '') {
+            if (is_file($ffmpegPath)) {
+                $ffmpegLocationArg = '--ffmpeg-location ' . escapeshellarg(dirname($ffmpegPath));
+            } elseif (is_dir($ffmpegPath)) {
+                $ffmpegLocationArg = '--ffmpeg-location ' . escapeshellarg($ffmpegPath);
+            }
+        }
+
+        $audioTemplate = $tmpDir . DIRECTORY_SEPARATOR . 'audio_%(id)s.%(ext)s';
+        $downloadAudioCmd = sprintf(
+            '%s -x --audio-format mp3 --audio-quality 64K --no-playlist --no-part %s -o %s %s 2>&1',
+            $ytDlpPath,
+            $ffmpegLocationArg,
+            '"' . $audioTemplate . '"',
+            escapeshellarg($videoUrl)
+        );
+
+        $downloadOut = [];
+        $downloadCode = 0;
+        exec($downloadAudioCmd, $downloadOut, $downloadCode);
+        if ($downloadCode !== 0) {
+            \Log::warning('Bilibili audio fallback download failed', [
+                'video_url' => $videoUrl,
+                'tail' => array_slice($downloadOut, -5),
+            ]);
+            return ['language' => 'unknown', 'transcript' => []];
+        }
+
+        $audioFiles = glob($tmpDir . DIRECTORY_SEPARATOR . 'audio_*.*') ?: [];
+        if (empty($audioFiles)) {
+            return ['language' => 'unknown', 'transcript' => []];
+        }
+
+        usort($audioFiles, function ($a, $b) {
+            return filesize($b) <=> filesize($a);
+        });
+        $sourceAudio = $audioFiles[0];
+
+        $ffmpegPath = config('services.ffmpeg.path', env('FFMPEG_PATH', 'ffmpeg'));
+        $preparedAudio = $tmpDir . DIRECTORY_SEPARATOR . 'whisper_input.mp3';
+        $prepareCmd = sprintf(
+            '%s -y -i %s -vn -ac 1 -ar 16000 -b:a 24k %s 2>&1',
+            escapeshellarg($ffmpegPath),
+            escapeshellarg($sourceAudio),
+            escapeshellarg($preparedAudio)
+        );
+        exec($prepareCmd, $prepareOut, $prepareCode);
+
+        $audioForWhisper = ($prepareCode === 0 && file_exists($preparedAudio)) ? $preparedAudio : $sourceAudio;
+
+        // OpenAI whisper-1 upload limit is about 25MB.
+        if (!file_exists($audioForWhisper) || filesize($audioForWhisper) > (24 * 1024 * 1024)) {
+            \Log::warning('Bilibili audio fallback too large for Whisper', [
+                'file' => $audioForWhisper,
+                'size' => @filesize($audioForWhisper),
+            ]);
+            return ['language' => 'unknown', 'transcript' => []];
+        }
+
+        try {
+            $client = new \GuzzleHttp\Client();
+            $response = $client->post('https://api.openai.com/v1/audio/transcriptions', [
+                'headers' => [
+                    'Authorization' => 'Bearer ' . $apiKey,
+                ],
+                'multipart' => [
+                    ['name' => 'file', 'contents' => fopen($audioForWhisper, 'r'), 'filename' => basename($audioForWhisper)],
+                    ['name' => 'model', 'contents' => 'whisper-1'],
+                    ['name' => 'response_format', 'contents' => 'verbose_json'],
+                    ['name' => 'timestamp_granularities[]', 'contents' => 'segment'],
+                ],
+                'timeout' => 600,
+            ]);
+
+            $result = json_decode($response->getBody()->getContents(), true);
+            $segments = $result['segments'] ?? [];
+            $language = (string) ($result['language'] ?? 'unknown');
+
+            $mapped = [];
+            foreach ($segments as $seg) {
+                $text = trim((string) ($seg['text'] ?? ''));
+                if ($text === '') {
+                    continue;
+                }
+                $start = (float) ($seg['start'] ?? 0);
+                $end = (float) ($seg['end'] ?? $start + 0.1);
+                $mapped[] = [
+                    'text' => $text,
+                    'start' => round($start, 3),
+                    'duration' => round(max(0.1, $end - $start), 3),
+                ];
+            }
+
+            return [
+                'language' => str_starts_with($language, 'vi') ? 'vi' : (str_starts_with($language, 'zh') ? 'zh' : $language),
+                'transcript' => $mapped,
+            ];
+        } catch (\Throwable $e) {
+            \Log::warning('Bilibili audio fallback transcription failed', [
+                'error' => $e->getMessage(),
+            ]);
+            return ['language' => 'unknown', 'transcript' => []];
+        }
+    }
+
+    private function pickBestBilibiliSubtitleFile(array $files): array
+    {
+        $priorities = [
+            'vi' => ['.vi.', '.vi-'],
+            'zh' => ['.zh-Hans.', '.zh-CN.', '.zh-TW.', '.zh.', '.zh-'],
+            'en' => ['.en.', '.en-'],
+        ];
+
+        foreach ($priorities as $lang => $needles) {
+            foreach ($files as $file) {
+                $name = basename($file);
+                foreach ($needles as $needle) {
+                    if (stripos($name, $needle) !== false) {
+                        return ['path' => $file, 'language' => $lang];
+                    }
+                }
+            }
+        }
+
+        return ['path' => $files[0], 'language' => 'unknown'];
+    }
+
+    private function parseVttTranscript(string $filePath): array
+    {
+        $content = @file_get_contents($filePath);
+        if ($content === false) {
+            return [];
+        }
+
+        $lines = preg_split('/\R/u', $content) ?: [];
+        $entries = [];
+        $currentStart = null;
+        $currentEnd = null;
+        $buffer = [];
+
+        foreach ($lines as $lineRaw) {
+            $line = trim($lineRaw);
+
+            if ($line === '' || strtoupper($line) === 'WEBVTT' || str_starts_with(strtoupper($line), 'NOTE')) {
+                if ($currentStart !== null && !empty($buffer)) {
+                    $text = trim(html_entity_decode(strip_tags(implode(' ', $buffer)), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+                    if ($text !== '') {
+                        $duration = max(0.1, $currentEnd - $currentStart);
+                        $entries[] = [
+                            'text' => $text,
+                            'start' => round($currentStart, 3),
+                            'duration' => round($duration, 3),
+                        ];
+                    }
+                }
+
+                $currentStart = null;
+                $currentEnd = null;
+                $buffer = [];
+                continue;
+            }
+
+            if (preg_match('/^([0-9:.]+)\s+-->\s+([0-9:.]+)/', $line, $m)) {
+                $currentStart = $this->vttTimeToSeconds($m[1]);
+                $currentEnd = $this->vttTimeToSeconds($m[2]);
+                $buffer = [];
+                continue;
+            }
+
+            if ($currentStart !== null) {
+                $buffer[] = preg_replace('/<[^>]+>/', '', $line);
+            }
+        }
+
+        // Deduplicate consecutive identical lines.
+        $deduped = [];
+        $lastText = null;
+        foreach ($entries as $entry) {
+            if ($entry['text'] === $lastText) {
+                continue;
+            }
+            $deduped[] = $entry;
+            $lastText = $entry['text'];
+        }
+
+        return $deduped;
+    }
+
+    private function vttTimeToSeconds(string $time): float
+    {
+        $time = str_replace(',', '.', $time);
+        $parts = explode(':', $time);
+        if (count($parts) === 3) {
+            return ((float) $parts[0]) * 3600 + ((float) $parts[1]) * 60 + (float) $parts[2];
+        }
+        if (count($parts) === 2) {
+            return ((float) $parts[0]) * 60 + (float) $parts[1];
+        }
+        return (float) $time;
+    }
+
+    private function cleanupDirectory(string $dir): void
+    {
+        if (!is_dir($dir)) {
+            return;
+        }
+
+        foreach (glob($dir . DIRECTORY_SEPARATOR . '*') ?: [] as $file) {
+            if (is_file($file)) {
+                @unlink($file);
+            }
+        }
+
+        @rmdir($dir);
+    }
+
+    private function isLikelyVietnameseTranscript(array $segments): bool
+    {
+        if (empty($segments)) {
+            return false;
+        }
+
+        $sample = array_slice($segments, 0, min(8, count($segments)));
+        $viCount = 0;
+
+        foreach ($sample as $seg) {
+            $text = trim((string) ($seg['text'] ?? ''));
+            if ($text === '') {
+                continue;
+            }
+
+            if (preg_match('/[\p{Han}\p{Hiragana}\p{Katakana}\p{Hangul}]/u', $text) === 1) {
+                continue;
+            }
+
+            if (preg_match('/[ăâêôơưđáàảãạắằẳẵặấầẩẫậéèẻẽẹếềểễệóòỏõọốồổỗộớờởỡợúùủũụứừửữựíìỉĩịýỳỷỹỵ]/iu', $text) === 1
+                || preg_match('/\b(khong|cua|nhung|duoc|trong|mot|voi|la)\b/iu', $text) === 1) {
+                $viCount++;
+            }
+        }
+
+        return $viCount >= max(1, (int) floor(count($sample) * 0.4));
+    }
+
+    private function resolveVietnameseTitleForUpdate(string $existingTitleVi, string $candidateTitleVi): string
+    {
+        $existing = trim($existingTitleVi);
+        $candidate = trim($candidateTitleVi);
+
+        if ($candidate === '') {
+            return $existing;
+        }
+
+        // Reject CJK-heavy strings for VI title to avoid accidental overwrite with source title.
+        if (preg_match('/[\p{Han}\p{Hiragana}\p{Katakana}\p{Hangul}]/u', $candidate) === 1) {
+            return $existing;
+        }
+
+        // Accept when candidate looks Vietnamese.
+        if (preg_match('/[ăâêôơưđáàảãạắằẳẵặấầẩẫậéèẻẽẹếềểễệóòỏõọốồổỗộớờởỡợúùủũụứừửữựíìỉĩịýỳỷỹỵ]/iu', $candidate) === 1
+            || preg_match('/\b(khong|cua|nhung|duoc|trong|mot|voi|la|ban|toi)\b/iu', $candidate) === 1) {
+            return $candidate;
+        }
+
+        return $existing;
+    }
+
+    /**
      * Fetch YouTube channel videos via Google API
      */
     public function fetchChannelVideos(Request $request)
@@ -253,6 +739,14 @@ class DubSyncController extends Controller
             'max_results' => 'nullable|integer|min:1|max:50',
         ]);
 
+        $channelUrl = $request->input('channel_url');
+        $maxResults = (int) $request->input('max_results', 20);
+        $maxResults = max(1, min(50, $maxResults));
+
+        if ($this->isBilibiliSpaceUrl($channelUrl)) {
+            return $this->fetchBilibiliSpaceVideos($channelUrl, $maxResults);
+        }
+
         $apiKey = config('services.youtube.api_key');
         if (!$apiKey) {
             return response()->json([
@@ -260,8 +754,6 @@ class DubSyncController extends Controller
                 'error' => 'Missing YOUTUBE_API_KEY in .env'
             ], 500);
         }
-
-        $channelUrl = $request->input('channel_url');
 
         $handle = null;
         $channelId = null;
@@ -322,9 +814,6 @@ class DubSyncController extends Controller
             ], 500);
         }
 
-        $maxResults = (int) $request->input('max_results', 20);
-        $maxResults = max(1, min(50, $maxResults));
-
         $playlistResponse = Http::get('https://www.googleapis.com/youtube/v3/playlistItems', [
             'part' => 'snippet,contentDetails',
             'playlistId' => $uploadsPlaylistId,
@@ -369,6 +858,166 @@ class DubSyncController extends Controller
             ],
             'videos' => $videos,
         ]);
+    }
+
+    private function isBilibiliSpaceUrl(string $channelUrl): bool
+    {
+        return preg_match('/space\.bilibili\.com\/\d+/i', $channelUrl) === 1;
+    }
+
+    private function extractBilibiliMid(string $channelUrl): ?string
+    {
+        if (preg_match('/space\.bilibili\.com\/(\d+)/i', $channelUrl, $matches)) {
+            return $matches[1];
+        }
+
+        return null;
+    }
+
+    private function normalizeBilibiliImageUrl(?string $url): ?string
+    {
+        if (!$url) {
+            return null;
+        }
+
+        if (str_starts_with($url, '//')) {
+            return 'https:' . $url;
+        }
+
+        if (str_starts_with($url, 'http://')) {
+            return 'https://' . substr($url, 7);
+        }
+
+        return $url;
+    }
+
+    private function fetchBilibiliSpaceVideos(string $channelUrl, int $maxResults)
+    {
+        $mid = $this->extractBilibiliMid($channelUrl);
+        if (!$mid) {
+            return response()->json([
+                'success' => false,
+                'error' => 'Bilibili URL không hợp lệ. Ví dụ: https://space.bilibili.com/123456'
+            ], 422);
+        }
+
+        $baseHeaders = [
+            'User-Agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            'Referer'    => 'https://space.bilibili.com/',
+            'Origin'     => 'https://space.bilibili.com',
+        ];
+        $sessdata = env('BILIBILI_SESSDATA', '');
+        if ($sessdata !== '') {
+            $baseHeaders['Cookie'] = 'SESSDATA=' . $sessdata;
+        }
+
+        try {
+            // Fetch channel info and video list in parallel.
+            [$infoResponse, $listResponse] = \Illuminate\Support\Facades\Http::pool(fn ($pool) => [
+                $pool->withHeaders($baseHeaders)->timeout(10)
+                    ->get('https://api.bilibili.com/x/space/acc/info', ['mid' => $mid, 'jsonp' => 'jsonp']),
+                $pool->withHeaders($baseHeaders)->timeout(15)
+                    ->get('https://api.bilibili.com/x/space/arc/search', [
+                        'mid'   => $mid,
+                        'ps'    => min($maxResults, 50),
+                        'pn'    => 1,
+                        'order' => 'pubdate',
+                        'jsonp' => 'jsonp',
+                    ]),
+            ]);
+
+            // Parse channel info.
+            $channelName = null;
+            $channelAvatar = null;
+            if ($infoResponse->ok()) {
+                $infoJson = $infoResponse->json();
+                if (($infoJson['code'] ?? -1) === 0) {
+                    $channelName   = data_get($infoJson, 'data.name');
+                    $channelAvatar = $this->normalizeBilibiliImageUrl(data_get($infoJson, 'data.face'));
+                }
+            }
+
+            // Parse video list.
+            if (!$listResponse->ok()) {
+                return response()->json(['success' => false, 'error' => 'Không thể lấy danh sách video từ Bilibili.'], 502);
+            }
+
+            $listJson = $listResponse->json();
+            if (($listJson['code'] ?? -1) !== 0) {
+                return response()->json([
+                    'success' => false,
+                    'error'   => $listJson['message'] ?? 'Bilibili từ chối yêu cầu (có thể do anti-crawler).',
+                ], 422);
+            }
+
+            $rawVideos = data_get($listJson, 'data.list.vlist', []);
+            $videos = collect($rawVideos)
+                ->map(function ($item) {
+                    $bvid        = data_get($item, 'bvid');
+                    $publishedTs = (int) (data_get($item, 'created') ?? 0);
+                    return [
+                        'video_id'     => $bvid ? ('bili:' . $bvid) : null,
+                        'title'        => data_get($item, 'title'),
+                        'thumbnail'    => $this->normalizeBilibiliImageUrl(data_get($item, 'pic')),
+                        'video_url'    => $bvid ? "https://www.bilibili.com/video/{$bvid}" : null,
+                        'published_at' => $publishedTs > 0 ? date('c', $publishedTs) : null,
+                    ];
+                })
+                ->filter(fn($v) => !empty($v['video_id']))
+                ->values();
+
+            // If maxResults exceeds one page (50), fetch remaining pages.
+            $total = (int) data_get($listJson, 'data.page.count', 0);
+            if ($maxResults > 50 && $total > 50) {
+                $page = 2;
+                while ($videos->count() < $maxResults) {
+                    $nextResponse = Http::withHeaders($baseHeaders)->timeout(15)
+                        ->get('https://api.bilibili.com/x/space/arc/search', [
+                            'mid'   => $mid,
+                            'ps'    => 50,
+                            'pn'    => $page,
+                            'order' => 'pubdate',
+                            'jsonp' => 'jsonp',
+                        ]);
+                    if (!$nextResponse->ok()) break;
+                    $nextJson = $nextResponse->json();
+                    if (($nextJson['code'] ?? -1) !== 0) break;
+                    $moreRaw = data_get($nextJson, 'data.list.vlist', []);
+                    if (empty($moreRaw)) break;
+                    $moreVideos = collect($moreRaw)->map(function ($item) {
+                        $bvid        = data_get($item, 'bvid');
+                        $publishedTs = (int) (data_get($item, 'created') ?? 0);
+                        return [
+                            'video_id'     => $bvid ? ('bili:' . $bvid) : null,
+                            'title'        => data_get($item, 'title'),
+                            'thumbnail'    => $this->normalizeBilibiliImageUrl(data_get($item, 'pic')),
+                            'video_url'    => $bvid ? "https://www.bilibili.com/video/{$bvid}" : null,
+                            'published_at' => $publishedTs > 0 ? date('c', $publishedTs) : null,
+                        ];
+                    })->filter(fn($v) => !empty($v['video_id']));
+                    $videos = $videos->merge($moreVideos);
+                    $page++;
+                }
+            }
+
+            $videos = $videos->take($maxResults)->values();
+
+            return response()->json([
+                'success' => true,
+                'channel' => [
+                    'id'          => 'bilibili:' . $mid,
+                    'title'       => $channelName ?: ('Bilibili Space ' . $mid),
+                    'description' => null,
+                    'thumbnail'   => $channelAvatar,
+                ],
+                'videos' => $videos,
+            ]);
+        } catch (\Throwable $e) {
+            return response()->json([
+                'success' => false,
+                'error' => 'Lỗi khi lấy dữ liệu Bilibili: ' . $e->getMessage()
+            ], 500);
+        }
     }
 
     /**
@@ -442,21 +1091,25 @@ class DubSyncController extends Controller
     {
         $request->validate([
             'segments' => 'required|array',
-            'provider' => 'nullable|in:openai,google'
+            'provider' => 'nullable|in:openai,google,gemini',
+            'style' => 'nullable|in:default,humorous'
         ]);
 
         try {
             $project = DubSyncProject::findOrFail($projectId);
             $segments = $request->segments;
             $provider = $request->provider ?? env('TRANSLATION_PROVIDER', 'google');
+            $style = $request->style ?? 'default';
 
-            // Merge segments into complete sentences for better translation quality
-            $segmentationService = new \App\Services\TranscriptSegmentationService();
-            $mergedSegments = $segmentationService->mergeSegmentsIntoSentences($segments);
-
-            // Step 4: Translate to Vietnamese
             $translationService = new \App\Services\TranslationService($provider);
-            $translatedSegments = $translationService->translateSegments($mergedSegments);
+
+            if ($provider === 'gemini') {
+                // Context-aware translation: Gemini reads entire article then translates each segment coherent.
+                $translatedSegments = $translationService->translateSegmentsWithGemini($segments, (int) $projectId, $style);
+            } else {
+                // Legacy per-segment translation.
+                $translatedSegments = $translationService->translateSegments($segments, null, (int) $projectId, 'auto', $style);
+            }
 
             $translatedFullTranscript = collect($translatedSegments)
                 ->map(fn($segment) => data_get($segment, 'text', ''))
@@ -470,12 +1123,14 @@ class DubSyncController extends Controller
                 'translation_provider' => $provider
             ];
 
+            // Translate title and description: use Gemini for single text or fallback to google.
+            $titleDescProvider = $provider === 'gemini' ? 'google' : $provider;
             if (!empty($project->youtube_title)) {
-                $updateData['youtube_title_vi'] = $translationService->translateText($project->youtube_title, 'en', 'vi', $provider);
+                $updateData['youtube_title_vi'] = $translationService->translateText($project->youtube_title, 'en', 'vi', $titleDescProvider);
             }
 
             if (!empty($project->youtube_description)) {
-                $updateData['youtube_description_vi'] = $translationService->translateText($project->youtube_description, 'en', 'vi', $provider);
+                $updateData['youtube_description_vi'] = $translationService->translateText($project->youtube_description, 'en', 'vi', $titleDescProvider);
             }
 
             $project->update($updateData);
@@ -532,7 +1187,7 @@ class DubSyncController extends Controller
         $request->validate([
             'segments' => 'required_without:translated_segments|array',
             'translated_segments' => 'required_without:segments|array',
-            'tts_provider' => 'nullable|in:google,openai,gemini',
+            'tts_provider' => 'nullable|in:google,openai,gemini,microsoft,vbee',
             'audio_mode' => 'nullable|in:single,multi',
             'speakers_config' => 'nullable|array',
             'style_instruction' => 'nullable|string'
@@ -779,10 +1434,43 @@ class DubSyncController extends Controller
     {
         try {
             $project = DubSyncProject::findOrFail($projectId);
-            $alignedSegments = $project->aligned_segments;
+
+            // Use aligned_segments if available, otherwise fall back to audio_segments
+            $segments = $project->aligned_segments;
+
+            if (empty($segments)) {
+                $segments = $project->audio_segments;
+            }
+
+            if (empty($segments)) {
+                // Last resort: check segments array for audio_path entries
+                $allSegments = $project->segments ?? [];
+                $segments = array_filter($allSegments, function ($seg) {
+                    return !empty($seg['audio_path']);
+                });
+            }
+
+            if (empty($segments)) {
+                return response()->json(['error' => 'Không có audio segments nào để merge. Vui lòng tạo TTS trước.'], 400);
+            }
+
+            $mergeMode = $request->input('merge_mode', 'timeline'); // 'timeline' | 'sequential'
+
+            \Log::info("MergeAudio: Starting merge for project {$projectId}", [
+                'source'     => !empty($project->aligned_segments) ? 'aligned_segments' : (!empty($project->audio_segments) ? 'audio_segments' : 'segments'),
+                'count'      => count($segments),
+                'merge_mode' => $mergeMode,
+            ]);
+
+            $mergeService = app('App\Services\AudioMergeService');
 
             // Step 7: Merge audio according to timeline
-            $finalAudioPath = app('App\Services\AudioMergeService')->mergeSegments($alignedSegments, $projectId);
+            if ($mergeMode === 'sequential') {
+                $finalAudioPath = $mergeService->mergeSegments(array_values($segments), $projectId);
+            } else {
+                // Default: place each segment at its exact original start_time
+                $finalAudioPath = $mergeService->mergeByTimeline(array_values($segments), $projectId);
+            }
 
             $project->update([
                 'final_audio_path' => $finalAudioPath,
@@ -791,11 +1479,33 @@ class DubSyncController extends Controller
 
             return response()->json([
                 'success' => true,
-                'audio_path' => $finalAudioPath
+                'audio_path' => $finalAudioPath,
+                'message' => 'Đã merge ' . count($segments) . ' segments theo đúng timeline thành công!'
             ]);
         } catch (\Exception $e) {
+            \Log::error("MergeAudio error: " . $e->getMessage());
             return response()->json(['error' => $e->getMessage()], 500);
         }
+    }
+
+    /**
+     * Manually change project status
+     */
+    public function changeStatus(Request $request, $projectId)
+    {
+        $allowed = ['new', 'source_downloaded', 'transcribed', 'translated', 'tts_generated', 'aligned', 'merged', 'completed', 'error'];
+
+        $request->validate([
+            'status' => 'required|in:' . implode(',', $allowed),
+        ]);
+
+        $project = DubSyncProject::findOrFail($projectId);
+        $old = $project->status;
+        $project->update(['status' => $request->status]);
+
+        \Log::info("changeStatus: project {$projectId} {$old} => {$request->status}");
+
+        return response()->json(['success' => true, 'old' => $old, 'new' => $request->status]);
     }
 
     /**
@@ -936,7 +1646,7 @@ class DubSyncController extends Controller
     public function updateTtsProvider(Request $request, $projectId)
     {
         $request->validate([
-            'tts_provider' => 'required|in:google,openai,gemini'
+            'tts_provider' => 'required|in:google,openai,gemini,microsoft,vbee'
         ]);
 
         try {
@@ -996,6 +1706,32 @@ class DubSyncController extends Controller
             return response()->json([
                 'success' => true,
                 'speakers_config' => $project->speakers_config
+            ]);
+        } catch (\Exception $e) {
+            return response()->json(['error' => $e->getMessage()], 500);
+        }
+    }
+
+    /**
+     * Update Vietnamese title for a project
+     */
+    public function updateVietnameseTitle(Request $request, $projectId)
+    {
+        $request->validate([
+            'youtube_title_vi' => 'nullable|string|max:500'
+        ]);
+
+        try {
+            $project = DubSyncProject::findOrFail($projectId);
+            $titleVi = trim((string) $request->input('youtube_title_vi', ''));
+
+            $project->update([
+                'youtube_title_vi' => $titleVi !== '' ? $titleVi : null,
+            ]);
+
+            return response()->json([
+                'success' => true,
+                'youtube_title_vi' => $project->youtube_title_vi,
             ]);
         } catch (\Exception $e) {
             return response()->json(['error' => $e->getMessage()], 500);
@@ -1133,6 +1869,153 @@ class DubSyncController extends Controller
     }
 
     /**
+     * Get queue status: pending, running, failed jobs
+     */
+    public function queueStatus()
+    {
+        try {
+            // Progress cache key prefixes mapped by job class
+            $progressKeyMap = [
+                'GenerateBatchVideoJob' => 'batch_video_progress_',
+                'GenerateChapterTtsBatchJob' => 'tts_batch_progress_',
+                'GenerateThumbnailJob' => 'thumbnail_progress_',
+                'GenerateDescriptionAudioJob' => 'desc_audio_progress_',
+                'PublishYoutubeJob' => 'publish_progress_',
+                'BoostChapterAudioBatchJob' => 'boost_batch_progress_',
+                'GenerateBookReviewVideoJob' => 'review_video_progress_',
+                'GenerateReviewAssetsJob' => 'review_assets_progress_',
+                'GenerateDubSyncBatchTtsJob' => 'dubsync_tts_batch_progress_',
+                'DownloadSourceVideoJob' => 'source_video_download_progress_',
+            ];
+
+            $pending = \DB::table('jobs')
+                ->select('id', 'queue', 'payload', 'attempts', 'created_at', 'reserved_at')
+                ->orderBy('id')
+                ->limit(100)
+                ->get()
+                ->map(function ($job) use ($progressKeyMap) {
+                    $payload = json_decode($job->payload, true);
+                    $displayName = $payload['displayName'] ?? 'Unknown';
+                    $isRunning = $job->reserved_at !== null;
+                    $jobBaseName = class_basename($displayName);
+
+                    // Extract target ID from serialized command
+                    $targetId = null;
+                    $targetType = null;
+                    try {
+                        $command = unserialize($payload['data']['command'] ?? '');
+                        if (isset($command->audioBookId)) {
+                            $targetId = $command->audioBookId;
+                            $targetType = 'audiobook';
+                        } elseif (isset($command->projectId)) {
+                            $targetId = $command->projectId;
+                            $targetType = 'project';
+                        }
+                    } catch (\Throwable $e) {}
+
+                    // Get cached progress for running jobs
+                    $progress = null;
+                    if ($isRunning && $targetId && isset($progressKeyMap[$jobBaseName])) {
+                        $progress = \Cache::get($progressKeyMap[$jobBaseName] . $targetId);
+                    }
+
+                    return [
+                        'id' => $job->id,
+                        'job' => $jobBaseName,
+                        'full_class' => $displayName,
+                        'queue' => $job->queue,
+                        'attempts' => $job->attempts,
+                        'status' => $isRunning ? 'running' : 'pending',
+                        'target_id' => $targetId,
+                        'target_type' => $targetType,
+                        'progress' => $progress,
+                        'created_at' => $job->created_at ? date('H:i:s d/m', $job->created_at) : null,
+                        'reserved_at' => $job->reserved_at ? date('H:i:s d/m', $job->reserved_at) : null,
+                    ];
+                });
+
+            $failed = \DB::table('failed_jobs')
+                ->select('id', 'uuid', 'connection', 'queue', 'payload', 'exception', 'failed_at')
+                ->orderByDesc('id')
+                ->limit(20)
+                ->get()
+                ->map(function ($job) {
+                    $payload = json_decode($job->payload, true);
+                    $displayName = $payload['displayName'] ?? 'Unknown';
+                    return [
+                        'id' => $job->id,
+                        'uuid' => $job->uuid,
+                        'job' => class_basename($displayName),
+                        'full_class' => $displayName,
+                        'queue' => $job->queue,
+                        'error' => mb_substr((string) $job->exception, 0, 200),
+                        'failed_at' => $job->failed_at,
+                    ];
+                });
+
+            // Job history from DB
+            $history = \DB::table('job_histories')
+                ->orderByDesc('finished_at')
+                ->limit(50)
+                ->get()
+                ->map(function ($h) {
+                    return [
+                        'id' => $h->id,
+                        'job' => $h->job_name,
+                        'target_id' => $h->target_id,
+                        'target_type' => $h->target_type,
+                        'status' => $h->status,
+                        'duration_seconds' => $h->duration_seconds,
+                        'message' => $h->message,
+                        'started_at' => $h->started_at,
+                        'finished_at' => $h->finished_at,
+                    ];
+                });
+
+            $running = $pending->where('status', 'running')->values();
+            $waiting = $pending->where('status', 'pending')->values();
+
+            return response()->json([
+                'success' => true,
+                'summary' => [
+                    'running' => $running->count(),
+                    'pending' => $waiting->count(),
+                    'failed' => $failed->count(),
+                    'total' => $pending->count(),
+                ],
+                'running' => $running,
+                'pending' => $waiting,
+                'failed' => $failed,
+                'history' => $history,
+            ]);
+        } catch (\Exception $e) {
+            return response()->json(['success' => false, 'error' => $e->getMessage()], 500);
+        }
+    }
+
+    /**
+     * Clear all pending/failed jobs
+     */
+    public function queueClear()
+    {
+        try {
+            $pendingCount = \DB::table('jobs')->count();
+            $failedCount = \DB::table('failed_jobs')->count();
+
+            \DB::table('jobs')->delete();
+            \DB::table('failed_jobs')->delete();
+
+            return response()->json([
+                'success' => true,
+                'cleared_pending' => $pendingCount,
+                'cleared_failed' => $failedCount,
+            ]);
+        } catch (\Exception $e) {
+            return response()->json(['success' => false, 'error' => $e->getMessage()], 500);
+        }
+    }
+
+    /**
      * Show project details
      */
     public function show($projectId)
@@ -1198,16 +2081,19 @@ class DubSyncController extends Controller
                 $validated = $request->validate([
                     'segment_indices' => 'required|array',
                     'segment_indices.*' => 'integer',
+                    'segment_texts' => 'sometimes|array',
+                    'segment_texts.*' => 'nullable|string',
                     'voice_settings' => 'sometimes|array',
                     'voice_settings.*.voice_gender' => 'required_with:voice_settings|in:male,female',
                     'voice_settings.*.voice_name' => 'required_with:voice_settings|string',
                     'voice_gender' => 'sometimes|in:male,female',
                     'voice_name' => 'sometimes|string',
-                    'provider' => 'required|string|in:google,openai,gemini',
+                    'provider' => 'required|string|in:google,openai,gemini,microsoft,vbee',
                     'style_instruction' => 'nullable|string'
                 ]);
 
                 $voiceSettings = $validated['voice_settings'] ?? [];
+                $segmentTexts = $validated['segment_texts'] ?? [];
                 $fallbackGender = $validated['voice_gender'] ?? null;
                 $fallbackName = $validated['voice_name'] ?? null;
 
@@ -1222,6 +2108,37 @@ class DubSyncController extends Controller
                 if (isset($validated['style_instruction']) && !empty($validated['style_instruction'])) {
                     $project->style_instruction = $validated['style_instruction'];
                     $project->save();
+                }
+
+                // Default to async queue mode for bulk requests to avoid HTTP timeout.
+                if ($request->boolean('async', true)) {
+                    $this->initDubSyncTtsBatchProgress(
+                        (int) $projectId,
+                        count($validated['segment_indices']),
+                        'queued',
+                        'Da dua batch TTS vao queue. Dang cho worker xu ly...'
+                    );
+
+                    GenerateDubSyncBatchTtsJob::dispatch(
+                        (int) $projectId,
+                        $validated['segment_indices'],
+                        $segmentTexts,
+                        $voiceSettings,
+                        $fallbackGender,
+                        $fallbackName,
+                        $validated['provider'],
+                        $validated['style_instruction'] ?? null
+                    );
+
+                    $this->ensureQueueWorkerRunning();
+
+                    return response()->json([
+                        'success' => true,
+                        'queued' => true,
+                        'status' => 'queued',
+                        'message' => 'Batch TTS da vao queue, vui long doi tien trinh realtime.',
+                        'total' => count($validated['segment_indices']),
+                    ]);
                 }
 
                 $ttsService = app(\App\Services\TTSService::class);
@@ -1250,7 +2167,10 @@ class DubSyncController extends Controller
                         }
 
                         $segment = $segments[$segmentIndex];
-                        $text = $segment['text'] ?? '';
+                        $textFromRequest = $segmentTexts[$segmentIndex] ?? null;
+                        $text = is_string($textFromRequest) && trim($textFromRequest) !== ''
+                            ? $textFromRequest
+                            : ($segment['text'] ?? '');
 
                         // Prepend style instruction if provided
                         $styleInstruction = $validated['style_instruction'] ?? '';
@@ -1348,7 +2268,7 @@ class DubSyncController extends Controller
                     'text' => 'required|string',
                     'voice_gender' => 'required|string',
                     'voice_name' => 'required|string',
-                    'provider' => 'required|string|in:google,openai,gemini',
+                    'provider' => 'required|string|in:google,openai,gemini,microsoft,vbee',
                     'style_instruction' => 'nullable|string'
                 ]);
 
@@ -1404,6 +2324,49 @@ class DubSyncController extends Controller
                 'error' => $e->getMessage()
             ], 500);
         }
+    }
+
+    public function getSegmentTtsBatchProgress($projectId)
+    {
+        $projectId = (int) $projectId;
+        $progress = Cache::get($this->getDubSyncTtsBatchProgressKey($projectId));
+
+        if (!$progress) {
+            return response()->json([
+                'success' => true,
+                'status' => 'idle',
+                'percent' => 0,
+                'message' => 'Chua co tien trinh batch TTS.',
+                'project_id' => $projectId,
+            ]);
+        }
+
+        return response()->json(array_merge([
+            'success' => true,
+        ], $progress));
+    }
+
+    private function getDubSyncTtsBatchProgressKey(int $projectId): string
+    {
+        return "dubsync_tts_batch_progress_{$projectId}";
+    }
+
+    private function initDubSyncTtsBatchProgress(int $projectId, int $total, string $status, string $message): void
+    {
+        Cache::put($this->getDubSyncTtsBatchProgressKey($projectId), [
+            'status' => $status,
+            'percent' => 1,
+            'message' => $message,
+            'project_id' => $projectId,
+            'current_segment_index' => null,
+            'processed' => 0,
+            'total' => max(0, $total),
+            'success_count' => 0,
+            'failed_count' => 0,
+            'errors' => [],
+            'segments_data' => [],
+            'updated_at' => now()->toIso8601String(),
+        ], now()->addHours(6));
     }
 
     /**
@@ -1850,6 +2813,218 @@ class DubSyncController extends Controller
     }
 
     /**
+     * Rewrite translated full transcript with Gemini to be clearer for narration.
+     */
+    public function rewriteFullTranscript(Request $request, $projectId)
+    {
+        $request->validate([
+            'translated_full_transcript' => 'required|string',
+        ]);
+
+        try {
+            $project = DubSyncProject::findOrFail($projectId);
+
+            $rawText = trim((string) $request->input('translated_full_transcript', ''));
+            if ($rawText === '') {
+                return response()->json([
+                    'success' => false,
+                    'error' => 'No translated transcript text provided'
+                ], 422);
+            }
+
+            $apiKey = env('GEMINI_API_KEY');
+            $configuredModel = trim((string) env('GEMINI_MODEL', 'gemini-2.0-flash'));
+
+            if (!$apiKey) {
+                return response()->json([
+                    'success' => false,
+                    'error' => 'GEMINI_API_KEY not configured'
+                ], 500);
+            }
+
+            $prompt = $this->buildGeminiRewritePrompt($rawText);
+
+            $modelCandidates = array_values(array_unique(array_filter([
+                ltrim($configuredModel, ' /'),
+                'gemini-2.0-flash',
+                'gemini-1.5-flash',
+            ])));
+
+            $response = null;
+            $model = null;
+            foreach ($modelCandidates as $candidateModel) {
+                $candidateResponse = Http::timeout(90)->post(
+                    "https://generativelanguage.googleapis.com/v1beta/models/{$candidateModel}:generateContent?key={$apiKey}",
+                    [
+                        'contents' => [
+                            [
+                                'role' => 'user',
+                                'parts' => [
+                                    ['text' => $prompt],
+                                ],
+                            ],
+                        ],
+                        'generationConfig' => [
+                            'temperature' => 0.5,
+                            'maxOutputTokens' => 8192,
+                        ],
+                    ]
+                );
+
+                // If model not found, try next fallback model.
+                if ($candidateResponse->status() === 404) {
+                    continue;
+                }
+
+                $response = $candidateResponse;
+                $model = $candidateModel;
+                break;
+            }
+
+            if (!$response || !$response->successful()) {
+                $statusCode = $response ? $response->status() : 404;
+                $responseBody = $response ? (string) $response->body() : 'No successful Gemini model available';
+
+                ApiUsageService::logFailure(
+                    'Gemini',
+                    'rewrite_full_transcript',
+                    'HTTP ' . $statusCode . ': ' . substr($responseBody, 0, 300),
+                    (int) $projectId,
+                    ['model' => $configuredModel, 'input_characters' => mb_strlen($rawText, 'UTF-8')]
+                );
+
+                return response()->json([
+                    'success' => false,
+                    'error' => 'Gemini API Error: ' . $statusCode
+                ], 500);
+            }
+
+            $data = $response->json();
+            $rewritten = (string) ($data['candidates'][0]['content']['parts'][0]['text'] ?? '');
+            $rewritten = trim($rewritten);
+
+            // Remove markdown fences if model wraps output in ``` blocks.
+            $rewritten = preg_replace('/^```(?:text|markdown)?\s*/i', '', $rewritten) ?? $rewritten;
+            $rewritten = preg_replace('/\s*```$/', '', $rewritten) ?? $rewritten;
+            $rewritten = trim($rewritten);
+            $rewritten = $this->sanitizeRewrittenFullTranscript($rewritten);
+
+            if ($rewritten === '') {
+                ApiUsageService::logFailure(
+                    'Gemini',
+                    'rewrite_full_transcript',
+                    'Empty rewrite content returned by Gemini',
+                    (int) $projectId,
+                    ['model' => $model, 'input_characters' => mb_strlen($rawText, 'UTF-8')]
+                );
+
+                return response()->json([
+                    'success' => false,
+                    'error' => 'Gemini returned empty content'
+                ], 500);
+            }
+
+            $project->update([
+                'translated_full_transcript' => $rewritten,
+            ]);
+
+            ApiUsageService::log([
+                'api_type' => 'Gemini',
+                'api_endpoint' => "https://generativelanguage.googleapis.com/v1beta/models/{$model}:generateContent",
+                'purpose' => 'rewrite_full_transcript',
+                'project_id' => (int) $projectId,
+                'characters_used' => mb_strlen($rawText, 'UTF-8'),
+                'description' => "Model: {$model}",
+                'estimated_cost' => 0,
+            ]);
+
+            return response()->json([
+                'success' => true,
+                'rewritten_transcript' => $rewritten,
+            ]);
+        } catch (\Exception $e) {
+            \Log::error('Rewrite full transcript error', [
+                'project_id' => $projectId,
+                'error' => $e->getMessage(),
+            ]);
+
+            ApiUsageService::logFailure(
+                'Gemini',
+                'rewrite_full_transcript',
+                $e->getMessage(),
+                (int) $projectId
+            );
+
+            return response()->json([
+                'success' => false,
+                'error' => $e->getMessage(),
+            ], 500);
+        }
+    }
+
+    private function buildGeminiRewritePrompt(string $rawText): string
+    {
+        return <<<PROMPT
+Vai trò: "Bạn là một người viết kịch bản (Scriptwriter) chuyên nghiệp cho các kênh Podcast hoặc YouTube kiến thức như 'Người Nổi Tiếng' hay 'Kiến Thức Thú Vị'. Nhiệm vụ của bạn là chuyển thể một bản dịch thô thành một kịch bản nói để dùng cho AI Voice (TTS)."
+
+Yêu cầu về định dạng TTS:
+
+Ngôn ngữ nói (Spoken Language): Sử dụng từ ngữ bình dân, tự nhiên như đang trò chuyện trực tiếp với khán giả. Tuyệt đối tránh các từ quá học thuật hoặc cấu trúc câu dài dòng, lắt léo.
+
+Ngắt nghỉ tự nhiên: Sử dụng câu ngắn. Những câu dài phải có dấu phẩy ở các điểm nghỉ hợp lý để AI không bị hụt hơi khi đọc.
+
+Xử lý ký tự đặc biệt: - Không dùng các ký hiệu lạ, không lạm dụng dấu ngoặc đơn ().
+
+Nếu có từ tiếng Anh (như Hacker, Zoom, Schwarzenegger), hãy cân nhắc viết phiên âm hoặc dùng từ tiếng Việt tương đương nếu cần.
+
+Các con số hoặc đơn vị phải viết sao cho dễ đọc nhất.
+
+Cấu trúc kịch bản:
+
+Có lời chào mở đầu (Hook) thu hút.
+
+Có lời dẫn nối (Transition) giữa các đoạn để người nghe không thấy bị hẫng.
+
+Có lời kết thúc và kêu gọi hành động nhẹ nhàng.
+
+Nhiệm vụ cụ thể:
+"Hãy viết lại nội dung thô dưới đây thành một kịch bản hấp dẫn, làm rõ sự khác biệt giữa Lầm tưởng trên phim và Sự thật ngoài đời. Hãy viết theo phong cách kể chuyện, có chút hóm hỉnh và bất ngờ."
+
+Yêu cầu xuất kết quả:
+- Chỉ trả về nội dung kịch bản đã viết lại bằng tiếng Việt.
+- Không thêm tiêu đề phụ ngoài nội dung.
+- Không thêm markdown, không thêm dấu ```.
+- Tuyệt đối KHÔNG dùng câu: "Chào mừng các bạn đến với kênh podcast hôm nay!"
+- Không mở đầu bằng câu chào khuôn mẫu kiểu podcast/channel intro.
+
+Nội dung gốc cần xử lý:
+{$rawText}
+PROMPT;
+    }
+
+    private function sanitizeRewrittenFullTranscript(string $text): string
+    {
+        $cleaned = trim($text);
+
+        $exactPhrases = [
+            'Chào mừng các bạn đến với kênh podcast hôm nay!',
+            'Chào mừng các bạn đến với kênh podcast hôm nay',
+        ];
+
+        foreach ($exactPhrases as $phrase) {
+            $cleaned = str_ireplace($phrase, '', $cleaned);
+        }
+
+        // Remove common intro line variants if they still appear at the beginning.
+        $cleaned = preg_replace('/^\s*chào\s+mừng[^\n.!?]{0,160}(podcast|kênh|channel)[^\n.!?]{0,160}[.!?]?\s*/iu', '', $cleaned) ?? $cleaned;
+
+        // Normalize excessive leading newlines/spaces after cleanup.
+        $cleaned = preg_replace('/^\s+/', '', $cleaned) ?? $cleaned;
+
+        return trim($cleaned);
+    }
+
+    /**
      * Generate TTS audio for translated full transcript (chunked by 1000 words)
      */
     public function generateFullTranscriptTTS(Request $request, $projectId)
@@ -1875,8 +3050,13 @@ class DubSyncController extends Controller
             $voiceName = $request->input('voice_name');
             $styleInstruction = $request->input('style_instruction', $project->style_instruction ?? null);
 
-            $words = preg_split('/\s+/', $text, -1, PREG_SPLIT_NO_EMPTY);
-            $chunks = array_chunk($words, 1000);
+            if (strtolower((string) $provider) === 'vbee') {
+                // Keep each Vbee request well below provider-side text rejection threshold.
+                $chunks = $this->splitTextByCharacterLimit($text, 1500);
+            } else {
+                $words = preg_split('/\s+/', $text, -1, PREG_SPLIT_NO_EMPTY);
+                $chunks = array_chunk($words, 1000);
+            }
 
             $maxParts = (int) $request->input('max_parts', 0);
             if ($maxParts > 0) {
@@ -1892,7 +3072,14 @@ class DubSyncController extends Controller
             $partIndexOffset = (int) $request->input('part_index', 0);
 
             foreach ($chunks as $index => $chunkWords) {
-                $chunkText = implode(' ', $chunkWords);
+                $chunkText = is_array($chunkWords)
+                    ? implode(' ', $chunkWords)
+                    : trim((string) $chunkWords);
+
+                if ($chunkText === '') {
+                    continue;
+                }
+
                 $partIndex = $partIndexOffset > 0 ? $partIndexOffset + $index : $index + 1;
                 $audioPath = $ttsService->generateAudio(
                     $chunkText,
@@ -1917,7 +3104,7 @@ class DubSyncController extends Controller
                     'index' => $partIndex,
                     'path' => $finalPath,
                     'url' => Storage::url($finalPath),
-                    'word_count' => count($chunkWords)
+                    'word_count' => count(preg_split('/\s+/u', $chunkText, -1, PREG_SPLIT_NO_EMPTY) ?: [])
                 ];
             }
 
@@ -1981,6 +3168,40 @@ class DubSyncController extends Controller
                 'error' => $e->getMessage()
             ], 500);
         }
+    }
+
+    private function splitTextByCharacterLimit(string $text, int $maxChars): array
+    {
+        $text = trim($text);
+        if ($text === '') {
+            return [];
+        }
+
+        $words = preg_split('/\s+/u', $text, -1, PREG_SPLIT_NO_EMPTY) ?: [];
+        $chunks = [];
+        $currentWords = [];
+        $currentLength = 0;
+
+        foreach ($words as $word) {
+            $wordLength = mb_strlen($word, 'UTF-8');
+            $addition = $currentLength === 0 ? $wordLength : $wordLength + 1;
+
+            if (($currentLength + $addition) > $maxChars && !empty($currentWords)) {
+                $chunks[] = implode(' ', $currentWords);
+                $currentWords = [$word];
+                $currentLength = $wordLength;
+                continue;
+            }
+
+            $currentWords[] = $word;
+            $currentLength += $addition;
+        }
+
+        if (!empty($currentWords)) {
+            $chunks[] = implode(' ', $currentWords);
+        }
+
+        return $chunks;
     }
 
     /**
@@ -2805,115 +4026,392 @@ class DubSyncController extends Controller
         }
     }
 
-    public function downloadYoutubeVideo($projectId)
+    public function downloadYoutubeVideo(Request $request, $projectId)
     {
+        $projectId = (int) $projectId;
+
         try {
             $project = DubSyncProject::findOrFail($projectId);
 
-            if (!$project->video_id) {
-                return response()->json([
-                    'success' => false,
-                    'error' => 'Không tìm thấy video ID'
-                ], 400);
+            if (!$project->video_id && !$project->youtube_url) {
+                return response()->json(['success' => false, 'error' => 'Không tìm thấy thông tin video nguồn'], 400);
             }
 
-            \Log::info('Starting YouTube video download', [
-                'project_id' => $projectId,
-                'video_id' => $project->video_id
-            ]);
+            $source = $this->resolveDownloadSourceForProject($project);
+            if (!$source) {
+                return response()->json(['success' => false, 'error' => 'Nguồn video chưa được hỗ trợ.'], 422);
+            }
 
-            // Create video directory
+            // If a merged video already exists, return it immediately without queuing.
             $videoDir = Storage::path("public/projects/{$projectId}/video");
-            if (!file_exists($videoDir)) {
-                mkdir($videoDir, 0755, true);
+            if (is_dir($videoDir)) {
+                $existingFiles = $this->findMergedVideoFiles($videoDir);
+                if (!empty($existingFiles)) {
+                    $existingFile = $existingFiles[0];
+                    $filename     = basename($existingFile);
+
+                    $currentStatus = (string) ($project->status ?? '');
+                    $allowedToSetSourceDownloaded = in_array($currentStatus, ['', 'new', 'pending', 'error', 'source_downloaded'], true);
+                    if ($allowedToSetSourceDownloaded && $currentStatus !== 'source_downloaded') {
+                        $project->status = 'source_downloaded';
+                        $project->save();
+                    }
+
+                    $result       = [
+                        'success'  => true,
+                        'queued'   => false,
+                        'platform' => $source['platform'],
+                        'filename' => $filename,
+                        'path'     => "public/projects/{$projectId}/video/{$filename}",
+                        'url'      => Storage::url("public/projects/{$projectId}/video/{$filename}"),
+                        'size'     => filesize($existingFile),
+                    ];
+                    $this->setSourceDownloadProgress($projectId, 'completed', 100, 'Video đã tồn tại.', $result);
+                    return response()->json($result);
+                }
             }
 
-            // Check if video already exists
-            $existingFiles = glob("{$videoDir}/*.mp4");
-            if (!empty($existingFiles)) {
-                $existingFile = $existingFiles[0];
-                return response()->json([
-                    'success' => true,
-                    'message' => 'Video đã tồn tại',
-                    'filename' => basename($existingFile),
-                    'path' => "public/projects/{$projectId}/video/" . basename($existingFile),
-                    'url' => Storage::url("public/projects/{$projectId}/video/" . basename($existingFile))
-                ]);
+            // Reset progress and dispatch the job.
+            $this->setSourceDownloadProgress($projectId, 'processing', 3, 'Đang xếp hàng tải xuống...');
+            \App\Jobs\DownloadSourceVideoJob::dispatch($projectId, $source);
+            $this->ensureQueueWorkerRunning();
+
+            return response()->json(['success' => true, 'queued' => true]);
+        } catch (\Exception $e) {
+            \Log::error('downloadYoutubeVideo dispatch error', ['error' => $e->getMessage()]);
+            return response()->json(['success' => false, 'error' => $e->getMessage()], 500);
+        }
+    }
+
+    public function getDownloadYoutubeVideoProgress($projectId)
+    {
+        $projectId = (int) $projectId;
+        $progress = Cache::get($this->getSourceDownloadProgressKey($projectId), [
+            'status' => 'idle',
+            'percent' => 0,
+            'message' => 'Chua co tien trinh tai video.',
+            'updated_at' => now()->toIso8601String(),
+        ]);
+
+        return response()->json([
+            'success' => true,
+            'progress' => $progress,
+        ]);
+    }
+
+    public function generateThumbnail(Request $request, $projectId)
+    {
+        $request->validate([
+            'ratio' => 'required|in:16:9,9:16',
+            'style' => 'required|string|max:50',
+        ]);
+
+        try {
+            $project = DubSyncProject::findOrFail((int) $projectId);
+
+            $ratio = (string) $request->input('ratio', '16:9');
+            $style = trim((string) $request->input('style', 'cinematic'));
+            $styleMap = [
+                'cinematic' => 'cinematic lighting, dramatic depth, movie-like composition',
+                'dramatic' => 'high tension, strong contrast, dynamic perspective',
+                'minimal' => 'clean composition, minimalist modern design, high readability',
+                'news' => 'documentary/news visual tone, realistic details, editorial framing',
+                'bold' => 'bold colors, strong contrast, intense focal point, high click-through appeal',
+            ];
+            $styleDescriptor = $styleMap[$style] ?? $styleMap['cinematic'];
+
+            $title = trim((string) ($project->youtube_title_vi ?: $project->youtube_title ?: ''));
+
+            $transcriptSource = trim((string) ($project->translated_full_transcript ?: $project->full_transcript ?: ''));
+            if ($transcriptSource === '' && is_array($project->translated_segments)) {
+                $transcriptSource = collect($project->translated_segments)
+                    ->map(fn($seg) => trim((string) ($seg['text'] ?? '')))
+                    ->filter()
+                    ->take(12)
+                    ->implode("\n");
             }
 
-            // Download using yt-dlp or youtube-dl
-            $ytDlpPath = env('YTDLP_PATH', 'python -m yt_dlp');
-            $youtubeUrl = "https://www.youtube.com/watch?v={$project->video_id}";
-            $outputTemplate = "{$videoDir}/%(title)s.%(ext)s";
+            $transcriptSnippet = mb_substr($transcriptSource, 0, 1800, 'UTF-8');
+            if ($transcriptSnippet === '') {
+                $transcriptSnippet = 'A compelling educational story with surprising facts and clear contrast between myth and reality.';
+            }
 
-            // Build command - don't escape paths that contain yt-dlp special characters like %(...)s
-            $command = sprintf(
-                '%s -f "best[ext=mp4]" -o %s %s 2>&1',
-                $ytDlpPath,  // Don't escape - may contain spaces for "python -m yt_dlp"
-                '"' . $outputTemplate . '"',  // Quote but don't escape to preserve %(...)s
-                escapeshellarg($youtubeUrl)
-            );
+            $prompt = "Create a highly clickable YouTube thumbnail image with ratio {$ratio}.\n"
+                . "Style direction: {$styleDescriptor}.\n"
+                . "Core title/topic: {$title}.\n"
+                . "Use this content context to shape scene and hook: {$transcriptSnippet}\n\n"
+                . "Requirements:\n"
+                . "- Visual must communicate contrast between common belief and real truth\n"
+                . "- One dominant focal subject, strong visual storytelling, clear hierarchy\n"
+                . "- Use topic/title only as semantic guidance, never render written words from it\n"
+                . "- ABSOLUTELY NO TEXT in the image: no letters, no words, no numbers, no subtitles\n"
+                . "- No signboards, posters, UI labels, interface text, watermark, logo, or typographic symbols\n"
+                . "- If any text appears, treat output as invalid and regenerate a text-free version\n"
+                . "- Vibrant but tasteful colors, high detail, modern thumbnail aesthetics\n"
+                . "- Make it feel surprising and curiosity-driven";
 
-            \Log::info('Executing yt-dlp command', [
-                'command' => $command,
-                'video_id' => $project->video_id,
-                'output_dir' => $videoDir,
-                'output_template' => $outputTemplate
-            ]);
+            $filename = 'thumb_' . now()->format('Ymd_His') . '_' . bin2hex(random_bytes(3)) . '.png';
+            $relativePath = "projects/{$project->id}/thumbnails/{$filename}";
+            $absolutePath = Storage::path('public/' . $relativePath);
 
-            $output = [];
-            $returnCode = 0;
-            exec($command, $output, $returnCode);
+            /** @var GeminiImageService $imageService */
+            $imageService = app(GeminiImageService::class);
+            $result = $imageService->generateImage($prompt, $absolutePath, $ratio, 'gemini-nano-banana-pro');
 
-            if ($returnCode !== 0) {
-                \Log::error('YouTube download failed', [
-                    'return_code' => $returnCode,
-                    'output' => implode("\n", $output)
-                ]);
-
+            if (!($result['success'] ?? false)) {
                 return response()->json([
                     'success' => false,
-                    'error' => 'Không thể tải video từ YouTube. Vui lòng kiểm tra video ID hoặc cài đặt yt-dlp'
+                    'error' => $result['error'] ?? 'Không thể tạo thumbnail',
                 ], 500);
             }
 
-            // Find downloaded file
-            $downloadedFiles = glob("{$videoDir}/*.mp4");
-            if (empty($downloadedFiles)) {
-                \Log::error('No video file found after download', ['directory' => $videoDir]);
-                return response()->json([
-                    'success' => false,
-                    'error' => 'Không tìm thấy file video sau khi tải'
-                ], 500);
-            }
-
-            $videoFile = $downloadedFiles[0];
-            $filename = basename($videoFile);
-
-            \Log::info('YouTube video downloaded successfully', [
-                'project_id' => $projectId,
-                'filename' => $filename,
-                'file_size' => filesize($videoFile)
+            $url = Storage::url('public/' . $relativePath);
+            $project->update([
+                'youtube_thumbnail' => $url,
             ]);
 
             return response()->json([
                 'success' => true,
-                'message' => 'Tải video thành công',
-                'filename' => $filename,
-                'path' => "public/projects/{$projectId}/video/{$filename}",
-                'url' => Storage::url("public/projects/{$projectId}/video/{$filename}"),
-                'size' => filesize($videoFile)
+                'thumbnail_url' => $url,
+                'ratio' => $ratio,
+                'style' => $style,
             ]);
-        } catch (\Exception $e) {
-            \Log::error('Download YouTube video error', [
+        } catch (\Throwable $e) {
+            \Log::error('generateThumbnail error', [
+                'project_id' => $projectId,
                 'error' => $e->getMessage(),
-                'trace' => $e->getTraceAsString()
             ]);
 
             return response()->json([
                 'success' => false,
-                'error' => $e->getMessage()
+                'error' => $e->getMessage(),
             ], 500);
         }
+    }
+
+    private function getSourceDownloadProgressKey(int $projectId): string
+    {
+        return "source_video_download_progress_{$projectId}";
+    }
+
+    private function setSourceDownloadProgress(int $projectId, string $status, int $percent, string $message, array $extra = []): void
+    {
+        Cache::put($this->getSourceDownloadProgressKey($projectId), array_merge([
+            'status' => $status,
+            'percent' => max(0, min(100, $percent)),
+            'message' => $message,
+            'updated_at' => now()->toIso8601String(),
+        ], $extra), now()->addHours(2));
+    }
+
+    private function findMergedVideoFiles(string $videoDir): array
+    {
+        $files = glob("{$videoDir}/*.mp4") ?: [];
+
+        $merged = array_values(array_filter($files, function ($path) {
+            $name = basename($path);
+
+            // yt-dlp fragmented tracks are usually *.f12345.mp4 and may have no audio.
+            if (preg_match('/\.f\d+\.mp4$/i', $name)) {
+                return false;
+            }
+
+            return true;
+        }));
+
+        usort($merged, function ($a, $b) {
+            return filemtime($b) <=> filemtime($a);
+        });
+
+        return $merged;
+    }
+
+    private function cleanupStaleDownloadArtifacts(string $videoDir): void
+    {
+        $patterns = [
+            "{$videoDir}/*.part",
+            "{$videoDir}/*.ytdl",
+            "{$videoDir}/*.f*.mp4",
+            "{$videoDir}/*.f*.m4a",
+            "{$videoDir}/*.f*.webm",
+        ];
+
+        foreach ($patterns as $pattern) {
+            foreach (glob($pattern) ?: [] as $file) {
+                if (is_file($file)) {
+                    @unlink($file);
+                }
+            }
+        }
+    }
+
+    private function renameDownloadedVideoWithLocalizedTitle(DubSyncProject $project, string $videoFile, string $videoDir, string $platform): ?string
+    {
+        try {
+            $titleVi = trim((string) ($project->youtube_title_vi ?? ''));
+
+            if ($titleVi === '' && $platform === 'bilibili') {
+                $sourceTitle = trim((string) ($project->youtube_title ?? ''));
+                if ($sourceTitle !== '' && preg_match('/\p{Han}/u', $sourceTitle) === 1) {
+                    /** @var TranslationService $translator */
+                    $translator = app(TranslationService::class);
+                    $translated = trim((string) $translator->translateText($sourceTitle, 'zh-CN', 'vi', 'google'));
+                    if ($translated !== '') {
+                        $titleVi = $translated;
+                        $project->youtube_title_vi = $translated;
+                        $project->save();
+                    }
+                }
+            }
+
+            if ($titleVi === '') {
+                return null;
+            }
+
+            $safeBase = $this->sanitizeWindowsFilename($titleVi);
+            if ($safeBase === '') {
+                return null;
+            }
+
+            $ext = pathinfo($videoFile, PATHINFO_EXTENSION) ?: 'mp4';
+            $targetPath = $videoDir . DIRECTORY_SEPARATOR . $safeBase . '.' . $ext;
+            $suffix = 1;
+            while (file_exists($targetPath) && realpath($targetPath) !== realpath($videoFile)) {
+                $targetPath = $videoDir . DIRECTORY_SEPARATOR . $safeBase . ' (' . $suffix . ').' . $ext;
+                $suffix++;
+            }
+
+            if (realpath($targetPath) === realpath($videoFile)) {
+                return $videoFile;
+            }
+
+            if (@rename($videoFile, $targetPath)) {
+                return $targetPath;
+            }
+        } catch (\Throwable $e) {
+            \Log::warning('Rename downloaded source video failed', [
+                'project_id' => $project->id,
+                'video_file' => $videoFile,
+                'error' => $e->getMessage(),
+            ]);
+        }
+
+        return null;
+    }
+
+    private function sanitizeWindowsFilename(string $name): string
+    {
+        $sanitized = preg_replace('/[<>:"\/\\|?*]+/u', ' ', $name) ?? '';
+        $sanitized = trim(preg_replace('/\s+/u', ' ', $sanitized) ?? '');
+
+        // Windows reserved names.
+        $reserved = ['CON', 'PRN', 'AUX', 'NUL', 'COM1', 'COM2', 'COM3', 'COM4', 'COM5', 'COM6', 'COM7', 'COM8', 'COM9', 'LPT1', 'LPT2', 'LPT3', 'LPT4', 'LPT5', 'LPT6', 'LPT7', 'LPT8', 'LPT9'];
+        if (in_array(strtoupper($sanitized), $reserved, true)) {
+            $sanitized = '_' . $sanitized;
+        }
+
+        // Keep filename reasonable for Windows path limits.
+        return mb_substr($sanitized, 0, 120);
+    }
+
+    private function resolveDownloadSourceForProject(DubSyncProject $project): ?array
+    {
+        $url = trim((string) ($project->youtube_url ?? ''));
+
+        if ($url !== '') {
+            if (preg_match('/(?:youtube\.com|youtu\.be)/i', $url)) {
+                return ['platform' => 'youtube', 'url' => $url];
+            }
+
+            if (preg_match('/(?:bilibili\.com|b23\.tv)/i', $url)) {
+                return ['platform' => 'bilibili', 'url' => $url];
+            }
+        }
+
+        // Backward compatibility when old records only have video_id.
+        $videoId = trim((string) ($project->video_id ?? ''));
+        if ($videoId === '') {
+            return null;
+        }
+
+        if (str_starts_with($videoId, 'bili:')) {
+            $bvid = trim(substr($videoId, 5));
+            return $bvid !== ''
+                ? ['platform' => 'bilibili', 'url' => "https://www.bilibili.com/video/{$bvid}"]
+                : null;
+        }
+
+        return ['platform' => 'youtube', 'url' => "https://www.youtube.com/watch?v={$videoId}"];
+    }
+
+    /**
+     * Ensure a persistent queue worker is running.
+     * Stores the worker PID in storage/app/queue-worker.pid.
+     * If the PID is still alive, skips starting a new one.
+     */
+    private function ensureQueueWorkerRunning(): void
+    {
+        try {
+            $pidFile = storage_path('app/queue-worker.pid');
+            $php     = PHP_BINARY;
+            $artisan = base_path('artisan');
+            $workdir = base_path();
+
+            // Check if existing worker is still alive.
+            if (file_exists($pidFile)) {
+                $pid = (int) trim((string) file_get_contents($pidFile));
+                if ($pid > 0 && $this->isWorkerProcessAlive($pid)) {
+                    \Log::info('[Queue] Worker already running', ['pid' => $pid]);
+                    return;
+                }
+            }
+
+            // Start a persistent worker (no --stop-when-empty).
+            if (PHP_OS_FAMILY === 'Windows') {
+                // PowerShell: start detached process, capture PID.
+                $psCmd = sprintf(
+                    '(Start-Process -FilePath \'%s\' -ArgumentList \'"%s" queue:work --sleep=3 --tries=1 --timeout=3600\' -WorkingDirectory \'%s\' -WindowStyle Hidden -PassThru).Id',
+                    str_replace("'", "''", $php),
+                    str_replace("'", "''", $artisan),
+                    str_replace("'", "''", $workdir)
+                );
+                $pid = (int) trim((string) shell_exec('powershell -NoProfile -Command "' . $psCmd . '"'));
+            } else {
+                $cmd = sprintf(
+                    'cd %s && %s %s queue:work --sleep=3 --tries=1 --timeout=3600 > /dev/null 2>&1 & echo $!',
+                    escapeshellarg($workdir),
+                    escapeshellarg($php),
+                    escapeshellarg($artisan)
+                );
+                $pid = (int) trim((string) shell_exec($cmd));
+            }
+
+            if ($pid > 0) {
+                file_put_contents($pidFile, $pid);
+                \Log::info('[Queue] Worker started', ['pid' => $pid]);
+            } else {
+                \Log::warning('[Queue] Worker started but could not capture PID');
+            }
+        } catch (\Throwable $e) {
+            \Log::warning('[Queue] Could not auto-start queue worker: ' . $e->getMessage());
+        }
+    }
+
+    private function isWorkerProcessAlive(int $pid): bool
+    {
+        if (PHP_OS_FAMILY === 'Windows') {
+            $out = shell_exec("tasklist /NH /FO CSV 2>NUL");
+            if (!$out) return false;
+            foreach (explode("\n", $out) as $line) {
+                $parts = str_getcsv(trim($line));
+                if (isset($parts[1]) && (int) $parts[1] === $pid) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        // Linux/Mac: sending signal 0 checks if process exists without killing it.
+        return function_exists('posix_kill') && posix_kill($pid, 0);
     }
 }

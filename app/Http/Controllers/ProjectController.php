@@ -33,6 +33,7 @@ class ProjectController extends Controller
                 'video_id',
                 'youtube_url',
                 'youtube_title',
+                'youtube_title_vi',
                 'youtube_description',
                 'youtube_thumbnail',
                 'youtube_duration',
@@ -175,11 +176,21 @@ class ProjectController extends Controller
             'project_ids.*' => 'integer|exists:dub_sync_projects,id',
         ]);
 
-        $ids = $validated['project_ids'];
+        $ids = array_values(array_unique($validated['project_ids']));
 
-        $deleted = DubSyncProject::whereIn('id', $ids)
+        $projects = DubSyncProject::whereIn('id', $ids)
             ->where('user_id', auth()->id())
-            ->delete();
+            ->get();
+
+        $deleted = 0;
+
+        foreach ($projects as $project) {
+            $this->deleteProjectFiles($project);
+            $project->delete();
+            $deleted++;
+        }
+
+        $this->clearProjectListCache();
 
         return redirect()->back()->with('success', "Deleted {$deleted} project(s) successfully.");
     }
@@ -236,12 +247,20 @@ class ProjectController extends Controller
     {
         $userId = auth()->id();
         $pageCount = 10; // Clear first 10 pages as safeguard
+        $perPageOptions = [10, 15, 25, 50, 100];
 
+        for ($page = 1; $page <= $pageCount; $page++) {
+            foreach ($perPageOptions as $perPage) {
+                \Cache::forget('projects.list.page.' . $userId . '.' . $page . '.' . $perPage);
+            }
+        }
+
+        // Backward compatibility: clear any legacy keys without per_page.
         for ($page = 1; $page <= $pageCount; $page++) {
             \Cache::forget('projects.list.page.' . $userId . '.' . $page);
         }
 
-        // Backward compatibility: clear any legacy keys without user id
+        // Backward compatibility: clear very old keys without user id.
         for ($page = 1; $page <= $pageCount; $page++) {
             \Cache::forget('projects.list.page.' . $page);
         }

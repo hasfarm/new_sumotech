@@ -15,7 +15,11 @@ return new class extends Migration
         // Just rename column if it has old name
         if (Schema::hasColumn('audiobook_chapter_chunks', 'audiobook_chapter_id')) {
             Schema::table('audiobook_chapter_chunks', function (Blueprint $table) {
-                DB::statement('ALTER TABLE audiobook_chapter_chunks DROP FOREIGN KEY IF EXISTS audiobook_chapter_chunks_audiobook_chapter_id_foreign');
+                try {
+                    DB::statement('ALTER TABLE audiobook_chapter_chunks DROP FOREIGN KEY audiobook_chapter_chunks_audiobook_chapter_id_foreign');
+                } catch (\Throwable $e) {
+                    // Ignore if foreign key does not exist
+                }
                 DB::statement('ALTER TABLE audiobook_chapter_chunks CHANGE audiobook_chapter_id audiobook_chapter_id BIGINT UNSIGNED');
             });
         }

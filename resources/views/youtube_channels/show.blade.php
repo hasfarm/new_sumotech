@@ -180,10 +180,29 @@
                                             disabled>
                                             Delete selected
                                         </button>
+                                        <button id="bulkDownloadBtn" type="button"
+                                            class="bg-blue-600 text-white font-semibold py-2 px-4 rounded-lg transition duration-200 opacity-60 cursor-not-allowed"
+                                            disabled>
+                                            Download selected (0)
+                                        </button>
                                         @if ($youtubeChannel->content_type === 'dub')
                                             <form action="{{ route('youtube-channels.fetch.videos', $youtubeChannel) }}"
-                                                method="POST">
+                                                method="POST" class="flex items-center gap-2">
                                                 @csrf
+                                                <select name="fetch_scope"
+                                                    class="border border-gray-300 rounded-lg text-sm px-2 py-2 focus:outline-none focus:ring-2 focus:ring-gray-500"
+                                                    title="Pham vi fetch">
+                                                    <option value="latest" selected>Moi nhat</option>
+                                                    <option value="all">Toan bo</option>
+                                                </select>
+                                                <select name="max_results"
+                                                    class="border border-gray-300 rounded-lg text-sm px-2 py-2 focus:outline-none focus:ring-2 focus:ring-gray-500"
+                                                    title="So luong toi da moi reference (chi ap dung voi Moi nhat)">
+                                                    <option value="50">50</option>
+                                                    <option value="100" selected>100</option>
+                                                    <option value="200">200</option>
+                                                    <option value="500">500</option>
+                                                </select>
                                                 <button type="submit"
                                                     class="bg-gray-600 hover:bg-gray-700 text-white font-semibold py-2 px-4 rounded-lg transition duration-200">
                                                     Fetch video
@@ -218,6 +237,9 @@
                                                 <option value="new" @if ($status === 'new') selected @endif>
                                                     New
                                                 </option>
+                                                <option value="source_downloaded"
+                                                    @if ($status === 'source_downloaded') selected @endif>
+                                                    Source Downloaded</option>
                                                 <option value="pending" @if ($status === 'pending') selected @endif>
                                                     Pending</option>
                                                 <option value="processing"
@@ -288,6 +310,15 @@
                                         @csrf
                                         <div id="bulkDeleteInputs"></div>
                                     </form>
+                                    <!-- Bulk Download Progress Panel -->
+                                    <div id="bulkDownloadProgressPanel" class="hidden mb-4 border border-blue-200 bg-blue-50 rounded-lg p-4">
+                                        <div class="flex items-center justify-between mb-2">
+                                            <h4 class="text-sm font-semibold text-blue-900">Bulk Download Progress</h4>
+                                            <span id="bulkDownloadSummary" class="text-xs text-blue-700">Waiting...</span>
+                                        </div>
+                                        <div id="bulkDownloadProgressList" class="space-y-2"></div>
+                                    </div>
+
                                     <div class="overflow-x-hidden">
                                         <table class="w-full table-fixed divide-y divide-gray-200">
                                             <thead class="bg-gray-50">
@@ -316,10 +347,19 @@
                                             </thead>
                                             <tbody class="bg-white divide-y divide-gray-200">
                                                 @foreach ($projects as $project)
+                                                    @php
+                                                        $projectUrl = strtolower((string) ($project->youtube_url ?? ''));
+                                                        $projectVideoId = strtolower((string) ($project->video_id ?? ''));
+                                                        $isBilibiliProject =
+                                                            str_contains($projectUrl, 'bilibili.com/video/') ||
+                                                            str_contains($projectUrl, 'b23.tv/') ||
+                                                            str_starts_with($projectVideoId, 'bili:');
+                                                    @endphp
                                                     <tr class="cursor-pointer hover:bg-gray-50"
                                                         data-href="{{ route('projects.edit', $project) }}"
                                                         data-transcript-url="{{ route('projects.get.transcript.async', $project) }}"
-                                                        data-status="{{ $project->status }}">
+                                                        data-status="{{ $project->status }}"
+                                                        data-is-bilibili="{{ $isBilibiliProject ? '1' : '0' }}">
                                                         <td class="px-4 py-3 align-top">
                                                             <input type="checkbox" data-project-id="{{ $project->id }}"
                                                                 class="project-checkbox rounded border-gray-300 text-red-600 focus:ring-red-500" />
@@ -327,7 +367,18 @@
                                                         <td class="px-4 py-3 text-sm text-gray-900 align-top">
                                                             <div class="flex items-start gap-3">
                                                                 @if ($project->youtube_thumbnail)
-                                                                    <img src="{{ $project->youtube_thumbnail }}"
+                                                                    @php
+                                                                        $projectThumb = $project->youtube_thumbnail;
+                                                                        $projectThumbHost = strtolower((string) parse_url($projectThumb, PHP_URL_HOST));
+                                                                        $useThumbProxy = $projectThumbHost !== ''
+                                                                            && (str_ends_with($projectThumbHost, '.biliimg.com')
+                                                                                || str_ends_with($projectThumbHost, '.hdslb.com')
+                                                                                || in_array($projectThumbHost, ['archive.biliimg.com', 'i0.hdslb.com', 'i1.hdslb.com', 'i2.hdslb.com', 'i.ytimg.com', 'img.youtube.com', 'yt3.ggpht.com'], true));
+                                                                        $projectThumbSrc = $useThumbProxy
+                                                                            ? route('youtube-channels.thumbnail.proxy', ['youtubeChannel' => $youtubeChannel, 'url' => $projectThumb])
+                                                                            : $projectThumb;
+                                                                    @endphp
+                                                                    <img src="{{ $projectThumbSrc }}"
                                                                         alt="Thumbnail"
                                                                         class="w-12 h-8 rounded object-cover border flex-shrink-0">
                                                                 @else
@@ -357,6 +408,8 @@
                                                                 $statusColors = [
                                                                     'new' =>
                                                                         'bg-blue-100 text-blue-800 border-blue-200',
+                                                                    'source_downloaded' =>
+                                                                        'bg-emerald-100 text-emerald-800 border-emerald-200',
                                                                     'pending' =>
                                                                         'bg-yellow-100 text-yellow-800 border-yellow-200',
                                                                     'processing' =>
@@ -790,26 +843,58 @@
         </div>
 
         <div id="newVideoModal" class="fixed inset-0 bg-black/40 hidden items-center justify-center z-50">
-            <div class="bg-white rounded-xl shadow-xl w-full max-w-md p-6">
+            <div class="bg-white rounded-xl shadow-xl w-full max-w-lg p-6">
                 <div class="flex items-center justify-between mb-4">
-                    <h3 class="text-lg font-semibold">Create New Video</h3>
-                    <button id="closeNewVideoModal" class="text-gray-500 hover:text-gray-700">
-                        &times;
+                    <h3 class="text-lg font-semibold">Tạo Video Mới</h3>
+                    <button id="closeNewVideoModal" class="text-gray-500 hover:text-gray-700 text-2xl leading-none">&times;</button>
+                </div>
+
+                <!-- Tab buttons -->
+                <div class="flex gap-2 mb-5 border-b border-gray-200">
+                    <button type="button" id="tabLongTiengBtn"
+                        class="pb-2 px-1 text-sm font-medium border-b-2 border-red-600 text-gray-900">
+                        🎙 Lồng tiếng
+                    </button>
+                    <button type="button" id="tabKichBanBtn"
+                        class="pb-2 px-1 text-sm font-medium border-b-2 border-transparent text-gray-500 hover:text-gray-700">
+                        ✍️ Kịch bản của tôi
+                    </button>
+                    <button type="button" id="tabAudiobookBtn"
+                        class="pb-2 px-1 text-sm font-medium border-b-2 border-transparent text-gray-500 hover:text-gray-700">
+                        📖 Audiobook
                     </button>
                 </div>
-                <p class="text-sm text-gray-600 mb-4">Choose the type to create:</p>
-                <div class="space-y-3">
-                    <a href="{{ route('projects.create') }}?youtube_channel_id={{ $youtubeChannel->id }}"
-                        class="block w-full text-center bg-red-600 hover:bg-red-700 text-white font-semibold py-2 px-4 rounded-lg transition duration-200">
-                        1) Lồng tiếng
-                    </a>
+
+                <!-- Tab: Lồng tiếng -->
+                <div id="tabLongTieng">
+                    <p class="text-sm text-gray-600 mb-3">Nhập URL video (YouTube, Bilibili, ...)</p>
+                    <input id="newVideoUrl" type="url" placeholder="https://www.youtube.com/watch?v=... hoặc https://www.bilibili.com/video/..."
+                        class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm mb-3 focus:outline-none focus:ring-2 focus:ring-red-400" />
+                    <div id="newVideoError" class="hidden text-red-600 text-sm mb-3"></div>
+                    <div id="newVideoPreview" class="hidden bg-gray-50 border border-gray-200 rounded-lg p-3 mb-3 text-sm text-gray-700"></div>
+                    <button id="newVideoSubmitBtn"
+                        class="w-full bg-red-600 hover:bg-red-700 text-white font-semibold py-2 px-4 rounded-lg transition">
+                        🚀 Lấy thông tin & tạo dự án
+                    </button>
+                    <div id="newVideoProgress" class="hidden mt-3 flex items-center gap-2 text-sm text-gray-600">
+                        <div class="w-4 h-4 border-2 border-gray-300 border-t-red-600 rounded-full animate-spin"></div>
+                        <span id="newVideoProgressText">Đang xử lý...</span>
+                    </div>
+                </div>
+
+                <!-- Tab: Kịch bản -->
+                <div id="tabKichBan" class="hidden">
                     <a href="{{ route('youtube-channels.contents.create', $youtubeChannel) }}"
-                        class="block w-full text-center bg-gray-100 hover:bg-gray-200 text-gray-800 font-semibold py-2 px-4 rounded-lg transition duration-200">
-                        2) Từ kịch bản của tôi
+                        class="block w-full text-center bg-gray-800 hover:bg-gray-900 text-white font-semibold py-2 px-4 rounded-lg transition">
+                        Tạo từ kịch bản của tôi →
                     </a>
+                </div>
+
+                <!-- Tab: Audiobook -->
+                <div id="tabAudiobook" class="hidden">
                     <a href="{{ route('audiobooks.create') }}?youtube_channel_id={{ $youtubeChannel->id }}"
-                        class="block w-full text-center bg-blue-600 hover:bg-blue-700 text-white font-semibold py-2 px-4 rounded-lg transition duration-200">
-                        3) Audiobook
+                        class="block w-full text-center bg-blue-600 hover:bg-blue-700 text-white font-semibold py-2 px-4 rounded-lg transition">
+                        Tạo Audiobook →
                     </a>
                 </div>
             </div>
@@ -948,18 +1033,102 @@
                     });
                 }
 
+                // ── New Video Modal tabs ──────────────────────────────────────
+                const modalTabs = {
+                    tabLongTieng: { btn: document.getElementById('tabLongTiengBtn'), panel: document.getElementById('tabLongTieng') },
+                    tabKichBan:   { btn: document.getElementById('tabKichBanBtn'),   panel: document.getElementById('tabKichBan') },
+                    tabAudiobook: { btn: document.getElementById('tabAudiobookBtn'), panel: document.getElementById('tabAudiobook') },
+                };
+                const switchModalTab = (active) => {
+                    Object.entries(modalTabs).forEach(([key, { btn, panel }]) => {
+                        if (!btn || !panel) return;
+                        if (key === active) {
+                            panel.classList.remove('hidden');
+                            btn.classList.add('border-red-600', 'text-gray-900');
+                            btn.classList.remove('border-transparent', 'text-gray-500');
+                        } else {
+                            panel.classList.add('hidden');
+                            btn.classList.remove('border-red-600', 'text-gray-900');
+                            btn.classList.add('border-transparent', 'text-gray-500');
+                        }
+                    });
+                };
+                Object.entries(modalTabs).forEach(([key, { btn }]) => {
+                    if (btn) btn.addEventListener('click', () => switchModalTab(key));
+                });
+
+                // ── New Video submit (Lồng tiếng) ─────────────────────────────
+                const newVideoSubmitBtn  = document.getElementById('newVideoSubmitBtn');
+                const newVideoUrl        = document.getElementById('newVideoUrl');
+                const newVideoError      = document.getElementById('newVideoError');
+                const newVideoProgress   = document.getElementById('newVideoProgress');
+                const newVideoProgressText = document.getElementById('newVideoProgressText');
+
+                if (newVideoSubmitBtn) {
+                    newVideoSubmitBtn.addEventListener('click', async () => {
+                        const url = newVideoUrl.value.trim();
+                        newVideoError.classList.add('hidden');
+                        if (!url) { newVideoError.textContent = 'Vui lòng nhập URL.'; newVideoError.classList.remove('hidden'); return; }
+
+                        newVideoSubmitBtn.disabled = true;
+                        newVideoProgress.classList.remove('hidden');
+                        newVideoProgressText.textContent = 'Đang lấy thông tin video...';
+
+                        try {
+                            const res = await fetch('{{ route('dubsync.process.youtube') }}', {
+                                method: 'POST',
+                                headers: {
+                                    'Content-Type': 'application/json',
+                                    'X-CSRF-TOKEN': document.querySelector('meta[name="csrf-token"]').content,
+                                },
+                                body: JSON.stringify({
+                                    youtube_url: url,
+                                    youtube_channel_id: {{ $youtubeChannel->id }},
+                                }),
+                            });
+                            const data = await res.json();
+                            if (!res.ok || data.error) throw new Error(data.error || 'Lỗi không xác định');
+
+                            newVideoProgressText.textContent = '✅ Xong! Đang chuyển hướng...';
+                            window.location.href = '/projects/' + data.project_id + '/edit';
+                        } catch (e) {
+                            newVideoError.textContent = '❌ ' + e.message;
+                            newVideoError.classList.remove('hidden');
+                            newVideoProgress.classList.add('hidden');
+                            newVideoSubmitBtn.disabled = false;
+                        }
+                    });
+
+                    // Submit on Enter
+                    newVideoUrl.addEventListener('keydown', (e) => {
+                        if (e.key === 'Enter') newVideoSubmitBtn.click();
+                    });
+                }
+
                 const selectAll = document.getElementById('selectAllProjects');
                 const checkboxes = Array.from(document.querySelectorAll('.project-checkbox'));
                 const bulkDeleteBtn = document.getElementById('bulkDeleteBtn');
                 const bulkDeleteForm = document.getElementById('bulkDeleteForm');
                 const bulkDeleteInputs = document.getElementById('bulkDeleteInputs');
                 const bulkTranscriptBtn = document.getElementById('bulkTranscriptBtn');
+                const bulkDownloadBtn = document.getElementById('bulkDownloadBtn');
+                const bulkDownloadProgressPanel = document.getElementById('bulkDownloadProgressPanel');
+                const bulkDownloadProgressList = document.getElementById('bulkDownloadProgressList');
+                const bulkDownloadSummary = document.getElementById('bulkDownloadSummary');
+                const csrfToken = document.querySelector('meta[name="csrf-token"]')?.getAttribute('content') || '';
+                let isBulkDownloading = false;
 
                 const updateBulkState = () => {
                     const checked = checkboxes.filter((cb) => cb.checked);
-                    const checkedNew = checked.filter((cb) => {
+                    const checkedBilibiliReady = checked.filter((cb) => {
                         const row = cb.closest('tr');
-                        return row?.dataset?.status === 'new';
+                        if (!row) return false;
+
+                        const status = String(row?.dataset?.status || '').toLowerCase();
+                        const isBilibili = row?.dataset?.isBilibili === '1';
+                        const eligibleStatuses = ['new', 'source_downloaded', 'error'];
+
+                        return isBilibili && eligibleStatuses.includes(status);
                     });
                     if (bulkDeleteBtn) {
                         bulkDeleteBtn.disabled = checked.length === 0;
@@ -967,9 +1136,19 @@
                         bulkDeleteBtn.classList.toggle('cursor-not-allowed', checked.length === 0);
                     }
                     if (bulkTranscriptBtn) {
-                        bulkTranscriptBtn.disabled = checkedNew.length === 0;
-                        bulkTranscriptBtn.classList.toggle('opacity-60', checkedNew.length === 0);
-                        bulkTranscriptBtn.classList.toggle('cursor-not-allowed', checkedNew.length === 0);
+                        bulkTranscriptBtn.disabled = checkedBilibiliReady.length === 0;
+                        bulkTranscriptBtn.classList.toggle('opacity-60', checkedBilibiliReady.length === 0);
+                        bulkTranscriptBtn.classList.toggle('cursor-not-allowed', checkedBilibiliReady.length === 0);
+                        bulkTranscriptBtn.textContent = `Get transcript (${checkedBilibiliReady.length})`;
+                    }
+                    if (bulkDownloadBtn) {
+                        const canDownload = checked.length > 0 && !isBulkDownloading;
+                        bulkDownloadBtn.disabled = !canDownload;
+                        bulkDownloadBtn.classList.toggle('opacity-60', !canDownload);
+                        bulkDownloadBtn.classList.toggle('cursor-not-allowed', !canDownload);
+                        bulkDownloadBtn.textContent = isBulkDownloading
+                            ? 'Downloading...'
+                            : `Download selected (${checked.length})`;
                     }
                     if (selectAll) {
                         selectAll.checked = checked.length > 0 && checked.length === checkboxes.length;
@@ -1016,19 +1195,36 @@
                         if (bulkTranscriptBtn.disabled) return;
 
                         const selected = checkboxes.filter((cb) => cb.checked);
-                        const selectedNew = selected.filter((cb) => {
+                        const selectedBilibiliReady = selected.filter((cb) => {
                             const row = cb.closest('tr');
-                            return row?.dataset?.status === 'new';
+                            if (!row) return false;
+
+                            const status = String(row?.dataset?.status || '').toLowerCase();
+                            const isBilibili = row?.dataset?.isBilibili === '1';
+                            const eligibleStatuses = ['new', 'source_downloaded', 'error'];
+
+                            return isBilibili && eligibleStatuses.includes(status);
                         });
-                        if (selectedNew.length === 0) return;
+                        if (selectedBilibiliReady.length === 0) {
+                            alert('Vui long chon video Bilibili co trang thai New hoac Error.');
+                            return;
+                        }
+
+                        const shouldContinue = confirm(
+                            `Lay transcript cho ${selectedBilibiliReady.length} video Bilibili da chon?`
+                        );
+                        if (!shouldContinue) return;
 
                         bulkTranscriptBtn.disabled = true;
                         bulkTranscriptBtn.classList.add('opacity-60', 'cursor-not-allowed');
+                        bulkTranscriptBtn.textContent = 'Getting transcript...';
 
                         const csrfToken = document.querySelector('meta[name="csrf-token"]')?.getAttribute(
                             'content');
+                        let successCount = 0;
+                        let failCount = 0;
 
-                        for (const cb of selectedNew) {
+                        for (const cb of selectedBilibiliReady) {
                             const row = cb.closest('tr');
                             const spinner = row?.querySelector('.row-spinner');
                             const statusEl = row?.querySelector('.project-status');
@@ -1061,15 +1257,27 @@
                                         statusEl.textContent = data.status ? data.status.replace('_', ' ') :
                                             'Transcribed';
                                     }
+                                    if (row) {
+                                        row.dataset.status = data.status || 'transcribed';
+                                    }
+                                    successCount++;
                                 } else {
                                     if (statusEl) {
                                         statusEl.textContent = 'Error';
                                     }
+                                    if (row) {
+                                        row.dataset.status = 'error';
+                                    }
+                                    failCount++;
                                 }
                             } catch (e) {
                                 if (statusEl) {
                                     statusEl.textContent = 'Error';
                                 }
+                                if (row) {
+                                    row.dataset.status = 'error';
+                                }
+                                failCount++;
                             } finally {
                                 if (spinner) {
                                     spinner.classList.add('hidden');
@@ -1078,9 +1286,110 @@
                             }
                         }
 
+                        if (failCount > 0) {
+                            alert(`Hoan tat: ${successCount} thanh cong, ${failCount} loi.`);
+                        }
+
                         updateBulkState();
                     });
                 }
+
+                // ── Bulk Download ────────────────────────────────────────────
+                const createDownloadRow = (projectId, title) => {
+                    if (!bulkDownloadProgressList) return;
+                    const row = document.createElement('div');
+                    row.className = 'bg-white border border-blue-100 rounded p-2';
+                    row.dataset.projectId = projectId;
+                    const safeTitle = String(title).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+                    row.innerHTML = `
+                        <div class="flex items-center justify-between gap-2 mb-1">
+                            <div class="text-xs font-medium text-gray-800 truncate">${safeTitle}</div>
+                            <div class="text-[11px] text-gray-500" data-role="status">Waiting...</div>
+                        </div>
+                        <div class="w-full bg-gray-200 rounded-full h-2 overflow-hidden">
+                            <div data-role="bar" class="h-full bg-blue-500 transition-all duration-500" style="width:0%"></div>
+                        </div>
+                        <div class="mt-1 text-[11px] text-gray-600 truncate" data-role="message">Đang chờ...</div>`;
+                    bulkDownloadProgressList.appendChild(row);
+                };
+
+                const updateDownloadRow = (projectId, progress) => {
+                    const row = bulkDownloadProgressList?.querySelector(`[data-project-id="${projectId}"]`);
+                    if (!row) return;
+                    const pct = Math.max(0, Math.min(100, progress.percent || 0));
+                    const bar = row.querySelector('[data-role="bar"]');
+                    if (bar) {
+                        bar.style.width = `${pct}%`;
+                        bar.className = `h-full transition-all duration-500 ${progress.status === 'completed' ? 'bg-green-500' : progress.status === 'error' ? 'bg-red-500' : 'bg-blue-500'}`;
+                    }
+                    const statusEl = row.querySelector('[data-role="status"]');
+                    if (statusEl) statusEl.textContent = `${Math.floor(pct)}%`;
+                    const msgEl = row.querySelector('[data-role="message"]');
+                    if (msgEl) msgEl.textContent = (progress.message || '') + (progress.speed ? ` • ${progress.speed}` : '');
+                };
+
+                const downloadOneProject = (projectId, title) => new Promise(async (resolve) => {
+                    updateDownloadRow(projectId, { status: 'processing', percent: 0, message: 'Đang xếp hàng...' });
+                    try {
+                        const res  = await fetch(`/dubsync/projects/${projectId}/download-youtube-video`, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json', 'X-CSRF-TOKEN': csrfToken },
+                            body: JSON.stringify({}),
+                        });
+                        const data = await res.json();
+                        if (!res.ok || !data.success) throw new Error(data.error || 'Lỗi tải video');
+
+                        if (!data.queued) {
+                            updateDownloadRow(projectId, { status: 'completed', percent: 100, message: '✅ Video đã tồn tại' });
+                            return resolve({ success: true });
+                        }
+
+                        const timer = setInterval(async () => {
+                            try {
+                                const pr = await fetch(`/dubsync/projects/${projectId}/download-youtube-video-progress`, {
+                                    headers: { 'X-CSRF-TOKEN': csrfToken }
+                                });
+                                const pj = await pr.json();
+                                const progress = pj?.progress || {};
+                                updateDownloadRow(projectId, progress);
+                                if (progress.status === 'completed') { clearInterval(timer); resolve({ success: true }); }
+                                else if (progress.status === 'error') { clearInterval(timer); resolve({ success: false }); }
+                            } catch (e) {}
+                        }, 1500);
+                    } catch (err) {
+                        updateDownloadRow(projectId, { status: 'error', percent: 100, message: `❌ ${err.message}` });
+                        resolve({ success: false });
+                    }
+                });
+
+                if (bulkDownloadBtn) {
+                    bulkDownloadBtn.addEventListener('click', async () => {
+                        if (isBulkDownloading) return;
+                        const selected = checkboxes.filter(cb => cb.checked);
+                        if (selected.length === 0) return;
+                        if (!confirm(`Tải source video cho ${selected.length} project đã chọn?`)) return;
+
+                        isBulkDownloading = true;
+                        updateBulkState();
+                        if (bulkDownloadProgressPanel) bulkDownloadProgressPanel.classList.remove('hidden');
+                        if (bulkDownloadProgressList) bulkDownloadProgressList.innerHTML = '';
+                        if (bulkDownloadSummary) bulkDownloadSummary.textContent = `Đang xếp hàng ${selected.length} video...`;
+
+                        const projects = selected.map(cb => ({
+                            id: cb.dataset.projectId,
+                            title: cb.closest('tr')?.querySelector('td:nth-child(2)')?.textContent?.trim() || `Project #${cb.dataset.projectId}`
+                        }));
+                        projects.forEach(p => createDownloadRow(p.id, p.title));
+
+                        const results = await Promise.all(projects.map(p => downloadOneProject(p.id, p.title)));
+                        const ok = results.filter(r => r.success).length;
+                        if (bulkDownloadSummary) bulkDownloadSummary.textContent = `Hoàn tất: ${ok} thành công, ${results.length - ok} lỗi`;
+
+                        isBulkDownloading = false;
+                        updateBulkState();
+                    });
+                }
+                // ─────────────────────────────────────────────────────────────
 
                 const rowLinks = document.querySelectorAll('tr[data-href]');
                 rowLinks.forEach((row) => {

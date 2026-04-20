@@ -119,12 +119,50 @@ class TTSService
         ],
     ];
 
+    // Conservative guard to avoid intermittent "Text too long" rejects from Vbee.
+    private const VBEE_SAFE_TEXT_LIMIT = 1700;
+
     private function safeLog(string $level, string $message, array $context = []): void
     {
         try {
             Log::log($level, $message, $context);
         } catch (\Throwable $logException) {
             error_log('[TTSService] Log write failed: ' . $logException->getMessage() . ' | message: ' . $message);
+        }
+    }
+
+    /**
+     * Persist detailed Vbee call history for the API usage page.
+     */
+    private function logVbeeApiHistory(
+        string $purpose,
+        string $endpoint,
+        string $status,
+        ?string $errorMessage,
+        array $requestData,
+        array $responseData,
+        ?int $charactersUsed = null,
+        ?int $projectId = null
+    ): void {
+        try {
+            ApiUsageService::log([
+                'api_type' => 'Vbee',
+                'api_endpoint' => $endpoint,
+                'purpose' => $purpose,
+                'status' => $status,
+                'error_message' => $errorMessage,
+                'request_data' => $requestData,
+                'response_data' => $responseData,
+                'characters_used' => $charactersUsed,
+                'estimated_cost' => 0,
+                'project_id' => $projectId,
+                'description' => 'Vbee TTS call history',
+            ]);
+        } catch (\Throwable $e) {
+            $this->safeLog('warning', 'Vbee history log failed', [
+                'purpose' => $purpose,
+                'error' => $e->getMessage(),
+            ]);
         }
     }
 
@@ -878,6 +916,60 @@ class TTSService
     }
 
     /**
+     * Vbee voices are optimized for Vietnamese. CJK-heavy text frequently stalls in IN_PROGRESS.
+     */
+    private function isLikelyUnsupportedForVbee(string $text): bool
+    {
+        return preg_match('/[\x{3400}-\x{4DBF}\x{4E00}-\x{9FFF}\x{F900}-\x{FAFF}]/u', $text) === 1;
+    }
+
+    /**
+     * Replace sensitive/violent Vietnamese words with softer alternatives
+     * to avoid Vbee "hate speech" rejection on literary content.
+     */
+    private function sanitizeVbeeText(string $text): string
+    {
+        $replacements = [
+            // Violence - killing
+            'giết chết' => 'hạ gục',
+            'giết người' => 'hại người',
+            'giết' => 'hại',
+            'sát nhân' => 'hung thủ',
+            'sát hại' => 'làm hại',
+            'trảm quyết' => 'xử tội',
+            'tra khảo' => 'thẩm vấn',
+            'tra tấn' => 'hành hạ',
+            'chém chết' => 'hạ gục',
+            'chém đầu' => 'xử tội',
+            'đâm chết' => 'hạ gục',
+            'bắn chết' => 'hạ gục',
+            'thảm sát' => 'tàn sát',
+            // Death
+            'chết chóc' => 'thương vong',
+            'chết' => 'bỏ mạng',
+            'xác chết' => 'thi thể',
+            'tử hình' => 'xử phạt nặng nhất',
+            'đền mạng' => 'đền tội',
+            // Crime
+            'tên chó má' => 'tên đáng khinh',
+            'chó má' => 'đáng khinh',
+            'ác độc' => 'tàn nhẫn',
+            'ác bá' => 'cường hào',
+            'đút lót' => 'hối lộ',
+            // Body/blood
+            'máu me' => 'thương tích',
+            'đổ máu' => 'bị thương',
+        ];
+
+        // Use case-insensitive replacement, longer phrases first (already ordered)
+        foreach ($replacements as $find => $replace) {
+            $text = mb_eregi_replace(preg_quote($find, '/'), $replace, $text);
+        }
+
+        return $text;
+    }
+
+    /**
      * Generate audio using Vbee TTS API (async → poll → download)
      * Retries up to 2 times on transient FAILURE.
      * On "hate speech" rejection, uses AI to rewrite text and retries.
@@ -892,9 +984,14 @@ class TTSService
         ?int $projectId = null,
         float $speed = 1.0
     ): string {
-        $maxRetries = 2;
+        if ($this->isLikelyUnsupportedForVbee($text)) {
+            throw new Exception('Vbee TTS chi ho tro noi dung tieng Viet. Hay dich segment sang tieng Viet hoac chon provider khac (Microsoft/OpenAI/Gemini).');
+        }
+
+        $maxRetries = 1;
         $lastException = null;
-        $currentText = $text;
+        // Always sanitize text before sending to Vbee to avoid "hate speech" rejection
+        $currentText = $this->sanitizeVbeeText($text);
 
         for ($retry = 0; $retry <= $maxRetries; $retry++) {
             try {
@@ -923,6 +1020,12 @@ class TTSService
                         continue; // retry with rewritten text
                     }
                     $this->safeLog('warning', 'Vbee TTS: AI rewrite returned no change, giving up');
+                    throw $e;
+                }
+
+                // Timeout usually means Vbee job is stuck in IN_PROGRESS.
+                // Do not keep retrying and making users wait many extra minutes.
+                if (str_contains($e->getMessage(), 'Timeout waiting for audio')) {
                     throw $e;
                 }
 
@@ -1023,58 +1126,155 @@ PROMPT;
         float $speed = 1.0
     ): string {
         $voiceCode = $this->resolveVbeeVoice($voiceGender, $voiceName);
+        $textLength = mb_strlen($text, 'UTF-8');
+        $textBytes = strlen($text);
+        $submitEndpoint = 'https://vbee.vn/api/v1/tts';
+
+        if ($textLength > self::VBEE_SAFE_TEXT_LIMIT) {
+            $this->logVbeeApiHistory(
+                'vbee_tts_guard',
+                $submitEndpoint,
+                'failed',
+                'Text too long (local guard)',
+                [
+                    'index' => $index,
+                    'voice_code' => $voiceCode,
+                    'text_chars' => $textLength,
+                    'text_bytes' => $textBytes,
+                    'safe_limit' => self::VBEE_SAFE_TEXT_LIMIT,
+                ],
+                [],
+                $textLength,
+                $projectId
+            );
+            throw new Exception(
+                'Vbee TTS submit failed: Text too long (local guard ' .
+                "{$textLength}/" . self::VBEE_SAFE_TEXT_LIMIT . ')'
+            );
+        }
 
         $this->safeLog('info', 'Vbee TTS: Starting', [
             'voice_code' => $voiceCode,
-            'text_length' => mb_strlen($text),
+            'text_length' => $textLength,
             'index' => $index,
         ]);
 
         // Step 1: Submit TTS request
         $client = new \GuzzleHttp\Client();
         $callbackUrl = rtrim(config('app.url', 'http://localhost'), '/') . '/api/vbee-callback';
+        $submitPayload = [
+            'app_id' => $appId,
+            'response_type' => 'indirect',
+            'callback_url' => $callbackUrl,
+            'input_text' => $text,
+            'voice_code' => $voiceCode,
+            'audio_type' => 'mp3',
+            'bitrate' => 128,
+            'speed_rate' => (string) $speed,
+        ];
+        $submitRequestData = [
+            'index' => $index,
+            'voice_code' => $voiceCode,
+            'text_chars' => $textLength,
+            'text_bytes' => $textBytes,
+            'speed_rate' => (string) $speed,
+            'callback_url' => $callbackUrl,
+            'text_preview' => mb_substr($text, 0, 200, 'UTF-8'),
+        ];
 
-        $response = $client->post('https://vbee.vn/api/v1/tts', [
-            'headers' => [
-                'Authorization' => 'Bearer ' . $token,
-                'Content-Type'  => 'application/json',
-            ],
-            'json' => [
-                'app_id'        => $appId,
-                'response_type' => 'indirect',
-                'callback_url'  => $callbackUrl,
-                'input_text'    => $text,
-                'voice_code'    => $voiceCode,
-                'audio_type'    => 'mp3',
-                'bitrate'       => 128,
-                'speed_rate'    => (string) $speed,
-            ],
-            'timeout' => 30,
-        ]);
+        try {
+            $response = $client->post($submitEndpoint, [
+                'headers' => [
+                    'Authorization' => 'Bearer ' . $token,
+                    'Content-Type'  => 'application/json',
+                ],
+                'json' => $submitPayload,
+                'timeout' => 30,
+            ]);
+        } catch (\Throwable $submitEx) {
+            $this->logVbeeApiHistory(
+                'vbee_tts_submit',
+                $submitEndpoint,
+                'failed',
+                $submitEx->getMessage(),
+                $submitRequestData,
+                [],
+                $textLength,
+                $projectId
+            );
+            throw $submitEx;
+        }
 
         $body = json_decode($response->getBody()->getContents(), true);
 
         if (($body['status'] ?? 0) !== 1) {
             $errMsg = $body['error_message'] ?? 'Vbee API returned error';
+            $this->safeLog('warning', 'Vbee TTS: Submit rejected', [
+                'index' => $index,
+                'voice_code' => $voiceCode,
+                'char_length' => $textLength,
+                'byte_length' => strlen($text),
+                'error_message' => $errMsg,
+                'response_status' => $body['status'] ?? null,
+                'response' => $body,
+            ]);
+            $this->logVbeeApiHistory(
+                'vbee_tts_submit',
+                $submitEndpoint,
+                'failed',
+                $errMsg,
+                $submitRequestData,
+                $body,
+                $textLength,
+                $projectId
+            );
             throw new Exception('Vbee TTS submit failed: ' . $errMsg);
         }
 
         $requestId = $body['result']['request_id'] ?? null;
         if (!$requestId) {
+            $this->logVbeeApiHistory(
+                'vbee_tts_submit',
+                $submitEndpoint,
+                'failed',
+                'No request_id returned',
+                $submitRequestData,
+                $body,
+                $textLength,
+                $projectId
+            );
             throw new Exception('Vbee TTS: No request_id returned');
         }
+
+        $this->logVbeeApiHistory(
+            'vbee_tts_submit',
+            $submitEndpoint,
+            'success',
+            null,
+            array_merge($submitRequestData, ['request_id' => $requestId]),
+            $body,
+            $textLength,
+            $projectId
+        );
 
         $this->safeLog('info', 'Vbee TTS: Request submitted', ['request_id' => $requestId]);
 
         // Step 2: Poll for completion (max ~3 minutes)
         $audioLink = null;
-        $maxAttempts = 60; // 60 × 3s = 180s
+        $maxAttempts = 40; // 40 × 3s = 120s
         $pollInterval = 3;
         for ($attempt = 0; $attempt < $maxAttempts; $attempt++) {
             sleep($pollInterval);
 
+            $pollEndpoint = "https://vbee.vn/api/v1/tts/{$requestId}";
+            $pollRequestData = [
+                'index' => $index,
+                'request_id' => $requestId,
+                'attempt' => $attempt + 1,
+            ];
+
             try {
-                $pollResp = $client->get("https://vbee.vn/api/v1/tts/{$requestId}", [
+                $pollResp = $client->get($pollEndpoint, [
                     'headers' => [
                         'Authorization' => 'Bearer ' . $token,
                     ],
@@ -1086,12 +1286,45 @@ PROMPT;
                     'request_id' => $requestId,
                     'error' => $pollEx->getMessage(),
                 ]);
+                $this->logVbeeApiHistory(
+                    'vbee_tts_poll',
+                    $pollEndpoint,
+                    'failed',
+                    $pollEx->getMessage(),
+                    $pollRequestData,
+                    [],
+                    $textLength,
+                    $projectId
+                );
                 // Network error during poll — continue retrying
                 continue;
             }
 
             $pollBody = json_decode($pollResp->getBody()->getContents(), true);
             $status = $pollBody['result']['status'] ?? '';
+
+            $pollLogStatus = 'success';
+            $pollError = null;
+            if ($status === 'FAILURE') {
+                $pollLogStatus = 'failed';
+                $pollError = $pollBody['result']['error_message']
+                    ?? $pollBody['error_message']
+                    ?? 'Vbee returned FAILURE status';
+            }
+
+            $this->logVbeeApiHistory(
+                'vbee_tts_poll',
+                $pollEndpoint,
+                $pollLogStatus,
+                $pollError,
+                $pollRequestData,
+                [
+                    'status' => $status,
+                    'result' => $pollBody['result'] ?? null,
+                ],
+                $textLength,
+                $projectId
+            );
 
             if ($status === 'SUCCESS') {
                 $audioLink = $pollBody['result']['audio_link'] ?? null;
@@ -1115,13 +1348,45 @@ PROMPT;
         }
 
         if (!$audioLink) {
+            $this->logVbeeApiHistory(
+                'vbee_tts_poll',
+                "https://vbee.vn/api/v1/tts/{$requestId}",
+                'failed',
+                'Timeout waiting for audio',
+                [
+                    'index' => $index,
+                    'request_id' => $requestId,
+                    'attempts' => $maxAttempts,
+                    'poll_interval' => $pollInterval,
+                ],
+                [],
+                $textLength,
+                $projectId
+            );
             throw new Exception('Vbee TTS: Timeout waiting for audio after ' . ($maxAttempts * $pollInterval) . 's (request ' . $requestId . ')');
         }
 
         $this->safeLog('info', 'Vbee TTS: Audio ready', ['audio_link' => $audioLink]);
 
         // Step 3: Download the audio file (link expires after 3 minutes)
-        $audioData = $client->get($audioLink, ['timeout' => 30])->getBody()->getContents();
+        try {
+            $audioData = $client->get($audioLink, ['timeout' => 30])->getBody()->getContents();
+        } catch (\Throwable $downloadEx) {
+            $this->logVbeeApiHistory(
+                'vbee_tts_download',
+                $audioLink,
+                'failed',
+                $downloadEx->getMessage(),
+                [
+                    'index' => $index,
+                    'request_id' => $requestId,
+                ],
+                [],
+                $textLength,
+                $projectId
+            );
+            throw $downloadEx;
+        }
 
         // Save using Storage facade (relative path) — consistent with other providers
         $folder = $projectId ? "public/projects/{$projectId}" : "public/dubsync/tts";
@@ -1130,18 +1395,22 @@ PROMPT;
 
         $this->safeLog('info', 'Vbee TTS: Saved audio', ['file' => $filename, 'size' => strlen($audioData)]);
 
-        // Track API usage
-        if ($projectId) {
-            try {
-                ApiUsageService::trackUsage($projectId, 'vbee', 'tts', [
-                    'characters' => mb_strlen($text),
-                    'voice_code' => $voiceCode,
-                    'request_id' => $requestId,
-                ]);
-            } catch (\Throwable $e) {
-                $this->safeLog('warning', 'Vbee TTS: Failed to track usage', ['error' => $e->getMessage()]);
-            }
-        }
+        $this->logVbeeApiHistory(
+            'vbee_tts_download',
+            $audioLink,
+            'success',
+            null,
+            [
+                'index' => $index,
+                'request_id' => $requestId,
+            ],
+            [
+                'file' => $filename,
+                'bytes' => strlen($audioData),
+            ],
+            $textLength,
+            $projectId
+        );
 
         return $filename;
     }

@@ -10,6 +10,8 @@ use App\Http\Controllers\YoutubeChannelContentController;
 use App\Http\Controllers\ApiUsageController;
 use App\Http\Controllers\AudioBookController;
 use App\Http\Controllers\AudioBookChapterController;
+use App\Http\Controllers\BookInsightStudioController;
+use App\Http\Controllers\MediaCenterController;
 use App\Http\Controllers\AutomationReportController;
 use Illuminate\Support\Facades\Route;
 use Illuminate\Support\Facades\App;
@@ -26,7 +28,7 @@ use Illuminate\Support\Facades\App;
 */
 
 Route::get('/', function () {
-    return view('welcome');
+    return redirect()->route('dashboard');
 });
 
 Route::get('/lang/{locale}', function (string $locale) {
@@ -60,6 +62,11 @@ Route::prefix('admin')->name('admin.')->group(function () {
     Route::get('/reports', [AdminController::class, 'reports'])->name('reports');
 });
 
+// Queue Monitor Page
+Route::get('/queue-monitor', function () {
+    return view('queue.index');
+})->middleware('auth')->name('queue.monitor');
+
 // DubSync Routes - Temporarily accessible without auth
 Route::prefix('dubsync')->name('dubsync.')->group(function () {
     Route::get('/', [DubSyncController::class, 'index'])->name('index');
@@ -71,17 +78,21 @@ Route::prefix('dubsync')->name('dubsync.')->group(function () {
     Route::post('/projects/{projectId}/save-segments', [DubSyncController::class, 'saveSegments'])->name('save.segments');
     Route::post('/projects/{projectId}/generate-tts', [DubSyncController::class, 'generateTTS'])->name('generate.tts');
     Route::post('/projects/{projectId}/generate-segment-tts', [DubSyncController::class, 'generateSegmentTTS'])->name('generate.segment.tts');
+    Route::get('/projects/{projectId}/generate-segment-tts-progress', [DubSyncController::class, 'getSegmentTtsBatchProgress'])->name('generate.segment.tts.progress');
     Route::post('/projects/{projectId}/tts-provider', [DubSyncController::class, 'updateTtsProvider'])->name('update.tts.provider');
     Route::post('/projects/{projectId}/audio-mode', [DubSyncController::class, 'updateAudioMode'])->name('update.audio.mode');
     Route::post('/projects/{projectId}/speakers-config', [DubSyncController::class, 'updateSpeakersConfig'])->name('update.speakers.config');
+    Route::post('/projects/{projectId}/title-vi', [DubSyncController::class, 'updateVietnameseTitle'])->name('update.title.vi');
     Route::post('/projects/{projectId}/style-instruction', [DubSyncController::class, 'updateStyleInstruction'])->name('update.style.instruction');
     Route::post('/projects/{projectId}/align-timing', [DubSyncController::class, 'alignTiming'])->name('align.timing');
     Route::post('/projects/{projectId}/normalize-times', [DubSyncController::class, 'normalizeSegmentTimes'])->name('normalize.times');
     Route::post('/projects/{projectId}/merge-audio', [DubSyncController::class, 'mergeAudio'])->name('merge.audio');
+    Route::post('/projects/{projectId}/change-status', [DubSyncController::class, 'changeStatus'])->name('change.status');
     Route::post('/projects/{projectId}/export', [DubSyncController::class, 'export'])->name('export');
     Route::post('/projects/{projectId}/delete-segment-audios', [DubSyncController::class, 'deleteSegmentAudios'])->name('delete.segment.audios');
     Route::post('/projects/{projectId}/reset-to-tts-generation', [DubSyncController::class, 'resetToTtsGeneration'])->name('reset.to.tts.generation');
     Route::post('/projects/{projectId}/save-full-transcript', [DubSyncController::class, 'saveFullTranscript'])->name('save.full.transcript');
+    Route::post('/projects/{projectId}/rewrite-full-transcript', [DubSyncController::class, 'rewriteFullTranscript'])->name('rewrite.full.transcript');
     Route::get('/projects/{projectId}/get-full-transcript', [DubSyncController::class, 'getFullTranscript'])->name('get.full.transcript');
     Route::post('/projects/{projectId}/generate-full-transcript-tts', [DubSyncController::class, 'generateFullTranscriptTTS'])->name('generate.full.transcript.tts');
     Route::get('/projects/{projectId}/full-transcript-audio-list', [DubSyncController::class, 'getFullTranscriptAudioList'])->name('get.full.transcript.audio.list');
@@ -90,10 +101,14 @@ Route::prefix('dubsync')->name('dubsync.')->group(function () {
     Route::post('/projects/{projectId}/delete-all-full-transcript-audio', [DubSyncController::class, 'deleteAllFullTranscriptAudio'])->name('delete.all.full.transcript.audio');
     Route::post('/projects/{projectId}/align-full-transcript-duration', [DubSyncController::class, 'alignFullTranscriptDuration'])->name('align.full.transcript.duration');
     Route::post('/projects/{projectId}/download-youtube-video', [DubSyncController::class, 'downloadYoutubeVideo'])->name('download.youtube.video');
+    Route::get('/projects/{projectId}/download-youtube-video-progress', [DubSyncController::class, 'getDownloadYoutubeVideoProgress'])->name('download.youtube.video.progress');
+    Route::post('/projects/{projectId}/generate-thumbnail', [DubSyncController::class, 'generateThumbnail'])->name('generate.thumbnail');
     Route::get('/projects/{projectId}/download/{fileType}', [DubSyncController::class, 'download'])->name('download');
     Route::get('/projects/{projectId}/segments/{segmentIndex}/audio-versions', [DubSyncController::class, 'getSegmentAudioVersions'])->name('segment.audio.versions');
     Route::post('/projects/{projectId}/segments/{segmentIndex}/regenerate', [DubSyncController::class, 'regenerateSegment'])->name('regenerate.segment');
     Route::delete('/projects/{projectId}', [DubSyncController::class, 'destroy'])->name('destroy');
+    Route::get('/queue-status', [DubSyncController::class, 'queueStatus'])->name('queue.status');
+    Route::post('/queue-clear', [DubSyncController::class, 'queueClear'])->name('queue.clear');
 });
 
 // API Usage Tracking Routes
@@ -119,8 +134,44 @@ Route::middleware('auth')->prefix('automation-reports')->name('automation-report
     Route::get('/', [AutomationReportController::class, 'index'])->name('index');
 });
 
+Route::middleware('auth')->prefix('media-center')->name('media-center.')->group(function () {
+    Route::get('/', [MediaCenterController::class, 'index'])->name('index');
+    Route::post('/projects', [MediaCenterController::class, 'store'])->name('projects.store');
+    Route::put('/projects/{project}', [MediaCenterController::class, 'updateProject'])->name('projects.update');
+    Route::delete('/projects/{project}', [MediaCenterController::class, 'destroy'])->name('projects.destroy');
+    Route::post('/projects/{project}/analyze', [MediaCenterController::class, 'analyze'])->name('projects.analyze');
+    Route::post('/projects/{project}/regenerate-weak-prompts', [MediaCenterController::class, 'regenerateWeakPrompts'])->name('projects.regenerate.weak.prompts');
+    Route::post('/projects/{project}/cleanup-prompts', [MediaCenterController::class, 'cleanupProjectPrompts'])->name('projects.cleanup.prompts');
+    Route::get('/projects/{project}/analyze/progress', [MediaCenterController::class, 'analyzeProgress'])->name('projects.analyze.progress');
+    Route::get('/queue-health', [MediaCenterController::class, 'queueHealth'])->name('queue.health');
+    Route::put('/projects/{project}/characters', [MediaCenterController::class, 'updateCharacterInfo'])->name('projects.characters.update');
+    Route::post('/projects/{project}/translate-main-character-profile', [MediaCenterController::class, 'translateMainCharacterProfile'])->name('projects.main-character.profile.translate');
+    Route::post('/projects/{project}/rewrite-main-character-profile-bilingual', [MediaCenterController::class, 'rewriteMainCharacterProfileBilingual'])->name('projects.main-character.profile.rewrite.bilingual');
+    Route::post('/projects/{project}/generate-main-character-references', [MediaCenterController::class, 'generateMainCharacterReferences'])->name('projects.main-character.references.generate');
+    Route::post('/projects/{project}/upload-main-character-references', [MediaCenterController::class, 'uploadMainCharacterReferences'])->name('projects.main-character.references.upload');
+    Route::delete('/projects/{project}/main-character-references', [MediaCenterController::class, 'deleteMainCharacterReference'])->name('projects.main-character.references.delete');
+    Route::put('/projects/{project}/world-profile', [MediaCenterController::class, 'updateWorldProfile'])->name('projects.world.update');
+    Route::put('/projects/{project}/media-settings', [MediaCenterController::class, 'updateMediaSettings'])->name('projects.media.settings.update');
+    Route::post('/projects/{project}/generate-image-style-previews', [MediaCenterController::class, 'generateImageStylePreviews'])->name('projects.image.style.previews.generate');
+    Route::delete('/projects/{project}/image-style-previews', [MediaCenterController::class, 'deleteImageStylePreview'])->name('projects.image.style.previews.delete');
+    Route::put('/projects/{project}/sentences/{sentence}', [MediaCenterController::class, 'updateSentence'])->name('projects.sentences.update');
+    Route::post('/projects/{project}/sentences/{sentence}/generate-tts', [MediaCenterController::class, 'generateSentenceTts'])->name('projects.sentences.generate.tts');
+    Route::post('/projects/{project}/sentences/{sentence}/generate-image', [MediaCenterController::class, 'generateSentenceImage'])->name('projects.sentences.generate.image');
+    Route::post('/projects/{project}/sentences/{sentence}/generate-animation', [MediaCenterController::class, 'generateSentenceAnimation'])->name('projects.sentences.generate.animation');
+    Route::get('/projects/{project}/sentences/{sentence}/generation-status', [MediaCenterController::class, 'sentenceGenerationStatus'])->name('projects.sentences.generation.status');
+    Route::post('/projects/{project}/sentences/{sentence}/suggest-animation-plan', [MediaCenterController::class, 'suggestSentenceAnimationPlan'])->name('projects.sentences.suggest.animation.plan');
+    Route::post('/projects/{project}/sentences/{sentence}/translate-vie', [MediaCenterController::class, 'translateSentenceField'])->name('projects.sentences.translate.vie');
+    Route::post('/projects/{project}/sentences/{sentence}/rewrite-bilingual', [MediaCenterController::class, 'rewriteSentenceFieldBilingual'])->name('projects.sentences.rewrite.bilingual');
+    Route::delete('/projects/{project}/sentences/{sentence}/images', [MediaCenterController::class, 'deleteSentenceImage'])->name('projects.sentences.images.delete');
+    Route::delete('/projects/{project}/sentences/{sentence}/animations', [MediaCenterController::class, 'deleteSentenceAnimation'])->name('projects.sentences.animations.delete');
+    Route::post('/projects/{project}/download-all-assets', [MediaCenterController::class, 'downloadAllSentenceAssets'])->name('projects.download.all.assets');
+    Route::post('/projects/{project}/generate-all', [MediaCenterController::class, 'generateAll'])->name('projects.generate.all');
+});
+
 // AudioBooks CRUD Routes
 Route::middleware('auth')->prefix('audiobooks')->name('audiobooks.')->group(function () {
+    Route::get('/book-insight-studio', [BookInsightStudioController::class, 'index'])->name('insight.studio');
+    Route::post('/book-insight-studio/generate-character-story', [BookInsightStudioController::class, 'generateCharacterStory'])->name('insight.studio.generate.character');
     Route::get('/', [AudioBookController::class, 'index'])->name('index');
     Route::get('/create', [AudioBookController::class, 'create'])->name('create');
     Route::post('/', [AudioBookController::class, 'store'])->name('store');
@@ -131,6 +182,9 @@ Route::middleware('auth')->prefix('audiobooks')->name('audiobooks.')->group(func
     Route::post('{audioBook}/update-tts-settings', [AudioBookController::class, 'updateTtsSettings'])->name('update.tts.settings');
     Route::post('{audioBook}/find-replace', [AudioBookController::class, 'findReplace'])->name('find.replace');
     Route::post('{audioBook}/fix-leading-initial-space', [AudioBookController::class, 'fixLeadingInitialSpace'])->name('fix.leading.initial.space');
+    Route::post('{audioBook}/scan-tts-vietnamese-issues', [AudioBookController::class, 'scanTtsVietnameseIssues'])->name('scan.tts.vietnamese.issues');
+    Route::post('{audioBook}/chunk-and-queue-embeddings', [AudioBookController::class, 'chunkAndQueueEmbeddings'])->name('chunk.queue.embeddings');
+    Route::get('{audioBook}/embedding-progress', [AudioBookController::class, 'getEmbeddingProgress'])->name('embedding.progress');
     Route::post('{audioBook}/upload-music', [AudioBookController::class, 'uploadMusic'])->name('upload.music');
     Route::post('{audioBook}/select-music-file', [AudioBookController::class, 'selectMusicFile'])->name('select.music.file');
     Route::post('{audioBook}/delete-music', [AudioBookController::class, 'deleteMusic'])->name('delete.music');
@@ -139,6 +193,7 @@ Route::middleware('auth')->prefix('audiobooks')->name('audiobooks.')->group(func
     Route::post('{audioBook}/update-speaker', [AudioBookController::class, 'updateSpeaker'])->name('update.speaker');
     Route::post('{audioBook}/update-description', [AudioBookController::class, 'updateDescription'])->name('update.description');
     Route::post('{audioBook}/rewrite-description', [AudioBookController::class, 'rewriteDescription'])->name('rewrite.description');
+    Route::get('{audioBook}/export-word', [AudioBookController::class, 'exportWord'])->name('export.word');
     Route::post('{audioBook}/generate-description-audio', [AudioBookController::class, 'generateDescriptionAudio'])->name('generate.description.audio');
     Route::get('{audioBook}/description-audio-progress', [AudioBookController::class, 'getDescriptionAudioProgress'])->name('description.audio.progress');
     Route::post('{audioBook}/generate-description-video', [AudioBookController::class, 'generateDescriptionVideo'])->name('generate.description.video');
@@ -175,6 +230,7 @@ Route::middleware('auth')->prefix('audiobooks')->name('audiobooks.')->group(func
 
     // Short Video (AI shorts up to 60s, 9:16)
     Route::get('{audioBook}/short-videos', [AudioBookController::class, 'getShortVideos'])->name('short.videos.index');
+    Route::post('{audioBook}/short-videos/manual', [AudioBookController::class, 'createManualShortVideo'])->name('short.videos.manual');
     Route::post('{audioBook}/short-videos/generate-plans', [AudioBookController::class, 'generateShortVideoPlans'])->name('short.videos.generate.plans');
     Route::post('{audioBook}/short-videos/generate-assets', [AudioBookController::class, 'generateShortVideoAssets'])->name('short.videos.generate.assets');
     Route::post('{audioBook}/short-videos/generate-tts', [AudioBookController::class, 'generateShortVideoTts'])->name('short.videos.generate.tts');
@@ -251,6 +307,7 @@ Route::middleware('auth')->prefix('audiobooks')->name('audiobooks.')->group(func
     Route::get('{audioBook}/chapters/{chapter}/edit', [AudioBookChapterController::class, 'edit'])->name('chapters.edit');
     Route::put('{audioBook}/chapters/{chapter}', [AudioBookChapterController::class, 'update'])->name('chapters.update');
     Route::delete('{audioBook}/chapters/{chapter}', [AudioBookChapterController::class, 'destroy'])->name('chapters.destroy');
+    Route::patch('{audioBook}/chapters/{chapter}/fix-paragraph', [AudioBookChapterController::class, 'fixParagraph'])->name('chapters.fix-paragraph');
     Route::post('{audioBook}/chapters/{chapter}/generate-tts', [AudioBookChapterController::class, 'generateTts'])->name('chapters.generate-tts');
     Route::post('{audioBook}/chapters/{chapter}/tts-preview', [AudioBookChapterController::class, 'ttsPreview'])->name('chapters.tts-preview');
     Route::post('{audioBook}/chapters/{chapter}/generate-tts-chunks', [AudioBookChapterController::class, 'generateTtsChunks'])->name('chapters.generate-tts-chunks');
@@ -333,6 +390,9 @@ Route::middleware('auth')->prefix('youtube-channels')->name('youtube-channels.')
 
     Route::post('{youtubeChannel}/fetch-videos', [YouTubeChannelController::class, 'fetchReferenceVideos'])
         ->name('fetch.videos');
+
+    Route::get('{youtubeChannel}/thumbnail-proxy', [YouTubeChannelController::class, 'thumbnailProxy'])
+        ->name('thumbnail.proxy');
 
     Route::match(['post', 'delete'], '{youtubeChannel}/projects/bulk-destroy', [YouTubeChannelController::class, 'bulkDestroyProjects'])
         ->name('projects.bulk.destroy');

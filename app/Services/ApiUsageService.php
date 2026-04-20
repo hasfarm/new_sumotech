@@ -3,22 +3,47 @@
 namespace App\Services;
 
 use App\Models\ApiUsage;
+use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Request;
-use Exception;
+use Illuminate\Support\Facades\Schema;
+use Throwable;
 
 class ApiUsageService
 {
+    private static ?bool $apiUsagesTableExists = null;
+
     /**
      * Log API usage
      */
     public static function log(array $data): ApiUsage
     {
-        return ApiUsage::create(array_merge([
+        $payload = array_merge([
             'user_id' => Auth::id(),
             'ip_address' => Request::ip(),
             'status' => 'success',
-        ], $data));
+        ], $data);
+
+        if (!self::canWriteApiUsage()) {
+            return new ApiUsage($payload);
+        }
+
+        try {
+            return ApiUsage::create($payload);
+        } catch (QueryException $e) {
+            // Avoid breaking core flows (e.g. TTS) when tracking table is absent/misaligned.
+            if (self::isMissingApiUsageTableError($e)) {
+                self::$apiUsagesTableExists = false;
+                Log::warning('ApiUsageService: api_usages table is missing, skip usage logging.', [
+                    'error' => $e->getMessage(),
+                ]);
+
+                return new ApiUsage($payload);
+            }
+
+            throw $e;
+        }
     }
 
     /**
@@ -200,5 +225,35 @@ class ApiUsageService
     public static function batchLog(array $calls): array
     {
         return array_map(fn($call) => self::log($call), $calls);
+    }
+
+    private static function canWriteApiUsage(): bool
+    {
+        if (self::$apiUsagesTableExists !== null) {
+            return self::$apiUsagesTableExists;
+        }
+
+        try {
+            self::$apiUsagesTableExists = Schema::hasTable('api_usages');
+        } catch (Throwable $e) {
+            Log::warning('ApiUsageService: Unable to verify api_usages table, skip logging.', [
+                'error' => $e->getMessage(),
+            ]);
+            self::$apiUsagesTableExists = false;
+        }
+
+        return self::$apiUsagesTableExists;
+    }
+
+    private static function isMissingApiUsageTableError(QueryException $e): bool
+    {
+        $message = strtolower($e->getMessage());
+
+        return str_contains($message, 'api_usages')
+            && (
+                str_contains($message, 'base table or view not found')
+                || str_contains($message, 'doesn\'t exist')
+                || str_contains($message, 'no such table')
+            );
     }
 }

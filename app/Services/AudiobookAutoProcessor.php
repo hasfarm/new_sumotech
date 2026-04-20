@@ -211,6 +211,21 @@ class AudiobookAutoProcessor
         // Build text with intro/outro
         $textContent = $this->buildChunkTextWithIntroOutro($chunk, $chapter, $audioBook, $totalChunks);
 
+        // Vbee: fallback to raw chunk text if intro/outro makes it too long
+        if (
+            strtolower((string) ($audioBook->tts_provider ?? '')) === 'vbee'
+            && mb_strlen($textContent, 'UTF-8') > 1700
+        ) {
+            Log::warning('Vbee payload too long after intro/outro, fallback to raw chunk text', [
+                'chapter_id' => $chapter->id,
+                'chunk_id' => $chunk->id,
+                'chunk_number' => $chunk->chunk_number,
+                'full_text_length' => mb_strlen($textContent, 'UTF-8'),
+                'raw_chunk_length' => mb_strlen((string) $chunk->text_content, 'UTF-8'),
+            ]);
+            $textContent = (string) $chunk->text_content;
+        }
+
         $ttsSpeed = (float) ($audioBook->tts_speed ?? 1.0);
 
         $audioPath = $this->ttsService->generateAudio(
@@ -289,6 +304,20 @@ class AudiobookAutoProcessor
 
         $totalBookChapters = $audioBook->chapters()->count();
         $isLastChapter = ($chapterNumber >= $totalBookChapters);
+        $currentChapterLabel = trim((string) $chapterTitle) !== ''
+            ? trim((string) $chapterTitle)
+            : "Chương {$chapterNumber}";
+        $nextChapterModel = null;
+        if (!$isLastChapter) {
+            $nextChapterModel = $audioBook->chapters()
+                ->where('chapter_number', '>', $chapterNumber)
+                ->orderBy('chapter_number')
+                ->orderBy('id')
+                ->first(['chapter_number', 'title']);
+        }
+        $nextChapterLabel = $nextChapterModel && trim((string) ($nextChapterModel->title ?? '')) !== ''
+            ? trim((string) $nextChapterModel->title)
+            : ($nextChapterModel ? "Chương {$nextChapterModel->chapter_number}" : 'chương tiếp theo');
 
         // Chunk 1: Add chapter title intro
         if ($chunk->chunk_number === 1) {
@@ -304,7 +333,7 @@ class AudiobookAutoProcessor
         // Last chunk: Add outro
         if ($chunk->chunk_number === $totalChunks) {
             if ($isLastChapter) {
-                $outro = "\n\nBạn vừa nghe xong chương {$chapterNumber}, chương cuối cùng của {$bookDesc}.";
+                $outro = "\n\nBạn vừa nghe xong {$currentChapterLabel}, chương cuối cùng của {$bookDesc}.";
                 $outro .= " Cảm ơn bạn đã đồng hành cùng chúng tôi trong suốt tác phẩm này.";
                 if ($channelName) {
                     $outro .= " Nếu bạn thích nội dung này, hãy nhấn like, subscribe và bật chuông thông báo để không bỏ lỡ những tác phẩm hay tiếp theo từ kênh {$channelName}.";
@@ -313,9 +342,8 @@ class AudiobookAutoProcessor
                     $outro .= " Hẹn gặp lại bạn trong những tác phẩm tiếp theo.";
                 }
             } else {
-                $nextChapter = $chapterNumber + 1;
-                $outro = "\n\nBạn vừa nghe xong chương {$chapterNumber} của {$bookDesc}.";
-                $outro .= " Mời bạn tiếp tục nghe chương {$nextChapter}.";
+                $outro = "\n\nBạn vừa nghe xong {$currentChapterLabel} của {$bookDesc}.";
+                $outro .= " Mời bạn tiếp tục nghe {$nextChapterLabel}.";
                 if ($channelName) {
                     $outro .= " Đừng quên like, subscribe và bật chuông để ủng hộ kênh {$channelName} nhé!";
                 }

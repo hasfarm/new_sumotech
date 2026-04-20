@@ -16,6 +16,12 @@ use Illuminate\Support\Facades\Cache;
 
 class AudioBookChapterController extends Controller
 {
+    private const DEFAULT_CHUNK_MAX_SIZE = 2000;
+    // Keep provider-specific chunking for Vbee, but avoid over-fragmenting chapters.
+    private const VBEE_CHUNK_MAX_SIZE = 1500;
+    private const VBEE_RUNTIME_TEXT_LIMIT = 1700;
+    private const TTS_EMBEDDING_STATUS = 'skipped';
+
     protected $ttsService;
 
     public function __construct(TTSService $ttsService)
@@ -66,7 +72,8 @@ class AudioBookChapterController extends Controller
                 'audiobook_chapter_id' => $chapter->id,
                 'chunk_number' => $index + 1,
                 'text_content' => $chunk,
-                'status' => 'pending'
+                'status' => 'pending',
+                'embedding_status' => self::TTS_EMBEDDING_STATUS,
             ]);
         }
 
@@ -137,7 +144,8 @@ class AudioBookChapterController extends Controller
                     'audiobook_chapter_id' => $chapter->id,
                     'chunk_number' => $index + 1,
                     'text_content' => $chunk,
-                    'status' => 'pending'
+                    'status' => 'pending',
+                    'embedding_status' => self::TTS_EMBEDDING_STATUS,
                 ]);
             }
 
@@ -146,7 +154,7 @@ class AudioBookChapterController extends Controller
 
         $chapter->update($data);
 
-        return redirect()->route('audiobooks.show', $audioBook)->with('success', 'Chương đã được cập nhật');
+        return redirect()->route('audiobooks.show', $audioBook)->with('success', 'Chương đã được cập nhật')->withFragment('chapter-' . $chapter->id);
     }
 
     /**
@@ -154,11 +162,51 @@ class AudioBookChapterController extends Controller
      */
     public function destroy(AudioBook $audioBook, AudioBookChapter $chapter)
     {
+        // Verify chapter belongs to this audiobook to prevent cross-book deletion
+        if ($chapter->audio_book_id !== $audioBook->id) {
+            if (request()->expectsJson()) {
+                return response()->json(['error' => 'Chapter không thuộc audiobook này'], 403);
+            }
+            abort(403, 'Chapter không thuộc audiobook này');
+        }
+
         $chapter->delete();
         $audioBook->total_chapters = $audioBook->chapters()->count();
         $audioBook->save();
 
+        if (request()->expectsJson() || request()->ajax()) {
+            return response()->json(['success' => true, 'message' => 'Chương đã bị xóa']);
+        }
+
         return redirect()->route('audiobooks.show', $audioBook)->with('success', 'Chương đã bị xóa');
+    }
+
+    /**
+     * Fix a specific paragraph in chapter content (find-and-replace)
+     */
+    public function fixParagraph(AudioBook $audioBook, AudioBookChapter $chapter)
+    {
+        if ($chapter->audio_book_id !== $audioBook->id) {
+            return response()->json(['error' => 'Chapter không thuộc audiobook này'], 403);
+        }
+
+        $original = request()->input('original');
+        $replacement = request()->input('replacement');
+
+        if ($original === null || $replacement === null) {
+            return response()->json(['error' => 'Thiếu tham số original hoặc replacement'], 422);
+        }
+
+        $content = $chapter->content ?? '';
+
+        if (!str_contains($content, $original)) {
+            return response()->json(['error' => 'Không tìm thấy đoạn văn gốc trong nội dung chương'], 422);
+        }
+
+        $chapter->content = str_replace($original, $replacement, $content);
+        $chapter->save();
+
+        return response()->json(['success' => true, 'message' => 'Đã lưu thay đổi']);
     }
 
     /**
@@ -190,7 +238,8 @@ class AudioBookChapterController extends Controller
                         'audiobook_chapter_id' => $chapter->id,
                         'chunk_number' => $index + 1,
                         'text_content' => $chunkText,
-                        'status' => 'pending'
+                        'status' => 'pending',
+                        'embedding_status' => self::TTS_EMBEDDING_STATUS,
                     ]);
                 }
             }
@@ -338,6 +387,7 @@ class AudioBookChapterController extends Controller
 
         $chunk->audio_file = 'audiobooks/audio/' . $filename;
         $chunk->status = 'completed';
+        $chunk->embedding_status = self::TTS_EMBEDDING_STATUS;
         $chunk->save();
     }
 
@@ -356,6 +406,9 @@ class AudioBookChapterController extends Controller
                 'tts_speed' => 'nullable|numeric|between:0.5,2.0',
                 'pause_between_chunks' => 'nullable|numeric|between:0,5'
             ]);
+
+            $provider = strtolower((string) $request->provider);
+            $maxChunkSize = $this->resolveChunkMaxSize($provider);
 
             // Update audiobook TTS settings
             $updateData = [
@@ -401,6 +454,18 @@ class AudioBookChapterController extends Controller
                     ]);
                     $needsRechunk = true;
                 }
+
+                // Vbee has stricter limits in practice, especially after intro/outro is added.
+                if (
+                    !$needsRechunk
+                    && $provider === 'vbee'
+                    && $existingChunks->contains(fn ($c) => mb_strlen((string) $c->text_content, 'UTF-8') > $maxChunkSize)
+                ) {
+                    Log::info("Chapter {$chapter->id} has oversized chunks for Vbee. Re-chunking.", [
+                        'max_chunk_size' => $maxChunkSize,
+                    ]);
+                    $needsRechunk = true;
+                }
             }
 
             if ($needsRechunk) {
@@ -425,14 +490,15 @@ class AudioBookChapterController extends Controller
                 }
 
                 $content = $chapter->content;
-                $chunksText = $this->chunkContent($content, 2000);
+                $chunksText = $this->chunkContent($content, $maxChunkSize);
 
                 foreach ($chunksText as $index => $chunkText) {
                     AudioBookChapterChunk::create([
                         'audiobook_chapter_id' => $chapter->id,
                         'chunk_number' => $index + 1,
                         'text_content' => $chunkText,
-                        'status' => 'pending'
+                        'status' => 'pending',
+                        'embedding_status' => self::TTS_EMBEDDING_STATUS,
                     ]);
                 }
 
@@ -540,8 +606,18 @@ class AudioBookChapterController extends Controller
                 'style_instruction' => 'nullable|string'
             ]);
 
-            // Skip if already completed
-            if ($chunk->status === 'completed' && $chunk->audio_file && file_exists(storage_path('app/public/' . $chunk->audio_file))) {
+            // Skip if audio file already exists to avoid regenerating the same chunk.
+            if ($chunk->audio_file && file_exists(storage_path('app/public/' . $chunk->audio_file))) {
+                if ($chunk->status !== 'completed') {
+                    $chunk->status = 'completed';
+                    if (!$chunk->duration) {
+                        $chunk->duration = $this->getAudioDuration(storage_path('app/public/' . $chunk->audio_file));
+                    }
+                }
+
+                $chunk->embedding_status = self::TTS_EMBEDDING_STATUS;
+                $chunk->save();
+
                 return response()->json([
                     'success' => true,
                     'skipped' => true,
@@ -558,8 +634,26 @@ class AudioBookChapterController extends Controller
             // Generate audio
             $this->generateChunkAudioWithService($chunk, $chapter, $request);
 
-            // Refresh chunk data
-            $chunk->refresh();
+            // Chunk can be recreated by another batch run; skip stale result instead of failing.
+            $freshChunk = $chunk->fresh();
+            if (!$freshChunk) {
+                Log::warning("Skip stale chunk after generation", [
+                    'audio_book_id' => $audioBook->id,
+                    'chapter_id' => $chapter->id,
+                    'chunk_id' => $chunk->id,
+                    'chunk_number' => $chunk->chunk_number,
+                ]);
+
+                return response()->json([
+                    'success' => true,
+                    'skipped' => true,
+                    'stale_chunk' => true,
+                    'chunk_number' => $chunk->chunk_number,
+                    'message' => 'Chunk da bi thay the trong luc xu ly, bo qua ket qua cu.'
+                ]);
+            }
+
+            $chunk = $freshChunk;
 
             return response()->json([
                 'success' => true,
@@ -572,9 +666,18 @@ class AudioBookChapterController extends Controller
         } catch (\Exception $e) {
             Log::error("Generate single chunk failed: " . $e->getMessage());
 
-            $chunk->status = 'error';
-            $chunk->error_message = $e->getMessage();
-            $chunk->save();
+            $freshChunk = $chunk->fresh();
+            if ($freshChunk) {
+                $freshChunk->status = 'error';
+                $freshChunk->error_message = $e->getMessage();
+                $freshChunk->save();
+            } else {
+                Log::warning('Skip marking chunk error because chunk was replaced', [
+                    'audio_book_id' => $audioBook->id,
+                    'chapter_id' => $chapter->id,
+                    'chunk_id' => $chunk->id,
+                ]);
+            }
 
             return response()->json([
                 'success' => false,
@@ -760,9 +863,10 @@ class AudioBookChapterController extends Controller
             // Delete existing chunks
             $chapter->chunks()->delete();
 
-            // Chunk content into max 2000 characters
+            // Chunk content with provider-specific max size.
             $content = $chapter->content;
-            $chunks = $this->chunkContent($content, 2000);
+            $provider = strtolower((string) $request->provider);
+            $chunks = $this->chunkContent($content, $this->resolveChunkMaxSize($provider));
 
             Log::info("Split chapter {$chapter->id} into " . count($chunks) . " chunks");
 
@@ -776,7 +880,8 @@ class AudioBookChapterController extends Controller
                         'audiobook_chapter_id' => $chapter->id,
                         'chunk_number' => $chunkNumber,
                         'text_content' => $chunkText,
-                        'status' => 'processing'
+                        'status' => 'processing',
+                        'embedding_status' => self::TTS_EMBEDDING_STATUS,
                     ]);
 
                     // Generate audio
@@ -842,6 +947,11 @@ class AudioBookChapterController extends Controller
     /**
      * Split content into chunks of max size, preferring to break at sentence/paragraph boundaries
      */
+    private function resolveChunkMaxSize(string $provider): int
+    {
+        return $provider === 'vbee' ? self::VBEE_CHUNK_MAX_SIZE : self::DEFAULT_CHUNK_MAX_SIZE;
+    }
+
     private function chunkContent(string $content, int $maxSize = 2000): array
     {
         $chunks = [];
@@ -949,6 +1059,20 @@ class AudioBookChapterController extends Controller
         // Build the text content with intro/outro
         $textContent = $this->buildChunkTextWithIntroOutro($chunk, $chapter, $audioBook, $totalChunks);
 
+        if (
+            strtolower((string) $request->provider) === 'vbee'
+            && mb_strlen($textContent, 'UTF-8') > self::VBEE_RUNTIME_TEXT_LIMIT
+        ) {
+            Log::warning('Vbee payload too long after intro/outro, fallback to raw chunk text', [
+                'chapter_id' => $chapter->id,
+                'chunk_id' => $chunk->id,
+                'chunk_number' => $chunk->chunk_number,
+                'full_text_length' => mb_strlen($textContent, 'UTF-8'),
+                'raw_chunk_length' => mb_strlen((string) $chunk->text_content, 'UTF-8'),
+            ]);
+            $textContent = (string) $chunk->text_content;
+        }
+
         // Get TTS speed from audiobook settings
         $ttsSpeed = (float) ($audioBook->tts_speed ?? 1.0);
 
@@ -987,7 +1111,8 @@ class AudioBookChapterController extends Controller
         // Boost TTS voice volume by +16dB for clarity
         if (file_exists($outputPath)) {
             $boostedPath = $outputPath . '.boosted.mp3';
-            $boostCmd = "ffmpeg -y -i \"{$outputPath}\" -af \"volume=16dB\" -c:a libmp3lame -b:a 192k \"{$boostedPath}\" 2>&1";
+            $ffmpegPath = $this->resolveFfmpegPath();
+            $boostCmd = escapeshellarg($ffmpegPath) . " -y -i \"{$outputPath}\" -af \"volume=16dB\" -c:a libmp3lame -b:a 192k \"{$boostedPath}\" 2>&1";
             exec($boostCmd, $boostOut, $boostCode);
             if ($boostCode === 0 && file_exists($boostedPath)) {
                 unlink($outputPath);
@@ -1002,6 +1127,7 @@ class AudioBookChapterController extends Controller
         $chunk->audio_file = 'books/' . $bookId . '/' . $filename;
         $chunk->duration = $duration;
         $chunk->status = 'completed';
+        $chunk->embedding_status = self::TTS_EMBEDDING_STATUS;
         $chunk->save();
 
         Log::info("Generated audio for chapter {$chapter->chapter_number} chunk {$chunk->chunk_number}: {$filename}");
@@ -1047,6 +1173,20 @@ class AudioBookChapterController extends Controller
         // Get total chapters of the book
         $totalBookChapters = $audioBook->chapters()->count();
         $isLastChapter = ($chapterNumber >= $totalBookChapters);
+        $currentChapterLabel = trim((string) $chapterTitle) !== ''
+            ? trim((string) $chapterTitle)
+            : "Chương {$chapterNumber}";
+        $nextChapterModel = null;
+        if (!$isLastChapter) {
+            $nextChapterModel = $audioBook->chapters()
+                ->where('chapter_number', '>', $chapterNumber)
+                ->orderBy('chapter_number')
+                ->orderBy('id')
+                ->first(['chapter_number', 'title']);
+        }
+        $nextChapterLabel = $nextChapterModel && trim((string) ($nextChapterModel->title ?? '')) !== ''
+            ? trim((string) $nextChapterModel->title)
+            : ($nextChapterModel ? "Chương {$nextChapterModel->chapter_number}" : 'chương tiếp theo');
 
         // Chunk 1: Add chapter title intro
         if ($chunk->chunk_number === 1) {
@@ -1067,7 +1207,7 @@ class AudioBookChapterController extends Controller
         if ($chunk->chunk_number === $totalChunks) {
             if ($isLastChapter) {
                 // This is the final chapter of the book
-                $outro = "\n\nBạn vừa nghe xong chương {$chapterNumber}, chương cuối cùng của {$bookDesc}.";
+                $outro = "\n\nBạn vừa nghe xong {$currentChapterLabel}, chương cuối cùng của {$bookDesc}.";
                 $outro .= " Cảm ơn bạn đã đồng hành cùng chúng tôi trong suốt tác phẩm này.";
                 if ($channelName) {
                     $outro .= " Nếu bạn thích nội dung này, hãy nhấn like, subscribe và bật chuông thông báo để không bỏ lỡ những tác phẩm hay tiếp theo từ kênh {$channelName}.";
@@ -1077,9 +1217,8 @@ class AudioBookChapterController extends Controller
                 }
             } else {
                 // There are more chapters
-                $nextChapter = $chapterNumber + 1;
-                $outro = "\n\nBạn vừa nghe xong chương {$chapterNumber} của {$bookDesc}.";
-                $outro .= " Mời bạn tiếp tục nghe chương {$nextChapter}.";
+                $outro = "\n\nBạn vừa nghe xong {$currentChapterLabel} của {$bookDesc}.";
+                $outro .= " Mời bạn tiếp tục nghe {$nextChapterLabel}.";
                 if ($channelName) {
                     $outro .= " Đừng quên like, subscribe và bật chuông để ủng hộ kênh {$channelName} nhé!";
                 }
@@ -1100,7 +1239,8 @@ class AudioBookChapterController extends Controller
         }
 
         // Try ffprobe first
-        $command = "ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 \"{$filePath}\" 2>&1";
+        $ffprobePath = $this->resolveFfprobePath();
+        $command = escapeshellarg($ffprobePath) . " -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 \"{$filePath}\" 2>&1";
         \exec($command, $output, $returnCode);
 
         if ($returnCode === 0 && isset($output[0]) && is_numeric($output[0])) {
@@ -1131,14 +1271,84 @@ class AudioBookChapterController extends Controller
                 ->orderBy('chunk_number')
                 ->get();
 
-            if ($chunks->isEmpty()) {
+            $outputDir = storage_path('app/public/books/' . $bookId);
+            if (!is_dir($outputDir)) {
+                mkdir($outputDir, 0755, true);
+            }
+
+            $mergedFilename = "c_{$chapterNum}_full.mp3";
+            $mergedPath = $outputDir . DIRECTORY_SEPARATOR . $mergedFilename;
+
+            // If no chunk audio files but chapter already has a merged file,
+            // re-apply intro/outro music to the existing merged file
+            if ($chunks->isEmpty() && $chapter->audio_file) {
+                $existingMergedPath = storage_path('app/public/' . $chapter->audio_file);
+                if (file_exists($existingMergedPath)) {
+                    $hasIntro = !empty($audioBook->intro_music) && file_exists(storage_path('app/public/' . $audioBook->intro_music));
+                    $outroUseIntro = $audioBook->outro_use_intro ?? false;
+                    $hasOutro = false;
+                    if (!empty($audioBook->outro_music) && file_exists(storage_path('app/public/' . $audioBook->outro_music))) {
+                        $hasOutro = true;
+                    } elseif ($outroUseIntro && $hasIntro) {
+                        $hasOutro = true;
+                    }
+
+                    if ($hasIntro || $hasOutro) {
+                        // Prefer voice-only file (no intro/outro) for clean re-merge
+                        $voiceOnlyFilename = "c_{$chapterNum}_voice.mp3";
+                        $voiceOnlyPath = $outputDir . DIRECTORY_SEPARATOR . $voiceOnlyFilename;
+
+                        if (file_exists($voiceOnlyPath)) {
+                            // Voice-only file preserved from original merge
+                            $voiceSourcePath = $voiceOnlyPath;
+                        } else {
+                            // Fallback: use existing merged file as voice source
+                            // (may already contain old intro/outro)
+                            $tempVoicePath = $outputDir . DIRECTORY_SEPARATOR . "c_{$chapterNum}_voice_tmp.mp3";
+                            copy($existingMergedPath, $tempVoicePath);
+                            $voiceSourcePath = $tempVoicePath;
+                        }
+
+                        $voiceDuration = $this->getAudioDuration($voiceSourcePath);
+
+                        // Remove old merged file 
+                        if (file_exists($mergedPath)) {
+                            unlink($mergedPath);
+                        }
+
+                        $finalPath = $this->addIntroOutroMusic(
+                            $voiceSourcePath,
+                            $mergedPath,
+                            $audioBook,
+                            $voiceDuration ?? 0
+                        );
+
+                        // Clean up temp file only (preserve voice-only file)
+                        if (isset($tempVoicePath) && file_exists($tempVoicePath)) {
+                            unlink($tempVoicePath);
+                        }
+
+                        if ($finalPath && file_exists($mergedPath)) {
+                            $totalDuration = $this->getAudioDuration($mergedPath);
+                            if ($totalDuration) {
+                                $chapter->total_duration = $totalDuration;
+                            }
+                            Log::info("Re-merged chapter {$chapter->id} with new intro/outro music");
+                            return 'books/' . $bookId . '/' . $mergedFilename;
+                        }
+                    }
+
+                    // No intro/outro change needed, return existing file
+                    return $chapter->audio_file;
+                }
+
                 Log::warning("No completed chunks found for chapter {$chapter->id}");
                 return null;
             }
 
-            $outputDir = storage_path('app/public/books/' . $bookId);
-            if (!is_dir($outputDir)) {
-                mkdir($outputDir, 0755, true);
+            if ($chunks->isEmpty()) {
+                Log::warning("No completed chunks found for chapter {$chapter->id}");
+                return null;
             }
 
             // Pause between chunks is disabled: always concatenate voice chunks directly.
@@ -1185,7 +1395,8 @@ class AudioBookChapterController extends Controller
 
             // Step 1: Merge all voice chunks into single voice file
             // Note: must re-encode (not -c copy) to eliminate MP3 encoder-delay gaps between chunks
-            $command = "ffmpeg -f concat -safe 0 -i \"{$listFile}\" -ar 44100 -ac 2 -c:a libmp3lame -b:a 192k \"{$voiceOnlyPath}\" 2>&1";
+            $ffmpegPath = $this->resolveFfmpegPath();
+            $command = escapeshellarg($ffmpegPath) . " -f concat -safe 0 -i \"{$listFile}\" -ar 44100 -ac 2 -c:a libmp3lame -b:a 192k \"{$voiceOnlyPath}\" 2>&1";
             Log::info("Merging chapter voice audio", ['command' => $command]);
 
             exec($command, $output, $returnCode);
@@ -1232,10 +1443,8 @@ class AudioBookChapterController extends Controller
                     $voiceDuration
                 );
 
-                // Clean up voice only file after merging with music
-                if (file_exists($voiceOnlyPath) && file_exists($mergedPath)) {
-                    unlink($voiceOnlyPath);
-                }
+                // Keep voice-only file for future re-merge with different music config
+                // (previously deleted here, now preserved)
 
                 if (!$finalPath) {
                     // If adding music failed, use voice only as final
@@ -1252,29 +1461,11 @@ class AudioBookChapterController extends Controller
                 $chapter->total_duration = $totalDuration;
             }
 
-            // Cleanup: after full chapter merge is successful, delete per-chunk audio files
-            $deletedChunkFiles = 0;
-            foreach ($chunks as $chunk) {
-                if (!$chunk->audio_file) {
-                    continue;
-                }
-
-                $chunkPath = storage_path('app/public/' . $chunk->audio_file);
-                if (file_exists($chunkPath)) {
-                    @unlink($chunkPath);
-                    $deletedChunkFiles++;
-                }
-
-                $chunk->audio_file = null;
-                $chunk->save();
-            }
-
             Log::info("Successfully merged {$chunks->count()} chunks into {$mergedFilename}", [
                 'has_intro' => $hasIntro,
                 'has_outro' => $hasOutro,
                 'voice_duration' => $voiceDuration,
                 'total_duration' => $totalDuration,
-                'deleted_chunk_files' => $deletedChunkFiles
             ]);
 
             return 'books/' . $bookId . '/' . $mergedFilename;
@@ -1392,7 +1583,8 @@ class AudioBookChapterController extends Controller
             $inputsStr = implode(' ', $inputs);
             $filterStr = implode(';', $filterComplex);
 
-            $command = "ffmpeg -y {$inputsStr} -filter_complex \"{$filterStr}\" -map \"[final]\" -c:a libmp3lame -b:a 192k \"{$outputPathNorm}\" 2>&1";
+            $ffmpegPath = $this->resolveFfmpegPath();
+            $command = escapeshellarg($ffmpegPath) . " -y {$inputsStr} -filter_complex \"{$filterStr}\" -map \"[final]\" -c:a libmp3lame -b:a 192k \"{$outputPathNorm}\" 2>&1";
 
             Log::info("Adding intro/outro music to chapter", [
                 'command' => $command,
@@ -1416,6 +1608,16 @@ class AudioBookChapterController extends Controller
             Log::error("Error adding intro/outro music: " . $e->getMessage());
             return null;
         }
+    }
+
+    private function resolveFfmpegPath(): string
+    {
+        return (string) config('services.ffmpeg.path', env('FFMPEG_PATH', 'ffmpeg'));
+    }
+
+    private function resolveFfprobePath(): string
+    {
+        return (string) config('services.ffmpeg.ffprobe_path', env('FFPROBE_PATH', 'ffprobe'));
     }
 
     /**

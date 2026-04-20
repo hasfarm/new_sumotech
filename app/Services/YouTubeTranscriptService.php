@@ -69,6 +69,14 @@ class YouTubeTranscriptService
             ]);
 
             if (!$process->isSuccessful()) {
+                // If stdout has valid JSON, ignore stderr warnings (e.g. Python installer messages)
+                $trimmedOutput = trim($output);
+                if (!empty($trimmedOutput) && json_decode($trimmedOutput, true) !== null) {
+                    Log::warning('YouTubeTranscriptService: Transcript script had non-zero exit but produced valid JSON, ignoring stderr', [
+                        'exitCode' => $process->getExitCode(),
+                        'stderr' => substr($errorOutput, 0, 200)
+                    ]);
+                } else {
                 Log::error('YouTubeTranscriptService: Python script failed', [
                     'exitCode' => $process->getExitCode(),
                     'stdout' => substr($output, 0, 500),
@@ -104,6 +112,7 @@ class YouTubeTranscriptService
                 }
 
                 throw new Exception('Không thể lấy transcript: ' . $errorMsg);
+                }
             }
 
             if (empty($output)) {
@@ -214,7 +223,8 @@ class YouTubeTranscriptService
             }
 
             // Use Symfony Process for reliable execution
-            $process = new Process(['python', $pythonScript, $videoId]);
+            $pythonCmd = env('PYTHON_PATH', 'python');
+            $process = new Process([$pythonCmd, $pythonScript, $videoId]);
             $process->setTimeout(30); // 30 seconds timeout
             $process->setIdleTimeout(30);
 
@@ -235,11 +245,20 @@ class YouTubeTranscriptService
             ]);
 
             if (!$process->isSuccessful()) {
-                Log::error('YouTubeTranscriptService: Python metadata script failed', [
-                    'exitCode' => $process->getExitCode(),
-                    'error' => substr($errorOutput, 0, 500)
-                ]);
-                throw new Exception('Không thể lấy metadata từ YouTube. Lỗi: ' . substr($errorOutput, 0, 200));
+                // If stdout has valid JSON, ignore stderr warnings (e.g. Python installer messages)
+                $trimmedOutput = trim($output);
+                if (!empty($trimmedOutput) && json_decode($trimmedOutput, true) !== null) {
+                    Log::warning('YouTubeTranscriptService: Script had non-zero exit but produced valid JSON, ignoring stderr', [
+                        'exitCode' => $process->getExitCode(),
+                        'stderr' => substr($errorOutput, 0, 200)
+                    ]);
+                } else {
+                    Log::error('YouTubeTranscriptService: Python metadata script failed', [
+                        'exitCode' => $process->getExitCode(),
+                        'error' => substr($errorOutput, 0, 500)
+                    ]);
+                    throw new Exception('Không thể lấy metadata từ YouTube. Lỗi: ' . substr($errorOutput, 0, 200));
+                }
             }
 
             if (empty($output)) {

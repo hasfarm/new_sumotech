@@ -127,34 +127,174 @@ class Docsach24Scraper
     {
         $this->chapters = [];
         $chapterNumber = 1;
-        $seenUrls = [];
+        $seenChapterUrls = [];
+        $pendingPages = [
+            [
+                'url' => $this->normalizeUrl($this->url),
+                'html' => $html,
+            ],
+        ];
+        $seenPageUrls = [];
+        $maxPages = 50;
 
-        if (preg_match_all('/<a[^>]*href=["\']([^"\']*\/doc-sach\/[^"\']+)["\'][^>]*>([^<]+)<\/a>/i', $html, $matches, PREG_SET_ORDER)) {
-            foreach ($matches as $match) {
-                $chapterUrl = trim($match[1]);
-                $chapterTitle = html_entity_decode(trim($match[2]), ENT_QUOTES, 'UTF-8');
+        while (!empty($pendingPages) && count($seenPageUrls) < $maxPages) {
+            $page = array_shift($pendingPages);
+            $pageUrl = $page['url'];
 
-                if ($chapterUrl === '' || $chapterTitle === '') {
-                    continue;
+            if ($pageUrl === '' || isset($seenPageUrls[$pageUrl])) {
+                continue;
+            }
+
+            $seenPageUrls[$pageUrl] = true;
+
+            $pageHtml = $page['html'];
+            if ($pageHtml === null) {
+                $pageHtml = $this->fetchHtml($pageUrl);
+            }
+
+            if (!$pageHtml) {
+                continue;
+            }
+
+            $this->extractChaptersFromHtml($pageHtml, $chapterNumber, $seenChapterUrls);
+
+            $nextPageUrls = $this->extractPaginationUrls($pageHtml, $pageUrl);
+            foreach ($nextPageUrls as $nextPageUrl) {
+                if (!isset($seenPageUrls[$nextPageUrl])) {
+                    $pendingPages[] = [
+                        'url' => $nextPageUrl,
+                        'html' => null,
+                    ];
                 }
-
-                if (isset($seenUrls[$chapterUrl])) {
-                    continue;
-                }
-
-                if (strpos($chapterUrl, 'http') !== 0) {
-                    $chapterUrl = 'https://docsach24.co' . $chapterUrl;
-                }
-
-                $this->chapters[] = [
-                    'number' => $chapterNumber,
-                    'title' => $chapterTitle,
-                    'url' => $chapterUrl
-                ];
-                $seenUrls[$chapterUrl] = true;
-                $chapterNumber++;
             }
         }
+    }
+
+    /**
+     * Extract chapter links from a chapter-list page.
+     */
+    protected function extractChaptersFromHtml($html, &$chapterNumber, array &$seenChapterUrls)
+    {
+        if (!preg_match_all('/<a[^>]*href=["\']([^"\']*\/doc-sach\/[^"\']+)["\'][^>]*>([^<]+)<\/a>/i', $html, $matches, PREG_SET_ORDER)) {
+            return;
+        }
+
+        foreach ($matches as $match) {
+            $chapterUrl = $this->normalizeUrl(trim($match[1]));
+            $chapterTitle = html_entity_decode(trim($match[2]), ENT_QUOTES, 'UTF-8');
+
+            if ($chapterUrl === '' || $chapterTitle === '') {
+                continue;
+            }
+
+            if (isset($seenChapterUrls[$chapterUrl])) {
+                continue;
+            }
+
+            $this->chapters[] = [
+                'number' => $chapterNumber,
+                'title' => $chapterTitle,
+                'url' => $chapterUrl,
+            ];
+            $seenChapterUrls[$chapterUrl] = true;
+            $chapterNumber++;
+        }
+    }
+
+    /**
+     * Extract pagination links for the same book page.
+     */
+    protected function extractPaginationUrls($html, $currentPageUrl)
+    {
+        $paginationUrls = [];
+        $currentUrlParts = parse_url($currentPageUrl);
+        $currentPath = $currentUrlParts['path'] ?? '';
+
+        if (!preg_match_all('/<a[^>]*href=["\']([^"\']+)["\'][^>]*>/i', $html, $matches)) {
+            return [];
+        }
+
+        foreach ($matches[1] as $href) {
+            $candidateUrl = $this->normalizeUrl($href);
+            if ($candidateUrl === '') {
+                continue;
+            }
+
+            $candidateParts = parse_url($candidateUrl);
+            if (($candidateParts['host'] ?? '') !== 'docsach24.co') {
+                continue;
+            }
+
+            if (($candidateParts['path'] ?? '') !== $currentPath) {
+                continue;
+            }
+
+            if (empty($candidateParts['query'])) {
+                continue;
+            }
+
+            parse_str($candidateParts['query'], $queryParams);
+            if (!isset($queryParams['page']) || !ctype_digit((string) $queryParams['page'])) {
+                continue;
+            }
+
+            $pageNumber = (int) $queryParams['page'];
+            // Page 1 is already parsed from the initial HTML, so skip it.
+            if ($pageNumber <= 1) {
+                continue;
+            }
+
+            $normalizedUrl = $this->normalizeBookPageUrl($candidateParts['path'], $pageNumber);
+            if ($normalizedUrl === $this->normalizeUrl($currentPageUrl)) {
+                continue;
+            }
+
+            $paginationUrls[$normalizedUrl] = true;
+        }
+
+        $urls = array_keys($paginationUrls);
+        usort($urls, function ($a, $b) {
+            parse_str((string) parse_url($a, PHP_URL_QUERY), $aParams);
+            parse_str((string) parse_url($b, PHP_URL_QUERY), $bParams);
+
+            return ((int) ($aParams['page'] ?? 1)) <=> ((int) ($bParams['page'] ?? 1));
+        });
+
+        return $urls;
+    }
+
+    /**
+     * Normalize URL to absolute docsach24.co URL.
+     */
+    protected function normalizeUrl($url)
+    {
+        $url = trim((string) $url);
+        if ($url === '') {
+            return '';
+        }
+
+        if (strpos($url, '//') === 0) {
+            return 'https:' . $url;
+        }
+
+        if (strpos($url, 'http://') === 0 || strpos($url, 'https://') === 0) {
+            return $url;
+        }
+
+        if ($url[0] === '/') {
+            return 'https://docsach24.co' . $url;
+        }
+
+        return 'https://docsach24.co/' . ltrim($url, '/');
+    }
+
+    /**
+     * Build normalized book page URL with page parameter.
+     */
+    protected function normalizeBookPageUrl($path, $pageNumber)
+    {
+        $path = '/' . ltrim((string) $path, '/');
+        return 'https://docsach24.co' . $path . '?page=' . (int) $pageNumber;
     }
 
     /**

@@ -16,23 +16,32 @@ class ExportService
      */
     public function generateSRT(DubSyncProject $project): string
     {
-        $alignedSegments = json_decode($project->aligned_segments, true);
+        // Prefer translated_segments (Vietnamese), fallback to aligned/segments (original)
+        $translatedSegments = $project->translated_segments ?: [];
+        $timingSegments     = $project->aligned_segments ?: $project->segments ?: [];
 
-        if (!$alignedSegments) {
-            throw new Exception('No aligned segments found');
+        if (empty($timingSegments)) {
+            throw new Exception('No segments found for SRT export');
+        }
+
+        // Build a lookup: index => translated text
+        $translatedMap = [];
+        foreach ($translatedSegments as $i => $ts) {
+            $translatedMap[$i] = trim($ts['text'] ?? '');
         }
 
         $srtContent = '';
+        $seq = 1;
 
-        foreach ($alignedSegments as $index => $segment) {
-            $sequenceNumber = $index + 1;
-            $startTime = $this->formatSRTTime($segment['start_time']);
-            $endTime = $this->formatSRTTime($segment['end_time']);
-            $text = $segment['text'];
+        foreach ($timingSegments as $i => $segment) {
+            $startTime = $this->formatSRTTime($segment['start_time'] ?? $segment['start'] ?? 0);
+            $endTime   = $this->formatSRTTime($segment['end_time']   ?? $segment['end']   ?? 0);
+            // Use translated text if available, otherwise fall back to segment text
+            $text      = $translatedMap[$i] ?? trim($segment['text'] ?? '');
+            if ($text === '') continue;
 
-            $srtContent .= "{$sequenceNumber}\n";
-            $srtContent .= "{$startTime} --> {$endTime}\n";
-            $srtContent .= "{$text}\n\n";
+            $srtContent .= "{$seq}\n{$startTime} --> {$endTime}\n{$text}\n\n";
+            $seq++;
         }
 
         $filename = "dubsync/exports/project_{$project->id}_" . time() . ".srt";
@@ -49,21 +58,27 @@ class ExportService
      */
     public function generateVTT(DubSyncProject $project): string
     {
-        $alignedSegments = json_decode($project->aligned_segments, true);
+        $translatedSegments = $project->translated_segments ?: [];
+        $timingSegments     = $project->aligned_segments ?: $project->segments ?: [];
 
-        if (!$alignedSegments) {
-            throw new Exception('No aligned segments found');
+        if (empty($timingSegments)) {
+            throw new Exception('No segments found for VTT export');
+        }
+
+        $translatedMap = [];
+        foreach ($translatedSegments as $i => $ts) {
+            $translatedMap[$i] = trim($ts['text'] ?? '');
         }
 
         $vttContent = "WEBVTT\n\n";
 
-        foreach ($alignedSegments as $index => $segment) {
-            $startTime = $this->formatVTTTime($segment['start_time']);
-            $endTime = $this->formatVTTTime($segment['end_time']);
-            $text = $segment['text'];
+        foreach ($timingSegments as $i => $segment) {
+            $startTime = $this->formatVTTTime($segment['start_time'] ?? $segment['start'] ?? 0);
+            $endTime   = $this->formatVTTTime($segment['end_time']   ?? $segment['end']   ?? 0);
+            $text      = $translatedMap[$i] ?? trim($segment['text'] ?? '');
+            if ($text === '') continue;
 
-            $vttContent .= "{$startTime} --> {$endTime}\n";
-            $vttContent .= "{$text}\n\n";
+            $vttContent .= "{$startTime} --> {$endTime}\n{$text}\n\n";
         }
 
         $filename = "dubsync/exports/project_{$project->id}_" . time() . ".vtt";

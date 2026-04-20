@@ -1,4 +1,4 @@
- @extends('layouts.app')
+ch  @extends('layouts.app')
 
  @section('content')
      <style>
@@ -2036,6 +2036,31 @@
                                  </div>
                              </div>
 
+                            <div class="mb-4 p-3 border border-fuchsia-200 bg-white rounded-lg">
+                                <div class="flex items-center justify-between mb-2">
+                                    <p class="text-xs font-semibold text-fuchsia-800">Tạo thủ công 1 short (không dùng AI plan)</p>
+                                    <button type="button" id="createManualShortBtn"
+                                        class="bg-fuchsia-600 hover:bg-fuchsia-700 text-white px-3 py-1.5 rounded text-xs font-semibold transition">
+                                        ➕ Thêm short thủ công
+                                    </button>
+                                </div>
+                                <div class="grid grid-cols-1 md:grid-cols-4 gap-2">
+                                    <input type="text" id="manualShortTitle"
+                                        class="md:col-span-2 w-full px-3 py-2 border border-fuchsia-200 rounded text-xs focus:outline-none focus:border-fuchsia-500"
+                                        placeholder="Tiêu đề short (tuỳ chọn)">
+                                    <input type="text" id="manualShortStyle"
+                                        class="w-full px-3 py-2 border border-fuchsia-200 rounded text-xs focus:outline-none focus:border-fuchsia-500"
+                                        placeholder="Phong cách (vd: Drama)" value="Cinematic">
+                                    <input type="text" id="manualShortImagePrompt"
+                                        class="w-full px-3 py-2 border border-fuchsia-200 rounded text-xs focus:outline-none focus:border-fuchsia-500"
+                                        placeholder="Prompt ảnh (tuỳ chọn)">
+                                </div>
+                                <textarea id="manualShortScript" rows="3"
+                                    class="mt-2 w-full px-3 py-2 border border-fuchsia-200 rounded text-xs focus:outline-none focus:border-fuchsia-500"
+                                    placeholder="Nhập script short để đọc TTS (bắt buộc)"></textarea>
+                                <p class="mt-1 text-[11px] text-gray-500">Mẹo: để trống prompt ảnh nếu muốn hệ thống tự tạo prompt mặc định từ script.</p>
+                            </div>
+
                              <div class="flex flex-wrap items-center gap-2 mb-3">
                                  <label class="inline-flex items-center gap-2 text-xs text-gray-600 cursor-pointer">
                                      <input type="checkbox" id="selectAllShortVideos"
@@ -2605,6 +2630,48 @@
                  <!-- Chapters Section -->
                  <div class="bg-white overflow-hidden shadow-sm sm:rounded-lg">
                      <div class="p-6">
+                        @php
+                            $chaptersWithContent = $audioBook->chapters->filter(function ($chapter) {
+                                return trim((string) $chapter->content) !== '';
+                            });
+                            $totalChaptersWithContent = $chaptersWithContent->count();
+                            $chunkedContentChapters = $chaptersWithContent->filter(function ($chapter) {
+                                return $chapter->chunks->count() > 0;
+                            })->count();
+                            $remainingUnchunkedChapters = max(0, $totalChaptersWithContent - $chunkedContentChapters);
+                            $pendingEmbeddingChunks = $chaptersWithContent
+                                ->flatMap(function ($chapter) {
+                                    return $chapter->chunks;
+                                })
+                                ->where('embedding_status', 'pending')
+                                ->count();
+                            $processingEmbeddingChunks = $chaptersWithContent
+                                ->flatMap(function ($chapter) {
+                                    return $chapter->chunks;
+                                })
+                                ->where('embedding_status', 'processing')
+                                ->count();
+                            $chunkEmbeddingMode =
+                                $remainingUnchunkedChapters > 0
+                                    ? 'chunk_and_embedding'
+                                    : ($pendingEmbeddingChunks > 0 ? 'embedding_only' : ($processingEmbeddingChunks > 0 ? 'processing' : 'locked'));
+                            $canChunkAndEmbedding = in_array($chunkEmbeddingMode, ['chunk_and_embedding', 'embedding_only'], true);
+                            $chunkEmbeddingButtonLabel =
+                                $chunkEmbeddingMode === 'chunk_and_embedding'
+                                    ? '🧩 Chunk & Embedding'
+                                    : ($chunkEmbeddingMode === 'embedding_only'
+                                        ? '🧠 Embedding'
+                                        : ($chunkEmbeddingMode === 'processing' ? '⏳ Embedding...' : '✅ Đã hoàn tất'));
+                            $chunkEmbeddingButtonTitle =
+                                $chunkEmbeddingMode === 'chunk_and_embedding'
+                                    ? "Còn {$remainingUnchunkedChapters} chương chưa chunk"
+                                    : ($chunkEmbeddingMode === 'embedding_only'
+                                        ? "Có {$pendingEmbeddingChunks} chunk pending embedding"
+                                        : ($chunkEmbeddingMode === 'processing'
+                                            ? "Đang xử lý {$processingEmbeddingChunks} chunk embedding"
+                                            : 'Toàn bộ chunk đã embedding xong'));
+                        @endphp
+
                          <div class="flex flex-col sm:flex-row sm:justify-between sm:items-center gap-3 mb-6" id="chapterToolbarAnchor">
                              <div class="flex items-center gap-4">
                                  <h3 class="text-base sm:text-lg font-semibold text-gray-800">📖 Danh sách chương</h3>
@@ -2640,10 +2707,27 @@
                                      class="bg-amber-600 hover:bg-amber-700 text-white font-semibold py-2 px-4 rounded-lg transition duration-200">
                                      🛠️ Fix ký tự đầu
                                  </button>
+                                 <button id="scanTtsIssuesBtn" onclick="scanTtsVietnameseIssuesAllChapters()"
+                                     class="bg-rose-600 hover:bg-rose-700 text-white font-semibold py-2 px-4 rounded-lg transition duration-200">
+                                     🧪 Quét lỗi TTS tiếng Việt
+                                 </button>
+                                 <button id="chunkEmbeddingBtn" onclick="chunkAndEmbeddingAllChapters()"
+                                     data-mode="{{ $chunkEmbeddingMode }}"
+                                     @disabled(!$canChunkAndEmbedding)
+                                     title="{{ $chunkEmbeddingButtonTitle }}"
+                                     class="{{ $canChunkAndEmbedding
+                                         ? 'bg-indigo-600 hover:bg-indigo-700 text-white'
+                                         : 'bg-gray-300 text-gray-600 cursor-not-allowed' }} font-semibold py-2 px-4 rounded-lg transition duration-200">
+                                     {{ $chunkEmbeddingButtonLabel }}
+                                 </button>
                                  <button onclick="openScrapeModal()"
                                      class="bg-green-600 hover:bg-green-700 text-white font-semibold py-2 px-4 rounded-lg transition duration-200">
                                      🌐 Scrape
                                  </button>
+                                 <a href="{{ route('audiobooks.export.word', $audioBook) }}" target="_blank"
+                                     class="bg-purple-600 hover:bg-purple-700 text-white font-semibold py-2 px-4 rounded-lg transition duration-200 inline-block">
+                                     📄 Xuất TXT
+                                 </a>
                                  <a href="{{ route('audiobooks.chapters.create', $audioBook) }}"
                                      class="bg-blue-600 hover:bg-blue-700 text-white font-semibold py-2 px-4 rounded-lg transition duration-200">
                                      + Thêm chương
@@ -2685,14 +2769,93 @@
                                          class="bg-orange-600 hover:bg-orange-700 text-white font-semibold py-1.5 px-3 rounded-lg transition duration-200 text-sm hidden">
                                          🔊 Boost +16dB (<span id="selectedBoostCountFloating">0</span>)
                                      </button>
+                                     <button id="scanTtsIssuesBtnFloating" onclick="scanTtsVietnameseIssuesAllChapters()"
+                                         class="bg-rose-600 hover:bg-rose-700 text-white font-semibold py-1.5 px-3 rounded-lg transition duration-200 text-sm">
+                                         🧪 Quét lỗi TTS
+                                     </button>
+                                     <button id="chunkEmbeddingBtnFloating" onclick="chunkAndEmbeddingAllChapters()"
+                                         data-mode="{{ $chunkEmbeddingMode }}"
+                                         @disabled(!$canChunkAndEmbedding)
+                                         title="{{ $chunkEmbeddingButtonTitle }}"
+                                         class="{{ $canChunkAndEmbedding
+                                             ? 'bg-indigo-600 hover:bg-indigo-700 text-white'
+                                             : 'bg-gray-300 text-gray-600 cursor-not-allowed' }} font-semibold py-1.5 px-3 rounded-lg transition duration-200 text-sm">
+                                         {{ $chunkEmbeddingButtonLabel }}
+                                     </button>
                                      <button onclick="openScrapeModal()"
                                          class="bg-green-600 hover:bg-green-700 text-white font-semibold py-1.5 px-3 rounded-lg transition duration-200 text-sm">
                                          🌐 Scrape
                                      </button>
+                                     <a href="{{ route('audiobooks.export.word', $audioBook) }}" target="_blank"
+                                         class="bg-purple-600 hover:bg-purple-700 text-white font-semibold py-1.5 px-3 rounded-lg transition duration-200 text-sm inline-block">
+                                         📄 Xuất TXT
+                                     </a>
                                      <a href="{{ route('audiobooks.chapters.create', $audioBook) }}"
                                          class="bg-blue-600 hover:bg-blue-700 text-white font-semibold py-1.5 px-3 rounded-lg transition duration-200 text-sm">
                                          + Thêm chương
                                      </a>
+                                 </div>
+                             </div>
+                         </div>
+
+                         <div id="ttsIssueScanPanel" class="hidden mb-6 p-4 bg-rose-50 border border-rose-200 rounded-lg">
+                             <div class="flex items-start justify-between gap-3">
+                                 <div>
+                                     <h4 class="text-sm font-semibold text-rose-800">🧪 Cảnh báo lỗi chữ có thể ảnh hưởng TTS tiếng Việt</h4>
+                                     <p class="text-xs text-rose-700 mt-1">Danh sách này là gợi ý tự động, có thể có false positive. Bạn nên kiểm tra lại trước khi sửa.</p>
+                                 </div>
+                                 <button type="button" onclick="hideTtsIssueScanPanel()"
+                                     class="text-xs bg-white hover:bg-rose-100 text-rose-700 border border-rose-200 px-2 py-1 rounded transition">
+                                     Ẩn
+                                 </button>
+                             </div>
+                             <div id="ttsIssueScanStatus" class="mt-3 text-sm text-rose-700"></div>
+                             <div id="ttsIssueScanSummary" class="mt-3"></div>
+
+                             <!-- Proper nouns section -->
+                             <div class="tts-proper-nouns-section hidden mt-4 p-3 bg-blue-50 border border-blue-200 rounded-lg">
+                                 <h5 class="text-xs font-semibold text-blue-800 mb-2">📛 Tên riêng & địa danh phát hiện trong toàn tài liệu <span class="font-normal text-blue-600">(kiểm tra cách đọc TTS)</span></h5>
+                                 <div id="ttsProperNounsPanel" class="text-sm text-blue-700"></div>
+                             </div>
+
+                             <div id="ttsIssueScanList" class="mt-3 space-y-3 max-h-[420px] overflow-y-auto pr-1"></div>
+                         </div>
+
+                         <div id="chunkEmbeddingPanel" class="hidden mb-6 p-4 bg-indigo-50 border border-indigo-200 rounded-lg">
+                             <div class="flex items-start justify-between gap-3">
+                                 <div>
+                                     <h4 class="text-sm font-semibold text-indigo-800">🧩 Chunk &amp; Embedding toàn bộ sách</h4>
+                                     <p class="text-xs text-indigo-700 mt-1">Bước 1: cắt chương thành chunk. Bước 2: đẩy các chunk <code>pending</code> vào queue embedding.</p>
+                                 </div>
+                                 <button type="button" onclick="document.getElementById('chunkEmbeddingPanel')?.classList.add('hidden')"
+                                     class="text-xs bg-white hover:bg-indigo-100 text-indigo-700 border border-indigo-200 px-2 py-1 rounded transition">
+                                     Ẩn
+                                 </button>
+                             </div>
+                             <div id="chunkEmbeddingStatus" class="mt-3 text-sm text-indigo-700"></div>
+                         </div>
+
+                         <div id="ttsIssueParagraphModal"
+                             class="fixed inset-0 z-50 hidden items-center justify-center bg-black/60 p-4">
+                             <div class="w-full max-w-3xl rounded-xl bg-white shadow-2xl flex flex-col" style="height:82vh;max-height:82vh">
+                                 <div class="flex items-center justify-between border-b border-gray-200 px-4 py-3 shrink-0">
+                                     <h4 class="text-sm font-semibold text-gray-800">📄 Đoạn văn chứa lỗi nghi ngờ</h4>
+                                     <button type="button" onclick="closeTtsIssueParagraphModal()"
+                                         class="rounded px-2 py-1 text-sm text-gray-500 hover:bg-gray-100 hover:text-gray-700">✕</button>
+                                 </div>
+                                 <div class="px-4 pt-3 shrink-0">
+                                     <p id="ttsIssueParagraphMeta" class="text-xs text-rose-700"></p>
+                                     <p class="text-[11px] text-gray-500 mt-1">✏️ Bạn có thể chỉnh sửa trực tiếp đoạn văn bên dưới rồi nhấn <strong>Lưu</strong>.</p>
+                                 </div>
+                                 <textarea id="ttsIssueParagraphContent"
+                                     class="mx-4 mb-2 mt-2 flex-1 min-h-[300px] rounded-lg border border-gray-300 bg-gray-50 p-3 text-sm leading-6 text-gray-800 resize-none focus:outline-none focus:border-rose-400 focus:ring-1 focus:ring-rose-300" style="min-height:300px"
+                                     spellcheck="false"></textarea>
+                                 <div id="ttsIssueParagraphSaveMsg" class="mx-4 mb-1 text-xs hidden"></div>
+                                 <div class="flex items-center justify-end gap-2 border-t border-gray-200 px-4 py-3 shrink-0">
+                                     <button type="button" onclick="closeTtsIssueParagraphModal()"
+                                         class="rounded-lg bg-gray-100 px-3 py-1.5 text-sm font-medium text-gray-700 transition hover:bg-gray-200">Đóng</button>
+                                     <button type="button" id="ttsIssueParagraphSaveBtn" onclick="saveTtsIssueParagraphEdit()"
+                                         class="rounded-lg bg-rose-600 px-3 py-1.5 text-sm font-medium text-white transition hover:bg-rose-700 disabled:opacity-50">💾 Lưu</button>
                                  </div>
                              </div>
                          </div>
@@ -3826,14 +3989,32 @@
              }
          }
 
-         // Restore state from localStorage
+         // Restore state from localStorage OR auto-expand if URL has #chapter-* fragment
          document.addEventListener('DOMContentLoaded', function() {
-             if (localStorage.getItem('chapterListExpanded') === '1') {
+             const hash = window.location.hash;
+             const isChapterHash = hash && hash.startsWith('#chapter-');
+
+             if (isChapterHash || localStorage.getItem('chapterListExpanded') === '1') {
                  const container = document.getElementById('chapterListContainer');
                  if (container) {
                      container.style.display = '';
                      document.getElementById('chapterListArrow').style.transform = 'rotate(90deg)';
                      document.getElementById('chapterListToggleText').textContent = 'Ẩn danh sách chương';
+                     localStorage.setItem('chapterListExpanded', '1');
+                 }
+             }
+
+             // Scroll to and highlight the target chapter
+             if (isChapterHash) {
+                 const target = document.querySelector(hash);
+                 if (target) {
+                     setTimeout(function() {
+                         target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                         target.classList.add('ring-2', 'ring-blue-500', 'bg-blue-50');
+                         setTimeout(function() {
+                             target.classList.remove('ring-2', 'ring-blue-500', 'bg-blue-50');
+                         }, 3000);
+                     }, 200);
                  }
              }
          });
@@ -4021,7 +4202,15 @@
              });
 
              const defaultButton = document.querySelector('.sidebar-menu-btn[data-default="true"]') || sidebarButtons[0];
-             if (defaultButton) {
+
+             // If URL has #chapter-* hash, activate the chapters tab instead of default
+             const hash = window.location.hash;
+             if (hash && hash.startsWith('#chapter-')) {
+                 const chaptersBtn = document.querySelector('.sidebar-menu-btn[data-tab="chapters"]');
+                 if (chaptersBtn) {
+                     chaptersBtn.click();
+                 }
+             } else if (defaultButton) {
                  defaultButton.click();
              }
          }
@@ -4082,9 +4271,8 @@
          const currentOutroMusicPath = @json($audioBook->outro_music);
          const systemMusicFiles = @json($systemMusicFilesForModal ?? []);
          let musicPickerTargetType = 'intro';
-         const deleteChapterUrlBase =
-             "{{ route('audiobooks.chapters.destroy', ['audioBook' => $audioBook->id, 'chapter' => 1]) }}"
-             .replace(/\/1$/, '');
+         const deleteChapterUrlTemplate =
+             "{{ route('audiobooks.chapters.destroy', ['audioBook' => $audioBook->id, 'chapter' => 'CHAPTER_ID_PLACEHOLDER']) }}";
 
          // ========== CSRF TOKEN HELPER ==========
          function getCsrfToken() {
@@ -5321,6 +5509,7 @@
          function setupShortVideoTab() {
              const btnRefresh = document.getElementById('refreshShortVideosBtn');
              const btnPlans = document.getElementById('generateShortPlansBtn');
+             const btnManual = document.getElementById('createManualShortBtn');
              const btnAssets = document.getElementById('generateShortAssetsBtn');
              const btnSelectedTts = document.getElementById('generateSelectedShortTtsBtn');
              const btnSelectedImages = document.getElementById('generateSelectedShortImagesBtn');
@@ -5330,6 +5519,10 @@
              const countInput = document.getElementById('shortVideoCount');
              const providerSelect = document.getElementById('shortVideoProvider');
              const imageProviderSelect = document.getElementById('shortImageProvider');
+             const manualTitleInput = document.getElementById('manualShortTitle');
+             const manualStyleInput = document.getElementById('manualShortStyle');
+             const manualPromptInput = document.getElementById('manualShortImagePrompt');
+             const manualScriptInput = document.getElementById('manualShortScript');
              const ttsProvider = document.getElementById('ttsProviderSelect');
             const workspaceModal = document.getElementById('shortWorkspaceModal');
             const closeWorkspaceBtn = document.getElementById('closeShortWorkspaceModalBtn');
@@ -5404,6 +5597,53 @@
                          setShortVideoStatus(`❌ ${error.message}`, 'error');
                      } finally {
                          btnPlans.disabled = false;
+                     }
+                 });
+             }
+
+             if (btnManual) {
+                 btnManual.addEventListener('click', async function() {
+                     const script = (manualScriptInput?.value || '').trim();
+                     const title = (manualTitleInput?.value || '').trim();
+                     const style = (manualStyleInput?.value || '').trim();
+                     const imagePrompt = (manualPromptInput?.value || '').trim();
+
+                     if (script.length < 10) {
+                         setShortVideoStatus('❌ Script short thủ công phải từ 10 ký tự trở lên.', 'error');
+                         return;
+                     }
+
+                     btnManual.disabled = true;
+                     setShortVideoStatus('⏳ Đang tạo short thủ công...', 'info');
+                     try {
+                         const resp = await fetch(`/audiobooks/${audioBookId}/short-videos/manual`, {
+                             method: 'POST',
+                             headers: {
+                                 'Content-Type': 'application/json',
+                                 'X-CSRF-TOKEN': getCsrfToken(),
+                                 'Accept': 'application/json'
+                             },
+                             body: JSON.stringify({
+                                 title,
+                                 style,
+                                 script,
+                                 image_prompt: imagePrompt
+                             })
+                         });
+
+                         const data = await safeJson(resp);
+                         shortVideoItems = data.items || shortVideoItems;
+                         renderShortVideos(shortVideoItems);
+
+                         if (manualTitleInput) manualTitleInput.value = '';
+                         if (manualPromptInput) manualPromptInput.value = '';
+                         if (manualScriptInput) manualScriptInput.value = '';
+
+                         setShortVideoStatus(`✅ Đã thêm short thủ công #${data.created_index || '?'}.`, 'success');
+                     } catch (error) {
+                         setShortVideoStatus(`❌ ${error.message}`, 'error');
+                     } finally {
+                         btnManual.disabled = false;
                      }
                  });
              }
@@ -9464,6 +9704,7 @@
              setupVideoSegments();
              setupShortVideoTab();
              setupFloatingToolbar();
+             checkEmbeddingProgressOnLoad();
              initSidebarCollapse();
              initSidebarMenu(); // Initialize sidebar navigation
          });
@@ -10190,8 +10431,8 @@
                      continue;
                  }
                  try {
-                     const deleteUrl = `${deleteChapterUrlBase}/${chapterId}`;
-                     if (!deleteUrl.includes('/chapters/')) {
+                     const deleteUrl = deleteChapterUrlTemplate.replace('CHAPTER_ID_PLACEHOLDER', chapterId);
+                     if (!deleteUrl.includes('/chapters/') || deleteUrl.includes('CHAPTER_ID_PLACEHOLDER')) {
                          errorCount++;
                          console.error('Delete chapter error: invalid URL', deleteUrl);
                          continue;
@@ -13070,6 +13311,9 @@
          async function doFindReplace(previewOnly) {
              const search = document.getElementById('frSearch').value.trim();
              const replace = document.getElementById('frReplace').value;
+             const replaceTrimmed = replace.trim();
+             const isWhitespaceOnlyReplace = replace !== '' && replaceTrimmed === '';
+             const isSingleSpaceReplace = replace === ' ';
              const caseSensitive = document.getElementById('frCaseSensitive').checked;
              const previewEl = document.getElementById('frPreviewResult');
              const btn = document.getElementById('frReplaceBtn');
@@ -13077,6 +13321,14 @@
              if (!search) {
                  previewEl.innerHTML =
                      '<div class="p-3 bg-red-50 border border-red-300 rounded-lg text-red-700 text-sm">⚠️ Vui lòng nhập văn bản cần tìm.</div>';
+                 previewEl.classList.remove('hidden');
+                 return;
+             }
+
+             // Allow exactly one space, but block other whitespace-only replacements (tab/newline/multi-space).
+             if (isWhitespaceOnlyReplace && !isSingleSpaceReplace) {
+                 previewEl.innerHTML =
+                     '<div class="p-3 bg-red-50 border border-red-300 rounded-lg text-red-700 text-sm">⚠️ Bạn chỉ có thể dùng đúng 1 dấu cách để thay thế. Nếu muốn xóa thì để trống.</div>';
                  previewEl.classList.remove('hidden');
                  return;
              }
@@ -13107,7 +13359,24 @@
                          preview_only: previewOnly ? 1 : 0,
                      }),
                  });
-                 const result = await response.json();
+                 const text = await response.text();
+                 let result = {};
+                 try {
+                     result = text ? JSON.parse(text) : {};
+                 } catch (parseError) {
+                     throw new Error(`Phản hồi không hợp lệ từ server (HTTP ${response.status}).`);
+                 }
+
+                 if (!response.ok) {
+                     let errorMsg = result.error || result.message || '';
+                     if (!errorMsg && result.errors && typeof result.errors === 'object') {
+                         const firstFieldErrors = Object.values(result.errors).find((arr) => Array.isArray(arr) && arr.length);
+                         if (firstFieldErrors) {
+                             errorMsg = firstFieldErrors[0];
+                         }
+                     }
+                     throw new Error(errorMsg || `Yêu cầu thất bại (HTTP ${response.status}).`);
+                 }
 
                  if (result.success) {
                      if (result.total_matches === 0) {
@@ -13129,8 +13398,9 @@
                          setTimeout(() => closeFindReplaceModal(), 2000);
                      }
                  } else {
+                     const errorMsg = result.error || result.message || 'Có lỗi xảy ra.';
                      previewEl.innerHTML =
-                         `<div class="p-3 bg-red-50 border border-red-300 rounded-lg text-red-700 text-sm">❌ Có lỗi xảy ra.</div>`;
+                         `<div class="p-3 bg-red-50 border border-red-300 rounded-lg text-red-700 text-sm">❌ ${errorMsg}</div>`;
                  }
              } catch (e) {
                  previewEl.innerHTML =
@@ -13177,6 +13447,715 @@
              } finally {
                  btn.disabled = false;
                  btn.innerHTML = originalText;
+             }
+         }
+
+         let embeddingPollingInterval = null;
+
+         function applyChunkEmbeddingButtonState(state) {
+             const mainBtn = document.getElementById('chunkEmbeddingBtn');
+             const floatingBtn = document.getElementById('chunkEmbeddingBtnFloating');
+             const buttons = [mainBtn, floatingBtn].filter(Boolean);
+             if (!state || buttons.length === 0) {
+                 return;
+             }
+
+             const mode = String(state.mode || 'locked');
+             const canRun = !!state.can_run;
+             const label = String(state.label || (canRun ? '🧩 Chunk & Embedding' : '✅ Đã hoàn tất'));
+             const title = String(state.title || '');
+
+             buttons.forEach((btn) => {
+                 btn.dataset.mode = mode;
+                 btn.title = title;
+                 btn.disabled = !canRun;
+                 btn.innerHTML = label;
+
+                 btn.classList.remove('bg-indigo-600', 'hover:bg-indigo-700', 'text-white', 'bg-gray-300', 'text-gray-600', 'cursor-not-allowed');
+                 if (canRun) {
+                     btn.classList.add('bg-indigo-600', 'hover:bg-indigo-700', 'text-white');
+                 } else {
+                     btn.classList.add('bg-gray-300', 'text-gray-600', 'cursor-not-allowed');
+                 }
+             });
+         }
+
+         function renderEmbeddingProgress(data) {
+             const container = document.getElementById('embeddingProgressContainer');
+             const badge = document.getElementById('embeddingProgressBadge');
+             const statusEl = document.getElementById('embeddingProgressStatus');
+             const bar = document.getElementById('embeddingProgressBar');
+             const countsEl = document.getElementById('embeddingProgressCounts');
+             const percentEl = document.getElementById('embeddingProgressPercent');
+
+             if (!container || !badge || !statusEl || !bar || !countsEl || !percentEl) {
+                 return;
+             }
+
+             const counts = data.counts || {};
+             const total = Number(counts.total_chunks || 0);
+             const queued = Number(counts.queued_chunks || 0);
+             const processing = Number(counts.processing_chunks || 0);
+             const done = Number(counts.done_chunks || 0);
+             const error = Number(counts.error_chunks || 0);
+
+             if (data.status === 'idle' && total === 0) {
+                 container.classList.add('hidden');
+                 return;
+             }
+
+             container.classList.remove('hidden');
+
+             const status = String(data.status || 'queued');
+             const statusMap = {
+                 queued: { label: 'queued', className: 'bg-amber-100 text-amber-700' },
+                 processing: { label: 'processing', className: 'bg-blue-100 text-blue-700' },
+                 done: { label: 'done', className: 'bg-green-100 text-green-700' },
+                 error: { label: 'error', className: 'bg-red-100 text-red-700' },
+                 idle: { label: 'idle', className: 'bg-gray-100 text-gray-700' },
+             };
+             const statusStyle = statusMap[status] || statusMap.queued;
+
+             badge.textContent = statusStyle.label;
+             badge.className = `text-[11px] px-2 py-0.5 rounded-full ${statusStyle.className}`;
+
+             statusEl.textContent = data.message || 'Đang xử lý embedding...';
+
+             const percent = Number(data.percent || 0);
+             bar.style.width = `${Math.max(0, Math.min(100, percent))}%`;
+             percentEl.textContent = `${Math.max(0, Math.min(100, Math.round(percent)))}%`;
+
+             countsEl.textContent = `queued: ${queued} | processing: ${processing} | done: ${done} | error: ${error} | total: ${total}`;
+         }
+
+         function stopEmbeddingPolling() {
+             if (embeddingPollingInterval) {
+                 clearInterval(embeddingPollingInterval);
+                 embeddingPollingInterval = null;
+             }
+         }
+
+         function startEmbeddingPolling() {
+             if (embeddingPollingInterval) {
+                 return;
+             }
+             pollEmbeddingProgress();
+             embeddingPollingInterval = setInterval(pollEmbeddingProgress, 2500);
+         }
+
+         async function pollEmbeddingProgress() {
+             try {
+                 const response = await fetch('{{ route('audiobooks.embedding.progress', $audioBook) }}', {
+                     headers: {
+                         'Accept': 'application/json',
+                     },
+                 });
+
+                 if (!response.ok) {
+                     return null;
+                 }
+
+                 const data = await response.json();
+                 if (!data.success) {
+                     return null;
+                 }
+
+                 renderEmbeddingProgress(data);
+                 if (data.button_state) {
+                     applyChunkEmbeddingButtonState(data.button_state);
+                 }
+
+                 const counts = data.counts || {};
+                 const queued = Number(counts.queued_chunks || 0);
+                 const processing = Number(counts.processing_chunks || 0);
+
+                 if ((data.status === 'done' || data.status === 'error' || data.status === 'idle') && queued === 0 && processing === 0) {
+                     stopEmbeddingPolling();
+                 }
+
+                 return data;
+             } catch (e) {
+                 return null;
+             }
+         }
+
+         async function checkEmbeddingProgressOnLoad() {
+             const data = await pollEmbeddingProgress();
+             if (!data) {
+                 return;
+             }
+
+             if (data.status === 'queued' || data.status === 'processing') {
+                 startEmbeddingPolling();
+             }
+         }
+
+         async function chunkAndEmbeddingAllChapters() {
+             const mainBtn = document.getElementById('chunkEmbeddingBtn');
+             const floatingBtn = document.getElementById('chunkEmbeddingBtnFloating');
+             const panel = document.getElementById('chunkEmbeddingPanel');
+             const statusEl = document.getElementById('chunkEmbeddingStatus');
+
+             const activeButtons = [mainBtn, floatingBtn].filter(Boolean);
+             if (!panel || !statusEl || activeButtons.length === 0) {
+                 alert('Không tìm thấy nút hoặc vùng hiển thị Chunk & Embedding.');
+                 return;
+             }
+
+             const currentMode = String(activeButtons[0]?.dataset.mode || 'locked');
+             if (!['chunk_and_embedding', 'embedding_only'].includes(currentMode)) {
+                 return;
+             }
+
+             const embeddingOnly = currentMode === 'embedding_only';
+             const confirmMessage = embeddingOnly
+                 ? `Bắt đầu Embedding cho các chunk pending?
+
+Hệ thống sẽ KHÔNG tạo lại chunk, chỉ đưa các job embedding vào queue.`
+                 : `Bắt đầu Chunk & Embedding cho toàn bộ chương chưa chunk?
+
+Hệ thống sẽ:
+1) Cắt chapter thành chunk và lưu DB
+2) Đẩy các chunk có embedding_status = pending vào queue`;
+
+             if (!confirm(confirmMessage)) {
+                 return;
+             }
+
+             const esc = (typeof escapeHtml === 'function')
+                 ? escapeHtml
+                 : (text) => (text || '').replace(/&/g, '&amp;')
+                     .replace(/</g, '&lt;')
+                     .replace(/>/g, '&gt;')
+                     .replace(/"/g, '&quot;')
+                     .replace(/'/g, '&#039;');
+
+             const snapshots = activeButtons.map((btn) => ({
+                 btn,
+                 text: btn.innerHTML,
+                 disabled: btn.disabled,
+             }));
+
+             snapshots.forEach((item) => {
+                 item.btn.disabled = true;
+                 item.btn.innerHTML = embeddingOnly ? '⏳ Đang queue embedding...' : '⏳ Đang chunk...';
+             });
+
+             panel.classList.remove('hidden');
+             statusEl.innerHTML = embeddingOnly
+                 ? '<span class="text-indigo-700">⏳ Đang đưa các chunk pending vào queue embedding...</span>'
+                 : '<span class="text-indigo-700">⏳ Đang chunk và đưa embedding jobs vào queue...</span>';
+
+             let requestSucceeded = false;
+
+             try {
+                 const response = await fetch('{{ route('audiobooks.chunk.queue.embeddings', $audioBook) }}', {
+                     method: 'POST',
+                     headers: {
+                         'Content-Type': 'application/json',
+                         'X-CSRF-TOKEN': document.querySelector('meta[name="csrf-token"]').content,
+                         'Accept': 'application/json',
+                     },
+                     body: JSON.stringify({}),
+                 });
+
+                 const text = await response.text();
+                 let result = {};
+                 try {
+                     result = text ? JSON.parse(text) : {};
+                 } catch (parseError) {
+                     throw new Error(`Phản hồi không hợp lệ từ server (HTTP ${response.status}).`);
+                 }
+
+                 if (!response.ok || !result.success) {
+                     let errorMsg = result.error || result.message || '';
+                     if (!errorMsg && result.errors && typeof result.errors === 'object') {
+                         const firstFieldErrors = Object.values(result.errors).find((arr) => Array.isArray(arr) && arr.length);
+                         if (firstFieldErrors) {
+                             errorMsg = firstFieldErrors[0];
+                         }
+                     }
+                     throw new Error(errorMsg || `Yêu cầu thất bại (HTTP ${response.status}).`);
+                 }
+
+                 const summary = result.summary || {};
+                 statusEl.innerHTML = `
+                    <div class="p-3 bg-white border border-indigo-200 rounded-lg text-sm text-indigo-900 space-y-1">
+                        <p class="font-semibold">✅ ${esc(result.message || 'Đã hoàn tất queue embedding.')}</p>
+                        <p>📚 Chương có nội dung: <strong>${Number(summary.total_chapters_with_content || 0)}</strong></p>
+                        <p>🧩 Chương mới được chunk: <strong>${Number(summary.newly_chunked_chapters || 0)}</strong></p>
+                        <p>📦 Chunk mới tạo: <strong>${Number(summary.new_chunks_created || 0)}</strong></p>
+                        <p>🚚 Jobs embedding đã queue: <strong>${Number(summary.queued_embedding_jobs || 0)}</strong></p>
+                        <p>🧮 Chương chưa chunk còn lại: <strong>${Number(summary.remaining_unchunked_chapters || 0)}</strong></p>
+                        <p>⏳ Chunk pending embedding: <strong>${Number(summary.pending_embedding_chunks || 0)}</strong></p>
+                    </div>
+                 `;
+
+                 if (result.button_state) {
+                     applyChunkEmbeddingButtonState(result.button_state);
+                 }
+
+                 requestSucceeded = true;
+                 startEmbeddingPolling();
+             } catch (e) {
+                 statusEl.innerHTML = `<span class="text-red-700">❌ Lỗi Chunk/Embedding: ${esc(e.message)}</span>`;
+             } finally {
+                 if (!requestSucceeded) {
+                     snapshots.forEach((item) => {
+                         item.btn.disabled = item.disabled;
+                         item.btn.innerHTML = item.text;
+                     });
+                 }
+             }
+         }
+
+         function hideTtsIssueScanPanel() {
+             const panel = document.getElementById('ttsIssueScanPanel');
+             if (panel) {
+                 panel.classList.add('hidden');
+             }
+         }
+
+         // State for TTS issue paragraph editing
+         let _ttsIssueChapterId = null;
+         let _ttsIssueOriginalParagraph = '';
+
+         function openTtsIssueParagraphModal(encodedParagraph, encodedMatchedText = '', chapterId = null) {
+             const modal = document.getElementById('ttsIssueParagraphModal');
+             const contentEl = document.getElementById('ttsIssueParagraphContent');
+             const metaEl = document.getElementById('ttsIssueParagraphMeta');
+             const saveMsg = document.getElementById('ttsIssueParagraphSaveMsg');
+
+             if (!modal || !contentEl || !metaEl) {
+                 return;
+             }
+
+             const esc = (typeof escapeHtml === 'function')
+                 ? escapeHtml
+                 : (text) => (text || '').replace(/&/g, '&amp;')
+                     .replace(/</g, '&lt;')
+                     .replace(/>/g, '&gt;')
+                     .replace(/"/g, '&quot;')
+                     .replace(/'/g, '&#039;');
+
+             let paragraph = '';
+             let matchedText = '';
+
+             try {
+                 paragraph = decodeURIComponent(encodedParagraph || '');
+             } catch (e) {
+                 paragraph = encodedParagraph || '';
+             }
+
+             try {
+                 matchedText = decodeURIComponent(encodedMatchedText || '');
+             } catch (e) {
+                 matchedText = encodedMatchedText || '';
+             }
+
+             // Store state for save
+             _ttsIssueChapterId = chapterId;
+             _ttsIssueOriginalParagraph = paragraph;
+
+             metaEl.innerHTML = matchedText
+                 ? `Từ nghi lỗi: <code class="rounded bg-rose-100 px-1 py-0.5 text-[11px] text-rose-700">${esc(matchedText)}</code>`
+                 : '';
+
+             // Reset save message
+             if (saveMsg) {
+                 saveMsg.classList.add('hidden');
+                 saveMsg.textContent = '';
+             }
+
+             // Set textarea content
+             contentEl.value = paragraph || '';
+
+             modal.classList.remove('hidden');
+             modal.classList.add('flex');
+
+             // Scroll to and highlight matched text in textarea
+             const doHighlight = (searchText) => {
+                 // Try exact match first, then case-insensitive
+                 let idx = paragraph.indexOf(searchText);
+                 if (idx === -1) {
+                     idx = paragraph.toLowerCase().indexOf(searchText.toLowerCase());
+                 }
+                 if (idx !== -1) {
+                     contentEl.focus();
+                     contentEl.setSelectionRange(idx, idx + searchText.length);
+                     // Count actual newlines before match for accurate scroll
+                     const linesBefore = (paragraph.substring(0, idx).match(/\n/g) || []).length;
+                     const lineHeight = parseInt(getComputedStyle(contentEl).lineHeight) || 22;
+                     contentEl.scrollTop = Math.max(0, linesBefore * lineHeight - contentEl.clientHeight / 3);
+                 } else {
+                     contentEl.focus();
+                     contentEl.setSelectionRange(0, 0);
+                     contentEl.scrollTop = 0;
+                 }
+             };
+             if (matchedText) {
+                 setTimeout(() => doHighlight(matchedText), 100);
+             } else {
+                 setTimeout(() => {
+                     contentEl.focus();
+                     contentEl.setSelectionRange(0, 0);
+                     contentEl.scrollTop = 0;
+                 }, 100);
+             }
+         }
+
+         function closeTtsIssueParagraphModal() {
+             const modal = document.getElementById('ttsIssueParagraphModal');
+             if (!modal) {
+                 return;
+             }
+             modal.classList.add('hidden');
+             modal.classList.remove('flex');
+             _ttsIssueChapterId = null;
+             _ttsIssueOriginalParagraph = '';
+         }
+
+         async function saveTtsIssueParagraphEdit() {
+             const contentEl = document.getElementById('ttsIssueParagraphContent');
+             const saveBtn = document.getElementById('ttsIssueParagraphSaveBtn');
+             const saveMsg = document.getElementById('ttsIssueParagraphSaveMsg');
+
+             if (!contentEl || !_ttsIssueChapterId) {
+                 if (saveMsg) {
+                     saveMsg.textContent = 'Lỗi: Không xác định được chapter cần lưu.';
+                     saveMsg.className = 'mx-4 mb-1 text-xs text-red-600';
+                     saveMsg.classList.remove('hidden');
+                 }
+                 return;
+             }
+
+             const replacement = contentEl.value;
+             if (replacement === _ttsIssueOriginalParagraph) {
+                 if (saveMsg) {
+                     saveMsg.textContent = 'Nội dung chưa thay đổi.';
+                     saveMsg.className = 'mx-4 mb-1 text-xs text-gray-500';
+                     saveMsg.classList.remove('hidden');
+                 }
+                 return;
+             }
+
+             if (saveBtn) saveBtn.disabled = true;
+             if (saveMsg) {
+                 saveMsg.textContent = 'Đang lưu...';
+                 saveMsg.className = 'mx-4 mb-1 text-xs text-gray-500';
+                 saveMsg.classList.remove('hidden');
+             }
+
+             try {
+                 const audioBookId = {{ $audioBook->id }};
+                 const url = `/audiobooks/${audioBookId}/chapters/${_ttsIssueChapterId}/fix-paragraph`;
+                 const resp = await fetch(url, {
+                     method: 'PATCH',
+                     headers: {
+                         'Content-Type': 'application/json',
+                         'X-CSRF-TOKEN': document.querySelector('meta[name="csrf-token"]')?.content || '',
+                         'Accept': 'application/json',
+                     },
+                     body: JSON.stringify({
+                         original: _ttsIssueOriginalParagraph,
+                         replacement: replacement,
+                     }),
+                 });
+
+                 const data = await resp.json();
+
+                 if (resp.ok && data.success) {
+                     _ttsIssueOriginalParagraph = replacement;
+                     if (saveMsg) {
+                         saveMsg.textContent = '✓ Đã lưu thành công.';
+                         saveMsg.className = 'mx-4 mb-1 text-xs text-emerald-600';
+                     }
+                 } else {
+                     if (saveMsg) {
+                         saveMsg.textContent = `Lỗi: ${data.message || data.error || 'Không thể lưu.'}`;
+                         saveMsg.className = 'mx-4 mb-1 text-xs text-red-600';
+                     }
+                 }
+             } catch (err) {
+                 if (saveMsg) {
+                     saveMsg.textContent = `Lỗi kết nối: ${err.message}`;
+                     saveMsg.className = 'mx-4 mb-1 text-xs text-red-600';
+                 }
+             } finally {
+                 if (saveBtn) saveBtn.disabled = false;
+             }
+         }
+
+         function scrollToChapterFromIssueScan(chapterId) {
+             const listContainer = document.getElementById('chapterListContainer');
+             const arrow = document.getElementById('chapterListArrow');
+             const text = document.getElementById('chapterListToggleText');
+
+             if (listContainer && listContainer.style.display === 'none') {
+                 listContainer.style.display = 'block';
+                 if (arrow) {
+                     arrow.classList.add('rotate-90');
+                 }
+                 if (text) {
+                     text.textContent = 'Ẩn danh sách chương';
+                 }
+             }
+
+             const chapterEl = document.getElementById(`chapter-${chapterId}`);
+             if (!chapterEl) {
+                 return;
+             }
+
+             chapterEl.scrollIntoView({
+                 behavior: 'smooth',
+                 block: 'center'
+             });
+
+             chapterEl.classList.add('ring-2', 'ring-rose-400');
+             setTimeout(() => {
+                 chapterEl.classList.remove('ring-2', 'ring-rose-400');
+             }, 2000);
+         }
+
+         async function scanTtsVietnameseIssuesAllChapters() {
+             const mainBtn = document.getElementById('scanTtsIssuesBtn');
+             const floatingBtn = document.getElementById('scanTtsIssuesBtnFloating');
+             const panel = document.getElementById('ttsIssueScanPanel');
+             const statusEl = document.getElementById('ttsIssueScanStatus');
+             const summaryEl = document.getElementById('ttsIssueScanSummary');
+             const listEl = document.getElementById('ttsIssueScanList');
+
+             if (!panel || !statusEl || !summaryEl || !listEl) {
+                 alert('Không tìm thấy vùng hiển thị kết quả quét.');
+                 return;
+             }
+
+             const activeButtons = [mainBtn, floatingBtn].filter(Boolean);
+             activeButtons.forEach((btn) => {
+                 btn.dataset.originalText = btn.innerHTML;
+                 btn.disabled = true;
+                 btn.innerHTML = '⏳ Đang quét...';
+             });
+
+             panel.classList.remove('hidden');
+             statusEl.innerHTML = '<span class="text-rose-700">⏳ Đang phân tích toàn bộ chương...</span>';
+             summaryEl.innerHTML = '';
+             listEl.innerHTML = '';
+
+             const esc = (typeof escapeHtml === 'function')
+                 ? escapeHtml
+                 : (text) => (text || '').replace(/&/g, '&amp;')
+                     .replace(/</g, '&lt;')
+                     .replace(/>/g, '&gt;')
+                     .replace(/"/g, '&quot;')
+                     .replace(/'/g, '&#039;');
+
+             try {
+                 const response = await fetch('{{ route('audiobooks.scan.tts.vietnamese.issues', $audioBook) }}', {
+                     method: 'POST',
+                     headers: {
+                         'Content-Type': 'application/json',
+                         'X-CSRF-TOKEN': document.querySelector('meta[name="csrf-token"]').content,
+                         'Accept': 'application/json',
+                     },
+                     body: JSON.stringify({}),
+                 });
+
+                 const result = await response.json();
+                 if (!response.ok || !result.success) {
+                     throw new Error(result.error || result.message || `HTTP ${response.status}`);
+                 }
+
+                 const summary     = result.summary || {};
+                 const chapters    = Array.isArray(result.chapters) ? result.chapters : [];
+                 const properNouns = Array.isArray(result.proper_nouns) ? result.proper_nouns : [];
+                 const typeCountsObj = summary.type_counts || {};
+                 const typeEntries = Object.entries(typeCountsObj).map(([type, item]) => ({
+                     type,
+                     label: String(item?.label || type),
+                     count: Number(item?.count || 0)
+                 }));
+                 const selectedTypes = new Set(typeEntries.map((entry) => entry.type));
+
+                 // ── Render proper nouns panel ──────────────────────────────
+                 const properNounsEl = document.getElementById('ttsProperNounsPanel');
+                 if (properNounsEl) {
+                     if (properNouns.length === 0) {
+                         properNounsEl.innerHTML = '<p class="text-xs text-gray-500 italic">Không phát hiện tên riêng đặc biệt.</p>';
+                     } else {
+                         let showAll = false;
+                         const LIMIT = 40;
+
+                         const render = () => {
+                             const visible = showAll ? properNouns : properNouns.slice(0, LIMIT);
+                             const tags = visible.map(n =>
+                                 `<span class="inline-flex items-center gap-1 bg-blue-50 border border-blue-200 text-blue-800 text-xs px-2 py-0.5 rounded-full cursor-pointer hover:bg-blue-100 select-all" title="Xuất hiện ${n.count} lần">${esc(n.text)} <em class="not-italic text-blue-400">${n.count}</em></span>`
+                             ).join('');
+                             const toggleBtn = properNouns.length > LIMIT
+                                 ? `<button type="button" id="properNounsToggle" class="text-xs text-blue-600 underline ml-1">${showAll ? 'Thu gọn' : `Xem thêm ${properNouns.length - LIMIT}…`}</button>`
+                                 : '';
+                             properNounsEl.innerHTML = `<div class="flex flex-wrap gap-1.5">${tags}</div>${toggleBtn}`;
+                             const toggleEl = document.getElementById('properNounsToggle');
+                             if (toggleEl) toggleEl.addEventListener('click', () => { showAll = !showAll; render(); });
+                         };
+                         render();
+                     }
+                     properNounsEl.closest('.tts-proper-nouns-section')?.classList.remove('hidden');
+                 }
+
+                 const getFilteredChapters = () => {
+                     return chapters.map((chapter) => {
+                         const issues = Array.isArray(chapter.issues) ? chapter.issues : [];
+                         const filteredIssues = selectedTypes.size === 0
+                             ? []
+                             : issues.filter((issue) => selectedTypes.has(issue.type || ''));
+
+                         return {
+                             ...chapter,
+                             filtered_issues: filteredIssues,
+                             filtered_issues_count: filteredIssues.length,
+                         };
+                     }).filter((chapter) => chapter.filtered_issues_count > 0);
+                 };
+
+                 function renderSummaryAndFilters() {
+                     const filteredChapters = getFilteredChapters();
+                     const filteredIssueCount = filteredChapters.reduce((sum, chapter) => sum + Number(chapter.filtered_issues_count || 0), 0);
+                     const allTypesSelected = typeEntries.length > 0 && selectedTypes.size === typeEntries.length;
+
+                     const typeButtons = typeEntries.map((entry) => {
+                         const isActive = selectedTypes.has(entry.type);
+                         const activeClass = isActive
+                             ? 'bg-rose-600 border-rose-600 text-white'
+                             : 'bg-white border-rose-200 text-rose-700 hover:bg-rose-100';
+
+                         return `
+                            <button type="button" data-filter-type="${esc(entry.type)}"
+                                class="tts-issue-type-filter inline-flex items-center border text-xs px-2 py-1 rounded-full transition ${activeClass}">
+                                ${esc(entry.label)}: <strong class="ml-1">${entry.count}</strong>
+                            </button>
+                         `;
+                     }).join('');
+
+                     const allBtnClass = allTypesSelected
+                         ? 'bg-gray-800 border-gray-800 text-white'
+                         : 'bg-white border-gray-300 text-gray-700 hover:bg-gray-100';
+
+                     summaryEl.innerHTML = `
+                        <div class="p-3 bg-white border border-rose-200 rounded-lg text-sm">
+                            <p class="text-rose-800 font-semibold">📊 Tổng hợp: ${Number(summary.total_issues || 0)} cảnh báo trong ${Number(summary.affected_chapters || 0)}/${Number(summary.total_chapters || 0)} chương.</p>
+                            ${summary.truncated ? '<p class="text-xs text-amber-700 mt-1">⚠️ Kết quả đã được giới hạn để tải nhanh. Bạn có thể xử lý đợt đầu rồi quét lại.</p>' : ''}
+                            ${typeEntries.length > 0 ? `<p class="text-xs text-rose-700 mt-2">🧩 Click nhóm lỗi để lọc. Đang hiển thị: <strong>${filteredIssueCount}</strong> lỗi trong <strong>${filteredChapters.length}</strong> chương.</p>` : ''}
+                            ${typeEntries.length > 0 ? `<div class="mt-2 flex flex-wrap gap-1.5">
+                                <button type="button" data-filter-type="__all__" class="tts-issue-type-filter inline-flex items-center border text-xs px-2 py-1 rounded-full transition ${allBtnClass}">Tất cả</button>
+                                ${typeButtons}
+                            </div>` : ''}
+                        </div>
+                     `;
+
+                     summaryEl.querySelectorAll('.tts-issue-type-filter').forEach((btn) => {
+                         btn.addEventListener('click', () => {
+                             const type = btn.getAttribute('data-filter-type');
+                             if (!type) {
+                                 return;
+                             }
+
+                             if (type === '__all__') {
+                                 selectedTypes.clear();
+                                 typeEntries.forEach((entry) => selectedTypes.add(entry.type));
+                             } else {
+                                 if (selectedTypes.has(type)) {
+                                     selectedTypes.delete(type);
+                                 } else {
+                                     selectedTypes.add(type);
+                                 }
+                             }
+
+                             renderSummaryAndFilters();
+                             renderFilteredList();
+                         });
+                     });
+                 }
+
+                 if (chapters.length === 0) {
+                     renderSummaryAndFilters();
+                     statusEl.innerHTML = '<span class="text-green-700">✅ Không phát hiện lỗi rõ ràng có thể gây sai đọc TTS.</span>';
+                     listEl.innerHTML = '';
+                     return;
+                 }
+
+                 statusEl.innerHTML = `<span class="text-rose-700">⚠️ ${esc(result.message || 'Đã hoàn tất quét.')}</span>`;
+
+                 function renderFilteredList() {
+                     const filteredChapters = getFilteredChapters();
+                     if (filteredChapters.length === 0) {
+                         listEl.innerHTML = `
+                            <div class="p-3 bg-white border border-rose-200 rounded-lg text-sm text-rose-700">
+                                Không có lỗi nào khớp với nhóm đang chọn.
+                            </div>
+                         `;
+                         return;
+                     }
+
+                     listEl.innerHTML = filteredChapters.map((chapter) => {
+                         const chapterTitle = chapter.chapter_title || `Chương ${chapter.chapter_number || ''}`;
+                         const issues = Array.isArray(chapter.filtered_issues) ? chapter.filtered_issues : [];
+                         const issuesHtml = issues.map((issue) => {
+                             const label = esc(issue.label || issue.type || 'Cảnh báo');
+                             const matchedText = esc(issue.matched_text || '');
+                             const context = esc(issue.context || '');
+                             const paragraph = encodeURIComponent(String(issue.paragraph || issue.context || ''));
+                             const matchedToken = encodeURIComponent(String(issue.matched_text || ''));
+                             const suggestion = esc(issue.suggestion || 'Kiểm tra và sửa lại theo cách đọc tự nhiên.');
+
+                             return `
+                                <li class="bg-white border border-gray-200 rounded-md p-2.5">
+                                    <div class="flex items-start justify-between gap-2">
+                                        <span class="text-[11px] font-semibold text-rose-700 bg-rose-100 px-1.5 py-0.5 rounded">${label}</span>
+                                        <code class="text-[11px] text-gray-800 bg-gray-100 px-1.5 py-0.5 rounded break-all">${matchedText}</code>
+                                    </div>
+                                    <p class="text-xs text-gray-700 mt-1">${context}</p>
+                                    <p class="text-[11px] text-emerald-700 mt-1">Gợi ý: ${suggestion}</p>
+                                    <div class="mt-2 flex justify-end">
+                                        <button type="button"
+                                            onclick="openTtsIssueParagraphModal('${paragraph}', '${matchedToken}', ${chapter.chapter_id})"
+                                            class="text-[11px] bg-white hover:bg-rose-100 text-rose-700 border border-rose-200 px-2 py-1 rounded transition">
+                                            📄 Xem đoạn văn
+                                        </button>
+                                    </div>
+                                </li>
+                             `;
+                         }).join('');
+
+                         return `
+                            <div class="border border-rose-200 bg-rose-100/40 rounded-lg p-3">
+                                <div class="flex items-center justify-between gap-3 mb-2">
+                                    <div>
+                                        <p class="text-sm font-semibold text-gray-800">📖 ${esc(chapterTitle)}</p>
+                                        <p class="text-xs text-gray-600">${Number(chapter.filtered_issues_count || 0)} cảnh báo${chapter.issues_truncated ? ' (đã giới hạn hiển thị)' : ''}</p>
+                                    </div>
+                                    <button type="button" onclick="scrollToChapterFromIssueScan(${Number(chapter.chapter_id || 0)})"
+                                        class="text-xs bg-white hover:bg-rose-100 text-rose-700 border border-rose-200 px-2 py-1 rounded transition">
+                                        🔗 Tới chương
+                                    </button>
+                                </div>
+                                <ul class="space-y-2">${issuesHtml}</ul>
+                            </div>
+                         `;
+                     }).join('');
+                 }
+
+                 renderSummaryAndFilters();
+                 renderFilteredList();
+             } catch (e) {
+                 statusEl.innerHTML = `<span class="text-red-700">❌ Lỗi quét văn bản: ${esc(e.message)}</span>`;
+                 summaryEl.innerHTML = '';
+                 listEl.innerHTML = '';
+             } finally {
+                 activeButtons.forEach((btn) => {
+                     btn.disabled = false;
+                     btn.innerHTML = btn.dataset.originalText || btn.innerHTML;
+                 });
              }
          }
 

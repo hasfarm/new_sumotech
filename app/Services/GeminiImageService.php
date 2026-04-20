@@ -33,9 +33,14 @@ class GeminiImageService
      */
     public function generateImage(string $prompt, string $outputPath, string $aspectRatio = '16:9', string $provider = 'gemini'): array
     {
-        $provider = strtolower(trim($provider));
-        if ($provider === 'flux') {
-            return app(FluxImageService::class)->generateImage($prompt, $outputPath, $aspectRatio);
+        $provider = $this->normalizeImageProvider($provider);
+        if (str_starts_with($provider, 'flux')) {
+            return app(FluxImageService::class)->generateImage(
+                $prompt,
+                $outputPath,
+                $aspectRatio,
+                $this->resolveFluxModelByProvider($provider)
+            );
         }
 
         if (empty($this->apiKey)) {
@@ -46,15 +51,21 @@ class GeminiImageService
         }
 
         try {
-            Log::info('GeminiImageService: Generating image with Gemini Native Image Generation', [
+            Log::info('GeminiImageService: Generating image', [
+                'provider' => $provider,
                 'prompt' => substr($prompt, 0, 200) . '...',
                 'aspectRatio' => $aspectRatio
             ]);
 
-            // Try Gemini Native Image Generation first (Nano Banana Pro)
-            $result = $this->generateWithGeminiNative($prompt, $aspectRatio);
+            if ($provider === 'gemini-nano-banana-pro') {
+                // Explicit Nano Banana Pro mode: use Gemini Native directly.
+                $result = $this->generateWithGeminiNative($prompt, $aspectRatio);
+            } else {
+                // Default Gemini mode: Gemini Native first, then fallback chain.
+                $result = $this->generateWithGeminiNative($prompt, $aspectRatio);
+            }
 
-            if (!$result['success']) {
+            if (!$result['success'] && $provider === 'gemini') {
                 // Fallback to Imagen 3
                 Log::info('GeminiImageService: Gemini Native failed, falling back to Imagen 3', [
                     'reason' => $result['error'] ?? 'unknown'
@@ -62,7 +73,7 @@ class GeminiImageService
                 $result = $this->generateWithImagen3($prompt, $aspectRatio);
             }
 
-            if (!$result['success']) {
+            if (!$result['success'] && $provider === 'gemini') {
                 // Last resort: Gemini Flash
                 Log::info('GeminiImageService: Imagen 3 failed, falling back to Gemini Flash', [
                     'reason' => $result['error'] ?? 'unknown'
@@ -103,6 +114,38 @@ class GeminiImageService
                 'error' => $e->getMessage()
             ];
         }
+    }
+
+    private function normalizeImageProvider(string $provider): string
+    {
+        $normalized = strtolower(trim($provider));
+
+        if (in_array($normalized, ['flux-1.1-pro', 'flux-1_1-pro', 'flux11pro', 'flux 1.1 pro'], true)) {
+            return 'flux-1.1-pro';
+        }
+
+        if (in_array($normalized, ['flux-pro', 'flux pro'], true)) {
+            return 'flux-pro';
+        }
+
+        if ($normalized === 'flux') {
+            return 'flux';
+        }
+
+        if (in_array($normalized, ['gemini-nano-banana-pro', 'nano-banana-pro', 'gemini-nano-banana', 'nanobanana'], true)) {
+            return 'gemini-nano-banana-pro';
+        }
+
+        return 'gemini';
+    }
+
+    private function resolveFluxModelByProvider(string $provider): ?string
+    {
+        return match ($provider) {
+            'flux-pro' => (string) config('services.aiml.flux_pro_model', 'flux-pro'),
+            'flux-1.1-pro' => (string) config('services.aiml.flux_1_1_pro_model', 'flux-1.1-pro'),
+            default => null,
+        };
     }
 
     /**
@@ -701,6 +744,126 @@ class GeminiImageService
                 $textWidth = abs($bbox[4] - $bbox[0]);
                 imagettftext($image, $fontSize, 0, $width - $textWidth - 20, $height - 20, $lightGray, $fontToUse, $textInfo['channel_name']);
             }
+        }
+    }
+
+    /**
+     * Generate an image using Gemini with a face reference image attached as inline data.
+     * The face reference is sent as multimodal input so the model keeps facial identity.
+     * Falls back to text-only generation if the reference file is missing.
+     *
+     * @return array{success:bool,path?:string,error?:string}
+     */
+    public function generateImageWithFaceRef(
+        string $prompt,
+        string $outputPath,
+        string $aspectRatio,
+        string $faceRefAbsolutePath
+    ): array {
+        if (empty($this->apiKey)) {
+            return ['success' => false, 'error' => 'GEMINI_API_KEY chưa được cấu hình'];
+        }
+
+        try {
+            if (!file_exists($faceRefAbsolutePath)) {
+                Log::warning('GeminiImageService: Face ref not found, falling back to text-only', [
+                    'path' => basename($faceRefAbsolutePath),
+                ]);
+                $result = $this->generateWithGeminiNative($prompt, $aspectRatio);
+            } else {
+                $result = $this->generateWithGeminiNativeAndFaceRef($prompt, $aspectRatio, $faceRefAbsolutePath);
+                if (!$result['success']) {
+                    Log::warning('GeminiImageService: Multimodal face-ref failed, falling back to text-only', [
+                        'reason' => $result['error'] ?? 'unknown',
+                    ]);
+                    $result = $this->generateWithGeminiNative($prompt, $aspectRatio);
+                }
+            }
+
+            if (!$result['success']) {
+                return $result;
+            }
+
+            $dir = dirname($outputPath);
+            if (!is_dir($dir)) {
+                mkdir($dir, 0755, true);
+            }
+            file_put_contents($outputPath, $result['imageBytes']);
+
+            return ['success' => true, 'path' => $outputPath];
+        } catch (Exception $e) {
+            Log::error('GeminiImageService: generateImageWithFaceRef failed', ['error' => $e->getMessage()]);
+            return ['success' => false, 'error' => $e->getMessage()];
+        }
+    }
+
+    /**
+     * Gemini Native call that includes a face reference image as inline data (multimodal).
+     *
+     * @return array{success:bool,imageBytes?:string,error?:string}
+     */
+    private function generateWithGeminiNativeAndFaceRef(string $prompt, string $aspectRatio, string $faceRefAbsolutePath): array
+    {
+        try {
+            $rawImage = file_get_contents($faceRefAbsolutePath);
+            if ($rawImage === false) {
+                throw new Exception('Cannot read face reference image: ' . basename($faceRefAbsolutePath));
+            }
+
+            $finfo    = finfo_open(FILEINFO_MIME_TYPE);
+            $mimeType = (string) finfo_buffer($finfo, $rawImage);
+            finfo_close($finfo);
+            if (!in_array($mimeType, ['image/jpeg', 'image/png', 'image/webp'], true)) {
+                $mimeType = 'image/png';
+            }
+
+            $url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-pro-image-preview:generateContent?key={$this->apiKey}";
+
+            $response = $this->client->post($url, [
+                'headers' => ['Content-Type' => 'application/json'],
+                'json'    => [
+                    'contents' => [[
+                        'parts' => [
+                            [
+                                'inlineData' => [
+                                    'mimeType' => $mimeType,
+                                    'data'     => base64_encode($rawImage),
+                                ],
+                            ],
+                            ['text' => $prompt],
+                        ],
+                    ]],
+                    'generationConfig' => [
+                        'responseModalities' => ['TEXT', 'IMAGE'],
+                        'responseMimeType'   => 'text/plain',
+                    ],
+                ],
+            ]);
+
+            $result     = json_decode($response->getBody()->getContents(), true);
+            $candidates = $result['candidates'] ?? [];
+            if (empty($candidates)) {
+                throw new Exception('Gemini multimodal không trả về kết quả');
+            }
+
+            $parts      = $candidates[0]['content']['parts'] ?? [];
+            $imageBytes = null;
+            foreach ($parts as $part) {
+                if (isset($part['inlineData']['data'])) {
+                    $imageBytes = base64_decode((string) $part['inlineData']['data']);
+                    break;
+                }
+            }
+
+            if ($imageBytes === null) {
+                throw new Exception('Gemini multimodal không trả về hình ảnh');
+            }
+
+            Log::info('GeminiImageService: Multimodal face-ref generation succeeded');
+
+            return ['success' => true, 'imageBytes' => $imageBytes];
+        } catch (Exception $e) {
+            return ['success' => false, 'error' => $e->getMessage()];
         }
     }
 

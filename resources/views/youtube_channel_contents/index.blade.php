@@ -58,7 +58,18 @@
                                             <td class="px-4 py-3 text-sm text-gray-900">
                                                 <div class="flex items-center gap-3">
                                                     @if ($content->thumbnail_url)
-                                                        <img src="{{ $content->thumbnail_url }}" alt="Thumbnail"
+                                                        @php
+                                                            $contentThumb = $content->thumbnail_url;
+                                                            $contentThumbHost = strtolower((string) parse_url($contentThumb, PHP_URL_HOST));
+                                                            $useContentThumbProxy = $contentThumbHost !== ''
+                                                                && (str_ends_with($contentThumbHost, '.biliimg.com')
+                                                                    || str_ends_with($contentThumbHost, '.hdslb.com')
+                                                                    || in_array($contentThumbHost, ['archive.biliimg.com', 'i0.hdslb.com', 'i1.hdslb.com', 'i2.hdslb.com', 'i.ytimg.com', 'img.youtube.com', 'yt3.ggpht.com'], true));
+                                                            $contentThumbSrc = $useContentThumbProxy
+                                                                ? route('youtube-channels.thumbnail.proxy', ['youtubeChannel' => $youtubeChannel, 'url' => $contentThumb])
+                                                                : $contentThumb;
+                                                        @endphp
+                                                        <img src="{{ $contentThumbSrc }}" alt="Thumbnail"
                                                             class="w-12 h-8 rounded object-cover border">
                                                     @else
                                                         <div

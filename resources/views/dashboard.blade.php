@@ -175,12 +175,12 @@
                             </div>
                             <span class="font-medium text-gray-700">{{ __('YouTube Channels') }}</span>
                         </a>
-                        <a href="{{ route('profile.edit') }}"
+                        <a href="{{ route('media-center.index') }}"
                             class="flex items-center gap-3 p-4 border-2 border-gray-200 rounded-xl hover:border-primary hover:bg-primary/5 transition-all">
                             <div class="w-10 h-10 bg-primary/10 rounded-lg flex items-center justify-center">
-                                <i class="ri-settings-line text-primary"></i>
+                                <i class="ri-movie-2-line text-primary"></i>
                             </div>
-                            <span class="font-medium text-gray-700">{{ __('Settings') }}</span>
+                            <span class="font-medium text-gray-700">{{ __('Media Center') }}</span>
                         </a>
                         <a href="{{ route('profile.edit') }}"
                             class="flex items-center gap-3 p-4 border-2 border-gray-200 rounded-xl hover:border-primary hover:bg-primary/5 transition-all">

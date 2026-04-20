@@ -4,6 +4,7 @@ namespace App\Http\Controllers;
 
 use App\Models\AudioBook;
 use App\Models\AudioBookChapter;
+use App\Models\AudioBookChapterChunk;
 use App\Models\ChannelSpeaker;
 use App\Models\YoutubeChannel;
 use App\Services\BookScrapers\Docsach24Scraper;
@@ -23,6 +24,7 @@ use App\Jobs\PublishYoutubeJob;
 use App\Jobs\GenerateThumbnailJob;
 use App\Jobs\GenerateDescriptionAudioJob;
 use App\Jobs\GenerateBookReviewVideoJob;
+use App\Jobs\EmbedAudioBookChapterChunkJob;
 use App\Services\BookReviewVideoService;
 use App\Models\AudioBookVideoSegment;
 use Illuminate\Http\Request;
@@ -248,7 +250,7 @@ class AudioBookController extends Controller
      */
     public function show(AudioBook $audioBook)
     {
-        $audioBook->load(['youtubeChannel', 'chapters', 'speaker', 'videoSegments']);
+        $audioBook->load(['youtubeChannel', 'chapters.chunks', 'speaker', 'videoSegments']);
 
         // Get available speakers from the same YouTube channel
         $speakers = [];
@@ -287,6 +289,60 @@ class AudioBookController extends Controller
             'channelStorageSize',
             'channelBookSizes'
         ));
+    }
+
+    /**
+     * Export all chapters of an audiobook to TXT.
+     */
+    public function exportWord(AudioBook $audioBook)
+    {
+        $audioBook->load(['chapters' => fn($q) => $q->orderBy('chapter_number')]);
+
+        $lines = [];
+        $lines[] = $audioBook->title ?: 'Audiobook';
+        if ($audioBook->author) {
+            $lines[] = 'Tác giả: ' . $audioBook->author;
+        }
+        $lines[] = str_repeat('=', 50);
+        $lines[] = '';
+
+        foreach ($audioBook->chapters as $chapter) {
+            $chapterTitle = $chapter->title ?: ('Chương ' . $chapter->chapter_number);
+            $lines[] = $chapterTitle;
+            $lines[] = str_repeat('-', mb_strlen($chapterTitle, 'UTF-8'));
+            $lines[] = '';
+
+            $content = trim((string) $chapter->content);
+            if ($content !== '') {
+                // Tách theo dòng có sẵn trước
+                $paragraphs = preg_split('/\r?\n/', $content);
+                foreach ($paragraphs as $para) {
+                    $para = trim($para);
+                    if ($para === '') {
+                        $lines[] = '';
+                        continue;
+                    }
+                    // Tách câu dài thành từng câu riêng (dấu . ! ? kết thúc câu)
+                    $sentences = preg_split('/(?<=[.!?。])\s+/u', $para);
+                    foreach ($sentences as $sentence) {
+                        $sentence = trim($sentence);
+                        if ($sentence !== '') {
+                            $lines[] = $sentence;
+                        }
+                    }
+                    $lines[] = '';
+                }
+            }
+            $lines[] = '';
+            $lines[] = '';
+        }
+
+        $text = "\xEF\xBB\xBF" . implode("\r\n", $lines);
+        $filename = \Illuminate\Support\Str::slug($audioBook->title ?: 'audiobook-' . $audioBook->id) . '.txt';
+
+        return response($text)
+            ->header('Content-Type', 'text/plain; charset=UTF-8')
+            ->header('Content-Disposition', 'attachment; filename="' . $filename . '"');
     }
 
     private function calculateDirectorySize(string $directory): int
@@ -745,7 +801,7 @@ class AudioBookController extends Controller
     {
         $data = $request->validate([
             'search'        => 'required|string|min:1|max:500',
-            'replace'       => 'required_without_all|nullable|string|max:500',
+            'replace'       => 'nullable|string|max:500',
             'case_sensitive' => 'nullable|boolean',
             'preview_only'  => 'nullable|boolean',
         ]);
@@ -754,6 +810,16 @@ class AudioBookController extends Controller
         $replace       = $data['replace'] ?? '';
         $caseSensitive = !empty($data['case_sensitive']);
         $previewOnly   = !empty($data['preview_only']);
+
+        $replaceIsWhitespaceOnly = $replace !== '' && trim($replace) === '';
+        $replaceIsSingleSpace = $replace === ' ';
+
+        if ($replaceIsWhitespaceOnly && !$replaceIsSingleSpace) {
+            return response()->json([
+                'success' => false,
+                'error' => 'Bạn chỉ có thể dùng đúng 1 dấu cách để thay thế. Nếu muốn xóa thì để trống.',
+            ], 422);
+        }
 
         $chapters          = $audioBook->chapters()->whereNotNull('content')->get();
         $totalMatches      = 0;
@@ -828,6 +894,804 @@ class AudioBookController extends Controller
                 ? "Đã sửa {$totalReplacements} lỗi ở {$chaptersAffected} chương."
                 : 'Không phát hiện chương nào có lỗi ký tự đầu + khoảng trắng.',
         ]);
+    }
+
+    /**
+     * Step 1: chunk chapter content into audiobook_chapter_chunks.
+     * Step 2: dispatch embedding jobs for all chunks in pending status.
+     */
+    public function chunkAndQueueEmbeddings(AudioBook $audioBook)
+    {
+        $chunkMaxSize = 2000;
+
+        $chaptersWithContentQuery = $audioBook->chapters()
+            ->whereNotNull('content')
+            ->where('content', '!=', '');
+
+        $totalChaptersWithContent = (clone $chaptersWithContentQuery)->count();
+
+        $chaptersToChunk = (clone $chaptersWithContentQuery)
+            ->doesntHave('chunks')
+            ->orderBy('chapter_number')
+            ->orderBy('id')
+            ->get(['id', 'chapter_number', 'content']);
+
+        $chunkedChapters = 0;
+        $createdChunks = 0;
+
+        foreach ($chaptersToChunk as $chapter) {
+            $chunksText = $this->splitChapterContentToChunks((string) $chapter->content, $chunkMaxSize);
+            if (empty($chunksText)) {
+                continue;
+            }
+
+            foreach ($chunksText as $index => $chunkText) {
+                AudioBookChapterChunk::create([
+                    'audiobook_chapter_id' => $chapter->id,
+                    'chunk_number' => $index + 1,
+                    'text_content' => $chunkText,
+                    'status' => 'pending',
+                    'embedding_status' => 'pending',
+                    'content_hash' => hash('sha256', (string) $chunkText),
+                ]);
+            }
+
+            $chapter->update(['total_chunks' => count($chunksText)]);
+
+            $chunkedChapters++;
+            $createdChunks += count($chunksText);
+        }
+
+        $queuedJobs = 0;
+        AudioBookChapterChunk::query()
+            ->whereHas('chapter', function ($query) use ($audioBook) {
+                $query->where('audio_book_id', $audioBook->id);
+            })
+            ->where('embedding_status', 'pending')
+            ->select('id')
+            ->orderBy('id')
+            ->chunkById(300, function ($chunks) use (&$queuedJobs) {
+                foreach ($chunks as $chunk) {
+                    EmbedAudioBookChapterChunkJob::dispatch((int) $chunk->id);
+                    $queuedJobs++;
+                }
+            }, 'id');
+
+        $embeddingCounts = $this->countEmbeddingStatusByBook($audioBook);
+        $buttonState = $this->resolveChunkEmbeddingButtonState($audioBook, $embeddingCounts);
+
+        $actionMode = $chunkedChapters > 0 ? 'chunk_and_embedding' : 'embedding_only';
+        $message = $queuedJobs > 0
+            ? ($actionMode === 'embedding_only'
+                ? "Đã đưa {$queuedJobs} job embedding vào queue (không tạo lại chunk)."
+                : "Đã chunk {$chunkedChapters} chương, tạo {$createdChunks} đoạn và đưa {$queuedJobs} job embedding vào queue.")
+            : 'Không có chunk pending để đưa vào queue.';
+
+        return response()->json([
+            'success' => true,
+            'action_mode' => $actionMode,
+            'summary' => [
+                'total_chapters_with_content' => $totalChaptersWithContent,
+                'newly_chunked_chapters' => $chunkedChapters,
+                'new_chunks_created' => $createdChunks,
+                'queued_embedding_jobs' => $queuedJobs,
+                'remaining_unchunked_chapters' => (int) ($buttonState['remaining_unchunked_chapters'] ?? 0),
+                'pending_embedding_chunks' => (int) ($embeddingCounts['queued_chunks'] ?? 0),
+                'chunk_max_size' => $chunkMaxSize,
+            ],
+            'button_state' => $buttonState,
+            'progress' => [
+                'status' => $embeddingCounts['processing_chunks'] > 0
+                    ? 'processing'
+                    : (($embeddingCounts['queued_chunks'] ?? 0) > 0 ? 'queued' : (($embeddingCounts['error_chunks'] ?? 0) > 0 ? 'error' : 'done')),
+                'counts' => $embeddingCounts,
+            ],
+            'message' => $message,
+        ]);
+    }
+
+    /**
+     * Get embedding progress counters for chunks of one audiobook.
+     */
+    public function getEmbeddingProgress(AudioBook $audioBook)
+    {
+        $counts = $this->countEmbeddingStatusByBook($audioBook);
+        $buttonState = $this->resolveChunkEmbeddingButtonState($audioBook, $counts);
+
+        $total = (int) ($counts['total_chunks'] ?? 0);
+        $queued = (int) ($counts['queued_chunks'] ?? 0);
+        $processing = (int) ($counts['processing_chunks'] ?? 0);
+        $done = (int) ($counts['done_chunks'] ?? 0);
+        $error = (int) ($counts['error_chunks'] ?? 0);
+
+        if ($total === 0) {
+            return response()->json([
+                'success' => true,
+                'status' => 'idle',
+                'percent' => 0,
+                'message' => 'Chưa có chunk để embedding.',
+                'counts' => $counts,
+                'button_state' => $buttonState,
+            ]);
+        }
+
+        $status = 'done';
+        $message = '✅ Đã hoàn tất embedding toàn bộ chunk.';
+
+        if ($processing > 0) {
+            $status = 'processing';
+            $message = "⚙️ Đang embedding... {$processing} chunk đang xử lý.";
+        } elseif ($queued > 0) {
+            $status = 'queued';
+            $message = "⏳ Đang chờ worker xử lý {$queued} chunk pending.";
+        } elseif ($error > 0) {
+            $status = 'error';
+            $message = "❌ Có {$error} chunk lỗi embedding.";
+        }
+
+        $percent = (int) round(((($done + $error) / max(1, $total)) * 100));
+        if ($status === 'done') {
+            $percent = 100;
+        }
+
+        return response()->json([
+            'success' => true,
+            'status' => $status,
+            'percent' => max(0, min(100, $percent)),
+            'message' => $message,
+            'counts' => $counts,
+            'button_state' => $buttonState,
+            'can_work_in_background' => true,
+        ]);
+    }
+
+    /**
+     * Count embedding statuses for all chunks of one audiobook.
+     *
+     * @return array{total_chunks:int,queued_chunks:int,processing_chunks:int,done_chunks:int,error_chunks:int}
+     */
+    private function countEmbeddingStatusByBook(AudioBook $audioBook): array
+    {
+        $row = AudioBookChapterChunk::query()
+            ->join('audiobook_chapters', 'audiobook_chapters.id', '=', 'audiobook_chapter_chunks.audiobook_chapter_id')
+            ->where('audiobook_chapters.audio_book_id', $audioBook->id)
+            ->selectRaw('COUNT(*) as total_chunks')
+            ->selectRaw("SUM(CASE WHEN audiobook_chapter_chunks.embedding_status = 'pending' THEN 1 ELSE 0 END) as queued_chunks")
+            ->selectRaw("SUM(CASE WHEN audiobook_chapter_chunks.embedding_status = 'processing' THEN 1 ELSE 0 END) as processing_chunks")
+            ->selectRaw("SUM(CASE WHEN audiobook_chapter_chunks.embedding_status = 'done' THEN 1 ELSE 0 END) as done_chunks")
+            ->selectRaw("SUM(CASE WHEN audiobook_chapter_chunks.embedding_status = 'error' THEN 1 ELSE 0 END) as error_chunks")
+            ->first();
+
+        return [
+            'total_chunks' => (int) ($row->total_chunks ?? 0),
+            'queued_chunks' => (int) ($row->queued_chunks ?? 0),
+            'processing_chunks' => (int) ($row->processing_chunks ?? 0),
+            'done_chunks' => (int) ($row->done_chunks ?? 0),
+            'error_chunks' => (int) ($row->error_chunks ?? 0),
+        ];
+    }
+
+    /**
+     * Resolve UI state for the Chunk/Embedding button.
+     *
+     * @param array{queued_chunks?:int}|null $embeddingCounts
+    * @return array{mode:string,can_run:bool,label:string,title:string,remaining_unchunked_chapters:int,pending_embedding_chunks:int,processing_embedding_chunks:int,total_chapters_with_content:int,chunked_chapters:int}
+     */
+    private function resolveChunkEmbeddingButtonState(AudioBook $audioBook, ?array $embeddingCounts = null): array
+    {
+        $chaptersWithContentQuery = AudioBookChapter::query()
+            ->where('audio_book_id', $audioBook->id)
+            ->whereNotNull('content')
+            ->where('content', '!=', '');
+
+        $totalChaptersWithContent = (clone $chaptersWithContentQuery)->count();
+        $chunkedChapters = (clone $chaptersWithContentQuery)->has('chunks')->count();
+        $remainingUnchunked = max(0, $totalChaptersWithContent - $chunkedChapters);
+
+        $pendingEmbeddingChunks = isset($embeddingCounts['queued_chunks'])
+            ? (int) $embeddingCounts['queued_chunks']
+            : AudioBookChapterChunk::query()
+                ->whereHas('chapter', function ($query) use ($audioBook) {
+                    $query->where('audio_book_id', $audioBook->id);
+                })
+                ->where('embedding_status', 'pending')
+                ->count();
+
+        $processingEmbeddingChunks = isset($embeddingCounts['processing_chunks'])
+            ? (int) $embeddingCounts['processing_chunks']
+            : AudioBookChapterChunk::query()
+                ->whereHas('chapter', function ($query) use ($audioBook) {
+                    $query->where('audio_book_id', $audioBook->id);
+                })
+                ->where('embedding_status', 'processing')
+                ->count();
+
+        $mode = 'locked';
+        if ($remainingUnchunked > 0) {
+            $mode = 'chunk_and_embedding';
+        } elseif ($pendingEmbeddingChunks > 0) {
+            $mode = 'embedding_only';
+        } elseif ($processingEmbeddingChunks > 0) {
+            $mode = 'processing';
+        }
+
+        $canRun = in_array($mode, ['chunk_and_embedding', 'embedding_only'], true);
+        $label = $mode === 'chunk_and_embedding'
+            ? '🧩 Chunk & Embedding'
+            : ($mode === 'embedding_only'
+                ? '🧠 Embedding'
+                : ($mode === 'processing' ? '⏳ Embedding...' : '✅ Đã hoàn tất'));
+
+        $title = $mode === 'chunk_and_embedding'
+            ? "Còn {$remainingUnchunked} chương chưa chunk"
+            : ($mode === 'embedding_only'
+                ? "Có {$pendingEmbeddingChunks} chunk pending embedding"
+                : ($mode === 'processing'
+                    ? "Đang xử lý {$processingEmbeddingChunks} chunk embedding"
+                    : 'Toàn bộ chunk đã embedding xong'));
+
+        return [
+            'mode' => $mode,
+            'can_run' => $canRun,
+            'label' => $label,
+            'title' => $title,
+            'remaining_unchunked_chapters' => $remainingUnchunked,
+            'pending_embedding_chunks' => $pendingEmbeddingChunks,
+            'processing_embedding_chunks' => $processingEmbeddingChunks,
+            'total_chapters_with_content' => $totalChaptersWithContent,
+            'chunked_chapters' => $chunkedChapters,
+        ];
+    }
+
+    /**
+     * Split chapter content into chunks with sentence/paragraph boundaries.
+     * Logic mirrors TTS chunking to keep chunk structure consistent.
+     */
+    private function splitChapterContentToChunks(string $content, int $maxSize = 2000): array
+    {
+        $chunks = [];
+        $content = trim($content);
+
+        if ($content === '') {
+            return [];
+        }
+
+        $paragraphs = preg_split('/\n\s*\n/', $content);
+        $currentChunk = '';
+
+        foreach ($paragraphs as $paragraph) {
+            $paragraph = trim((string) $paragraph);
+            if ($paragraph === '') {
+                continue;
+            }
+
+            if (mb_strlen($paragraph, 'UTF-8') > $maxSize) {
+                if ($currentChunk !== '') {
+                    $chunks[] = trim($currentChunk);
+                    $currentChunk = '';
+                }
+
+                $sentences = preg_split('/(?<=[.!?。！？])\s+/', $paragraph);
+
+                foreach ($sentences as $sentence) {
+                    $sentence = trim((string) $sentence);
+                    if ($sentence === '') {
+                        continue;
+                    }
+
+                    if (mb_strlen($sentence, 'UTF-8') > $maxSize) {
+                        if ($currentChunk !== '') {
+                            $chunks[] = trim($currentChunk);
+                            $currentChunk = '';
+                        }
+
+                        $words = explode(' ', $sentence);
+                        $tempChunk = '';
+
+                        foreach ($words as $word) {
+                            $word = trim((string) $word);
+                            if ($word === '') {
+                                continue;
+                            }
+
+                            $candidate = $tempChunk === '' ? $word : $tempChunk . ' ' . $word;
+                            if (mb_strlen($candidate, 'UTF-8') > $maxSize) {
+                                if ($tempChunk !== '') {
+                                    $chunks[] = trim($tempChunk);
+                                }
+                                $tempChunk = $word;
+                            } else {
+                                $tempChunk = $candidate;
+                            }
+                        }
+
+                        if ($tempChunk !== '') {
+                            $currentChunk = $tempChunk;
+                        }
+                    } else {
+                        $candidate = $currentChunk === '' ? $sentence : $currentChunk . ' ' . $sentence;
+                        if (mb_strlen($candidate, 'UTF-8') > $maxSize) {
+                            if ($currentChunk !== '') {
+                                $chunks[] = trim($currentChunk);
+                            }
+                            $currentChunk = $sentence;
+                        } else {
+                            $currentChunk = $candidate;
+                        }
+                    }
+                }
+            } else {
+                $candidate = $currentChunk === '' ? $paragraph : $currentChunk . "\n\n" . $paragraph;
+                if (mb_strlen($candidate, 'UTF-8') > $maxSize) {
+                    if ($currentChunk !== '') {
+                        $chunks[] = trim($currentChunk);
+                    }
+                    $currentChunk = $paragraph;
+                } else {
+                    $currentChunk = $candidate;
+                }
+            }
+        }
+
+        if ($currentChunk !== '') {
+            $chunks[] = trim($currentChunk);
+        }
+
+        return $chunks;
+    }
+
+    /**
+     * Scan all chapter contents for Vietnamese text issues that may break TTS pronunciation.
+     */
+    public function scanTtsVietnameseIssues(AudioBook $audioBook)
+    {
+        $chapters = $audioBook->chapters()
+            ->whereNotNull('content')
+            ->where('content', '!=', '')
+            ->orderBy('chapter_number')
+            ->orderBy('id')
+            ->get(['id', 'chapter_number', 'title', 'content']);
+
+        $maxTotalIssues = 700;
+        $maxIssuesPerChapter = 80;
+        $globalTruncated = false;
+        $totalIssues = 0;
+        $typeCounts = [];
+        $chapterResults = [];
+
+        foreach ($chapters as $chapter) {
+            $issues = $this->detectTtsVietnameseIssues((string) $chapter->content);
+            if (empty($issues)) {
+                continue;
+            }
+
+            $chapterTruncated = false;
+            if (count($issues) > $maxIssuesPerChapter) {
+                $issues = array_slice($issues, 0, $maxIssuesPerChapter);
+                $chapterTruncated = true;
+            }
+
+            $remaining = $maxTotalIssues - $totalIssues;
+            if ($remaining <= 0) {
+                $globalTruncated = true;
+                break;
+            }
+
+            if (count($issues) > $remaining) {
+                $issues = array_slice($issues, 0, $remaining);
+                $chapterTruncated = true;
+                $globalTruncated = true;
+            }
+
+            if (empty($issues)) {
+                continue;
+            }
+
+            foreach ($issues as $issue) {
+                $type = (string) ($issue['type'] ?? 'unknown');
+                if (!isset($typeCounts[$type])) {
+                    $typeCounts[$type] = [
+                        'label' => (string) ($issue['label'] ?? $type),
+                        'count' => 0,
+                    ];
+                }
+                $typeCounts[$type]['count']++;
+            }
+
+            $totalIssues += count($issues);
+            $chapterResults[] = [
+                'chapter_id' => $chapter->id,
+                'chapter_number' => $chapter->chapter_number,
+                'chapter_title' => $chapter->title ?: ('Chương ' . $chapter->chapter_number),
+                'issues_count' => count($issues),
+                'issues_truncated' => $chapterTruncated,
+                'issues' => $issues,
+            ];
+
+            if ($globalTruncated) {
+                break;
+            }
+        }
+
+        uasort($typeCounts, fn($a, $b) => ($b['count'] <=> $a['count']));
+
+        // ── Collect proper nouns across ALL chapter content ───────────────────
+        $fullText = $chapters->pluck('content')->implode("\n");
+        $properNouns = $this->extractProperNouns($fullText);
+
+        return response()->json([
+            'success' => true,
+            'summary' => [
+                'total_chapters' => $chapters->count(),
+                'affected_chapters' => count($chapterResults),
+                'total_issues' => $totalIssues,
+                'max_total_issues' => $maxTotalIssues,
+                'max_issues_per_chapter' => $maxIssuesPerChapter,
+                'truncated' => $globalTruncated,
+                'type_counts' => $typeCounts,
+            ],
+            'proper_nouns' => $properNouns,
+            'chapters' => $chapterResults,
+            'message' => $totalIssues > 0
+                ? "Đã phát hiện {$totalIssues} cảnh báo có thể ảnh hưởng TTS trong " . count($chapterResults) . ' chương.'
+                : 'Không phát hiện lỗi rõ ràng có thể gây sai đọc TTS.',
+        ]);
+    }
+
+    /**
+     * Detect suspicious words/tokens that can cause Vietnamese TTS to read incorrectly.
+     */
+    private function detectTtsVietnameseIssues(string $content): array
+    {
+        $text = str_replace(["\r\n", "\r"], "\n", $content);
+        $text = (string) preg_replace('/[ \t]+/u', ' ', $text);
+        $text = (string) preg_replace('/\n{3,}/u', "\n\n", $text);
+        $text = trim($text);
+        if ($text === '') {
+            return [];
+        }
+
+        $rules = [
+            [
+                'type' => 'chat_abbreviation',
+                'label' => 'Viết tắt kiểu chat',
+                'pattern' => '/\b(?:ko|hok|k0|dc|đc|vs|mn|mik|mng|ntn|nchung|cx|thik|okie|ib|inb|rep)\b/ui',
+                'suggestion' => 'Nên đổi sang từ đầy đủ tiếng Việt để TTS phát âm tự nhiên.',
+            ],
+            [
+                'type' => 'dotted_abbreviation',
+                'label' => 'Viết tắt có dấu chấm',
+                'pattern' => '/(?:\b\p{L}{1,5}\.){2,6}/u',
+                'suggestion' => 'Nên viết đầy đủ cụm từ (ví dụ: "thành phố" thay vì "TP.").',
+            ],
+            [
+                'type' => 'upper_abbreviation',
+                'label' => 'Từ viết tắt IN HOA',
+                'pattern' => '/(?<!\p{L})[A-ZĐ]{2,6}(?!\p{L})/u',
+                'suggestion' => 'Kiểm tra có cần đổi thành cụm từ đầy đủ để tránh đọc từng chữ cái.',
+            ],
+            [
+                'type' => 'mixed_alnum',
+                'label' => 'Chuỗi chữ và số dính nhau',
+                'pattern' => '/(?<!\p{L}|\d)(?:\d+\p{L}+|\p{L}+\d+)[\p{L}\d]*(?!\p{L}|\d)/u',
+                'suggestion' => 'Cân nhắc thêm khoảng trắng hoặc viết rõ ràng cách đọc.',
+            ],
+            [
+                'type' => 'slash_abbreviation',
+                'label' => 'Viết tắt dạng dấu gạch chéo',
+                'pattern' => '/(?<!\p{L})(?:\p{L}{1,4}\/\p{L}{1,4})(?!\p{L})/u',
+                'suggestion' => 'Nên viết rõ nghĩa thay vì dùng dạng rút gọn có dấu "/".',
+            ],
+            [
+                'type' => 'repeated_punctuation',
+                'label' => 'Dấu câu lặp bất thường',
+                'pattern' => '/[!?.,;:]{3,}/u',
+                'suggestion' => 'Rút gọn dấu câu để tránh TTS ngắt nhịp bất thường.',
+            ],
+            [
+                'type' => 'no_diacritic_word',
+                'label' => 'Từ dài không dấu (nghi lỗi chính tả)',
+                'pattern' => '/\b[a-z]{7,}\b/u',
+                'suggestion' => 'Kiểm tra và thêm dấu tiếng Việt nếu đây là từ tiếng Việt.',
+            ],
+            [
+                'type' => 'invalid_unicode',
+                'label' => 'Ký tự lỗi Unicode',
+                'pattern' => '/\x{FFFD}/u',
+                'suggestion' => 'Ký tự lỗi có thể khiến TTS đọc sai. Nên sửa hoặc xóa.',
+            ],
+        ];
+
+        $issues = [];
+        $seen = [];
+
+        foreach ($rules as $rule) {
+            if (!preg_match_all($rule['pattern'], $text, $matches, PREG_OFFSET_CAPTURE)) {
+                continue;
+            }
+
+            foreach ($matches[0] as $matchInfo) {
+                $matchedText = trim((string) ($matchInfo[0] ?? ''));
+                $offset = (int) ($matchInfo[1] ?? 0);
+
+                if ($matchedText === '') {
+                    continue;
+                }
+
+                if ($rule['type'] === 'upper_abbreviation' && $this->shouldIgnoreUpperAbbreviation($matchedText)) {
+                    continue;
+                }
+
+                if ($rule['type'] === 'no_diacritic_word' && !$this->shouldFlagNoDiacriticWord($matchedText)) {
+                    continue;
+                }
+
+                $dedupeKey = $rule['type'] . '|' . $offset . '|' . mb_strtolower($matchedText, 'UTF-8');
+                if (isset($seen[$dedupeKey])) {
+                    continue;
+                }
+                $seen[$dedupeKey] = true;
+
+                $issues[] = [
+                    'type' => $rule['type'],
+                    'label' => $rule['label'],
+                    'matched_text' => $matchedText,
+                    'context' => $this->buildIssueContext($text, $offset, strlen($matchedText)),
+                    'paragraph' => $this->buildIssueParagraph($text, $offset),
+                    'suggestion' => $rule['suggestion'],
+                    '_offset' => $offset,
+                ];
+            }
+        }
+
+        usort($issues, fn($a, $b) => (($a['_offset'] ?? 0) <=> ($b['_offset'] ?? 0)));
+
+        foreach ($issues as &$issue) {
+            unset($issue['_offset']);
+        }
+        unset($issue);
+
+        return $issues;
+    }
+
+    /**
+     * Extract proper nouns (names & place names) from full text.
+     * Heuristic: Title-Case word sequences not in the Vietnamese stop-word list.
+     * Returns array of ['text' => string, 'count' => int] sorted by frequency desc.
+     */
+    private function extractProperNouns(string $text): array
+    {
+        $stopWords = [
+            'Và','Của','Trong','Với','Cho','Từ','Đến','Vì','Nhưng','Hoặc','Hay',
+            'Khi','Nếu','Thì','Mà','Cũng','Đã','Đang','Sẽ','Được','Không','Có',
+            'Là','Này','Đó','Các','Những','Một','Hai','Ba','Bốn','Năm','Sáu',
+            'Bảy','Tám','Chín','Mười','Trăm','Nghìn','Triệu','Tỷ',
+            'Ông','Bà','Anh','Chị','Em','Con','Cô','Chú','Bác','Dì','Dượng',
+            'Tôi','Tao','Mày','Nó','Họ','Chúng','Mình','Ta',
+            'Ngày','Tháng','Giờ','Phút','Giây','Tuần',
+            'Người','Nước','Đất','Trời','Biển','Núi','Sông',
+            'Sau','Trước','Trên','Dưới','Ngoài','Giữa',
+            'Rất','Thật','Cực','Quá','Hơn','Nhất','Khá',
+            'Tuy','Dù','Bởi','Nên','Vậy','Thế','Đây',
+            'The','And','Of','In','To','A','An','Is','Are','Was','Were',
+        ];
+        $stopSet = array_flip($stopWords);
+
+        // Split into lines to limit backtracking scope
+        $lines = preg_split('/\n+/', $text) ?: [];
+        $freq  = [];
+
+        // Simple pattern: a Title-Case word (Latin or Vietnamese uppercase start)
+        // We collect individual title-case tokens then group consecutive ones
+        $tokenPattern = '/\b([A-ZĐ\x{00C0}-\x{1EF9}][a-zA-ZĐđ\x{00C0}-\x{1EF9}]{1,30})\b/u';
+
+        foreach ($lines as $line) {
+            $line = trim($line);
+            if ($line === '') continue;
+
+            // Limit per-line backtracking
+            if (mb_strlen($line, 'UTF-8') > 2000) {
+                $line = mb_substr($line, 0, 2000, 'UTF-8');
+            }
+
+            $tokens = [];
+            if (!@preg_match_all($tokenPattern, $line, $m, PREG_OFFSET_CAPTURE)) continue;
+
+            // Build consecutive groups
+            $prev_end = -99;
+            $group    = [];
+
+            foreach ($m[0] as $hit) {
+                $word   = $hit[0];
+                $offset = $hit[1];
+
+                // Check if this token immediately follows the previous one (gap ≤ 1 space)
+                $gap = $offset - $prev_end;
+                if ($gap <= 2 && $group) {
+                    $group[] = $word;
+                } else {
+                    // Save previous group
+                    if ($group) {
+                        $this->recordProperNounGroup($group, $stopSet, $freq);
+                    }
+                    $group = [$word];
+                }
+                $prev_end = $offset + strlen($word);
+            }
+            if ($group) {
+                $this->recordProperNounGroup($group, $stopSet, $freq);
+            }
+        }
+
+        // Keep multi-word OR single words appearing ≥ 2 times
+        $result = [];
+        foreach ($freq as $term => $count) {
+            $wordCount = substr_count($term, ' ') + 1;
+            if ($wordCount >= 2 || $count >= 2) {
+                $result[] = ['text' => $term, 'count' => $count];
+            }
+        }
+
+        usort($result, fn($a, $b) => $b['count'] <=> $a['count']);
+
+        return array_slice($result, 0, 200);
+    }
+
+    private function recordProperNounGroup(array $group, array $stopSet, array &$freq): void
+    {
+        // Try longest match first, then sub-groups of ≥ 2 words
+        $maxLen = min(count($group), 4);
+
+        for ($len = $maxLen; $len >= 1; $len--) {
+            for ($start = 0; $start + $len <= count($group); $start++) {
+                $slice = array_slice($group, $start, $len);
+                $term  = implode(' ', $slice);
+
+                // Must have at least one non-stop word
+                $hasNonStop = false;
+                foreach ($slice as $w) {
+                    if (!isset($stopSet[$w])) { $hasNonStop = true; break; }
+                }
+                if (!$hasNonStop) continue;
+
+                // Skip very short single tokens (sentence starters)
+                if ($len === 1 && mb_strlen($term, 'UTF-8') <= 3) continue;
+
+                $freq[$term] = ($freq[$term] ?? 0) + 1;
+            }
+        }
+    }
+
+    /**
+     * Some uppercase tokens are technical names and should not be flagged.
+     */
+    private function shouldIgnoreUpperAbbreviation(string $token): bool
+    {
+        $token = strtoupper(trim($token));
+        if ($token === '') {
+            return true;
+        }
+
+        $allowed = [
+            'AI', 'API', 'CPU', 'GPU', 'RAM', 'ROM', 'USB', 'LAN', 'WAN',
+            'SMS', 'OTP', 'MP3', 'MP4', 'PDF', 'USD', 'VND', 'TTS', 'NLP',
+            'URL', 'HTTP', 'HTTPS', 'CEO', 'CTO', 'GDP', 'TV', 'FM', 'AM',
+            'THCS', 'THPT', 'THPTQG'
+        ];
+
+        if (in_array($token, $allowed, true)) {
+            return true;
+        }
+
+        return (bool) preg_match('/^[IVXLCDM]+$/', $token);
+    }
+
+    /**
+     * Heuristic check for long non-diacritic words that likely should be Vietnamese words with accents.
+     */
+    private function shouldFlagNoDiacriticWord(string $word): bool
+    {
+        $word = strtolower(trim($word));
+        if ($word === '') {
+            return false;
+        }
+
+        if (preg_match('/\d/u', $word)) {
+            return false;
+        }
+
+        $ignoreWords = [
+            'youtube', 'facebook', 'tiktok', 'podcast', 'livestream', 'gmail', 'email',
+            'google', 'review', 'thumbnail', 'audio', 'video', 'chapter', 'playlist',
+            'subscribe', 'comment', 'download', 'upload', 'shorts', 'android', 'iphone',
+            'netflix', 'spotify', 'telegram', 'discord', 'messenger'
+        ];
+
+        if (in_array($word, $ignoreWords, true)) {
+            return false;
+        }
+
+        if (preg_match('/(?:http|https|www|\.com|\.vn|\.net|\.org)/', $word)) {
+            return false;
+        }
+
+        if (!preg_match('/[aeiouy]/', $word)) {
+            return false;
+        }
+
+        if (preg_match('/(?:tion|ment|ness|ship|able|ing|ized|izer)$/', $word)) {
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * Build a short context snippet around a matched token.
+     */
+    private function buildIssueContext(string $text, int $offset, int $length, int $padding = 28): string
+    {
+        $totalBytes = strlen($text);
+        $start = max(0, $offset - $padding);
+        $end = min($totalBytes, $offset + max($length, 1) + $padding);
+
+        $snippet = mb_strcut($text, $start, max(1, $end - $start), 'UTF-8');
+        $snippet = trim((string) preg_replace('/\s+/u', ' ', $snippet));
+
+        $prefix = $start > 0 ? '...' : '';
+        $suffix = $end < $totalBytes ? '...' : '';
+
+        return $prefix . $snippet . $suffix;
+    }
+
+    /**
+     * Build full paragraph content around matched token for quick review.
+     */
+    private function buildIssueParagraph(string $text, int $offset, int $maxLength = 1400): string
+    {
+        if ($text === '') {
+            return '';
+        }
+
+        $paragraph = '';
+        $parts = preg_split('/\n{2,}/u', $text, -1, PREG_SPLIT_NO_EMPTY | PREG_SPLIT_OFFSET_CAPTURE);
+
+        if (is_array($parts)) {
+            foreach ($parts as $part) {
+                $candidate = (string) ($part[0] ?? '');
+                $start = (int) ($part[1] ?? 0);
+                $end = $start + strlen($candidate);
+
+                if ($offset >= $start && $offset <= $end) {
+                    $paragraph = trim($candidate);
+                    break;
+                }
+            }
+        }
+
+        if ($paragraph === '') {
+            $totalBytes = strlen($text);
+            $start = max(0, $offset - 350);
+            $end = min($totalBytes, $offset + 650);
+            $paragraph = trim(mb_strcut($text, $start, max(1, $end - $start), 'UTF-8'));
+
+            if ($start > 0) {
+                $paragraph = '...' . $paragraph;
+            }
+            if ($end < $totalBytes) {
+                $paragraph .= '...';
+            }
+        }
+
+        $paragraph = (string) preg_replace('/[ \t]+\n/u', "\n", $paragraph);
+        $paragraph = (string) preg_replace('/\n{3,}/u', "\n\n", $paragraph);
+        $paragraph = trim($paragraph);
+
+        if (mb_strlen($paragraph, 'UTF-8') > $maxLength) {
+            $paragraph = mb_substr($paragraph, 0, $maxLength, 'UTF-8') . '...';
+        }
+
+        return $paragraph;
     }
 
     /**
@@ -1381,7 +2245,7 @@ class AudioBookController extends Controller
             if ($voiceDuration <= 0) {
                 $cmd = sprintf(
                     '%s -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 %s',
-                    $ffprobe,
+                    escapeshellarg($ffprobe),
                     escapeshellarg($voicePath)
                 );
                 exec($cmd, $output);
@@ -1519,7 +2383,7 @@ class AudioBookController extends Controller
 
             $mixCmd = sprintf(
                 '%s -y -i %s -i %s -filter_complex "%s" -map "[mixout]" -c:a libmp3lame -b:a 192k %s 2>&1',
-                $ffmpeg,
+                escapeshellarg($ffmpeg),
                 escapeshellarg($introMusicPath),
                 escapeshellarg($voicePath),
                 $audioFilterComplex,
@@ -1615,7 +2479,7 @@ class AudioBookController extends Controller
                 '%s -y -loop 1 -i %s -i %s -filter_complex "%s" -map "[out]" -map 1:a ' .
                     '-c:v libx264 -preset medium -tune stillimage -crf 23 -c:a aac -b:a 192k ' .
                     '-pix_fmt yuv420p -t %s -movflags +faststart -progress pipe:1 -stats %s',
-                $ffmpeg,
+                escapeshellarg($ffmpeg),
                 escapeshellarg($imagePath),
                 escapeshellarg($mixedAudioPath),
                 $videoFilterComplex,
@@ -1658,7 +2522,7 @@ class AudioBookController extends Controller
             // Get actual video duration
             $durationCmd = sprintf(
                 '%s -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 %s',
-                $ffprobe,
+                escapeshellarg($ffprobe),
                 escapeshellarg($outputPath)
             );
             $durationOutput = [];
@@ -2705,6 +3569,79 @@ class AudioBookController extends Controller
         }
     }
 
+    public function createManualShortVideo(Request $request, AudioBook $audioBook)
+    {
+        $request->validate([
+            'title' => 'nullable|string|max:200',
+            'style' => 'nullable|string|max:100',
+            'script' => 'required|string|min:10|max:5000',
+            'image_prompt' => 'nullable|string|min:10|max:5000',
+        ]);
+
+        $items = $this->loadShortVideoItems($audioBook->id);
+
+        $maxIndex = 0;
+        foreach ($items as $key => $item) {
+            $itemIndex = (int)($item['index'] ?? ($key + 1));
+            if ($itemIndex > $maxIndex) {
+                $maxIndex = $itemIndex;
+            }
+        }
+
+        $newIndex = $maxIndex + 1;
+        if ($newIndex <= 0) {
+            $newIndex = count($items) + 1;
+        }
+
+        $style = trim((string) $request->input('style', 'Cinematic'));
+        if ($style === '') {
+            $style = 'Cinematic';
+        }
+
+        $title = trim((string) $request->input('title', ''));
+        if ($title === '') {
+            $title = 'Short #' . $newIndex . ' - ' . $style;
+        }
+
+        $script = trim((string) $request->input('script', ''));
+        $imagePrompt = trim((string) $request->input('image_prompt', ''));
+
+        if ($imagePrompt === '') {
+            $imagePrompt = 'Vertical 9:16 cinematic frame, style ' . $style . '. Main action: ' . $script . '. Keep strong subject focus, dramatic lighting, rich texture detail, no text, no logo, no watermark.';
+        }
+
+        $now = now()->toDateTimeString();
+        $manualItem = [
+            'index' => $newIndex,
+            'title' => $title,
+            'style' => $style,
+            'script' => $script,
+            'image_prompt' => $imagePrompt,
+            'status' => 'planned',
+            'error_message' => null,
+            'audio_path' => null,
+            'image_path' => null,
+            'video_path' => null,
+            'duration' => null,
+            'shots' => [],
+            'story_bible' => null,
+            'character_bible' => null,
+            'source' => 'manual',
+            'created_at' => $now,
+            'updated_at' => $now,
+        ];
+
+        $items[] = $manualItem;
+        $this->saveShortVideoItems($audioBook->id, $items);
+
+        return response()->json([
+            'success' => true,
+            'created_index' => $newIndex,
+            'item' => $this->mapShortVideoItemForResponse($audioBook->id, $manualItem),
+            'items' => array_map(fn($item) => $this->mapShortVideoItemForResponse($audioBook->id, $item), $items),
+        ]);
+    }
+
     public function generateShortVideoAssets(Request $request, AudioBook $audioBook)
     {
         $request->validate([
@@ -3182,19 +4119,26 @@ class AudioBookController extends Controller
         $bookTitle = trim((string)($audioBook->title ?? ''));
         $style = trim((string)($targetItem['style'] ?? 'Cinematic'));
         $title = trim((string)($targetItem['title'] ?? ('Short #' . $index)));
+        $storyBible = trim((string)($targetItem['story_bible'] ?? ''));
+        $characterBible = trim((string)($targetItem['character_bible'] ?? ''));
 
-        $systemPrompt = "You are an expert cinematic prompt engineer for vertical short-video cover images.";
+        $systemPrompt = "You are an expert cinematic prompt engineer for vertical short-video cover images. Write rich, production-ready prompts with concrete visual details, not generic summaries.";
         $userPrompt = "Generate ONE English image prompt for AI image generation based on this short video content.\n"
             . "Requirements:\n"
             . "- Vertical composition 9:16 for YouTube Shorts/TikTok\n"
             . "- Cinematic, vivid, emotional, high detail, dramatic lighting\n"
+            . "- Include specific subject action, environment details, camera framing, lighting mood, and texture cues\n"
+            . "- Keep character identity, age, hairstyle, outfit continuity\n"
+            . "- Mention period-appropriate setting/props only (no anachronism)\n"
             . "- No text, no captions, no logos, no watermark\n"
             . "- Avoid violence/gore/explicit content\n"
-            . "- Keep under 90 words\n"
+            . "- Length target: 90-150 words\n"
             . "- Return ONLY the prompt text, no explanation\n\n"
             . "Book title: {$bookTitle}\n"
             . "Short title: {$title}\n"
             . "Style: {$style}\n"
+            . ($storyBible !== '' ? "Story bible: {$storyBible}\n" : '')
+            . ($characterBible !== '' ? "Character bible: {$characterBible}\n" : '')
             . "Short script:\n{$script}";
 
         try {
@@ -3226,6 +4170,14 @@ class AudioBookController extends Controller
             }
 
             $content = trim($content, " \t\n\r\0\x0B\"'");
+            $content = $this->ensureDetailedShortImagePrompt(
+                $content,
+                $script,
+                $style,
+                $storyBible,
+                $characterBible,
+                $index
+            );
             $items[$targetKey]['image_prompt'] = $content;
             $items[$targetKey]['updated_at'] = now()->toDateTimeString();
 
@@ -4406,17 +5358,30 @@ class AudioBookController extends Controller
             $storyboard = $this->buildShortStoryboardFallback($audioBook, $item, $shortIndex, $sentences);
         }
 
+        $style = trim((string)($item['style'] ?? 'Cinematic'));
+        $storyBible = trim((string)($storyboard['story_bible'] ?? ''));
+        $characterBible = trim((string)($storyboard['character_bible'] ?? ''));
+
         $shots = [];
         foreach ($sentences as $i => $sentence) {
             $rawShot = $storyboard['shots'][$i] ?? [];
-            $shots[] = $this->normalizeShortShotData($rawShot, $i + 1, $sentence);
+            $shot = $this->normalizeShortShotData($rawShot, $i + 1, $sentence);
+            $shot['image_prompt'] = $this->ensureDetailedShortImagePrompt(
+                (string)($shot['image_prompt'] ?? ''),
+                $sentence,
+                $style,
+                $storyBible,
+                $characterBible,
+                $i + 1
+            );
+            $shots[] = $shot;
         }
 
         [$shots] = $this->ensureShortShotPromptTranslations($shots, $audioBook->id, $shortIndex);
 
         return [
-            'story_bible' => trim((string)($storyboard['story_bible'] ?? '')),
-            'character_bible' => trim((string)($storyboard['character_bible'] ?? '')),
+            'story_bible' => $storyBible,
+            'character_bible' => $characterBible,
             'shots' => $shots,
         ];
     }
@@ -4528,12 +5493,13 @@ class AudioBookController extends Controller
         $prompt .= "2) Có 3 key gốc: story_bible, character_bible, shots.\n";
         $prompt .= "3) shots là array có đúng " . count($sentences) . " phần tử, mỗi phần tử gồm:\n";
         $prompt .= "   - sentence\n";
-        $prompt .= "   - image_prompt (English, dùng để tạo ảnh 9:16, nhấn mạnh continuity nhân vật/cảnh)\n";
+        $prompt .= "   - image_prompt (English, 70-130 words, dùng để tạo ảnh 9:16, bắt buộc có: subject action + scene details + camera framing + lighting mood + texture + continuity nhân vật/cảnh)\n";
         $prompt .= "   - image_prompt_vi (Tiếng Việt, diễn giải nghĩa của image_prompt để người vận hành dễ kiểm tra)\n";
         $prompt .= "   - kling_prompt (English, dùng cho image-to-video motion)\n";
         $prompt .= "   - is_reference_keyframe (boolean)\n";
         $prompt .= "4) Nhân vật phải đồng nhất ngoại hình/trang phục/độ tuổi giữa các shots.\n";
-        $prompt .= "5) Không thêm chữ vào ảnh.\n";
+        $prompt .= "5) Prompt ảnh không được chung chung kiểu 'a person in a room'; phải có bối cảnh cụ thể để model dựng cảnh tốt.\n";
+        $prompt .= "6) Không thêm chữ vào ảnh.\n";
 
         try {
             $resp = Http::timeout(120)
@@ -4609,6 +5575,100 @@ class AudioBookController extends Controller
             'character_bible' => 'Nhân vật trung tâm phải giữ nhất quán về khuôn mặt, độ tuổi, giới tính, tóc và trang phục trong mọi shot.',
             'shots' => $shots,
         ];
+    }
+
+    private function ensureDetailedShortImagePrompt(
+        string $prompt,
+        string $sentence,
+        string $style,
+        string $storyBible,
+        string $characterBible,
+        int $shotIndex
+    ): string {
+        $normalizedPrompt = trim((string)preg_replace('/\s+/u', ' ', $prompt));
+        if ($normalizedPrompt === '') {
+            return $this->buildDetailedShortImagePrompt($sentence, $style, $storyBible, $characterBible, $shotIndex, '');
+        }
+
+        $wordCount = count(array_values(array_filter(preg_split('/\s+/u', $normalizedPrompt) ?: [])));
+        $promptLower = mb_strtolower($normalizedPrompt);
+        $qualitySignals = [
+            '9:16',
+            'vertical',
+            'cinematic',
+            'lighting',
+            'camera',
+            'close-up',
+            'medium shot',
+            'wide shot',
+            'depth',
+            'texture',
+            'no text',
+        ];
+
+        $signalHits = 0;
+        foreach ($qualitySignals as $signal) {
+            if (mb_strpos($promptLower, $signal) !== false) {
+                $signalHits++;
+            }
+        }
+
+        $needsExpansion = $wordCount < 28 || $signalHits < 3;
+        if (!$needsExpansion) {
+            return $normalizedPrompt;
+        }
+
+        return $this->buildDetailedShortImagePrompt($sentence, $style, $storyBible, $characterBible, $shotIndex, $normalizedPrompt);
+    }
+
+    private function buildDetailedShortImagePrompt(
+        string $sentence,
+        string $style,
+        string $storyBible,
+        string $characterBible,
+        int $shotIndex,
+        string $seedPrompt
+    ): string {
+        $parts = [];
+        $parts[] = 'Vertical 9:16 cinematic ' . $style . ' keyframe for shot ' . $shotIndex . '.';
+
+        $seedPrompt = trim($seedPrompt);
+        if ($seedPrompt !== '') {
+            $parts[] = rtrim($seedPrompt, '. ') . '.';
+        }
+
+        $parts[] = 'Primary action: ' . $this->truncatePromptContext($sentence, 260) . '.';
+
+        $storyContext = $this->truncatePromptContext($storyBible, 220);
+        if ($storyContext !== '') {
+            $parts[] = 'Story context: ' . $storyContext . '.';
+        }
+
+        $characterContext = $this->truncatePromptContext($characterBible, 220);
+        if ($characterContext !== '') {
+            $parts[] = 'Character continuity: ' . $characterContext . '.';
+        }
+
+        $parts[] = 'Composition: clear foreground subject, readable midground action, atmospheric background, strong depth separation.';
+        $parts[] = 'Camera and lighting: cinematic framing, natural perspective, dramatic but realistic light, rich texture detail, sharp subject focus with gentle depth of field.';
+        $parts[] = 'Continuity constraints: keep the same protagonist identity, face structure, age, hairstyle, wardrobe and color palette as other shots.';
+        $parts[] = 'No text, no subtitle, no logo, no watermark.';
+
+        return trim((string)preg_replace('/\s+/u', ' ', implode(' ', $parts)));
+    }
+
+    private function truncatePromptContext(string $text, int $maxChars): string
+    {
+        $normalized = trim((string)preg_replace('/\s+/u', ' ', $text));
+        if ($normalized === '') {
+            return '';
+        }
+
+        if (mb_strlen($normalized) <= $maxChars) {
+            return $normalized;
+        }
+
+        return rtrim(mb_substr($normalized, 0, $maxChars - 3)) . '...';
     }
 
     private function normalizeShortShotData(array $rawShot, int $shotIndex, string $fallbackSentence): array
@@ -6055,7 +7115,7 @@ class AudioBookController extends Controller
                 $ffprobe = env('FFPROBE_PATH', 'ffprobe');
                 $cmd = sprintf(
                     '%s -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 %s',
-                    $ffprobe,
+                    escapeshellarg($ffprobe),
                     escapeshellarg($audioPath)
                 );
                 exec($cmd, $output);
@@ -9107,14 +10167,17 @@ class AudioBookController extends Controller
             $concatListPath = $tempDir . '/concat_list.txt';
             $concatContent = '';
             foreach ($audioFiles as $af) {
-                $concatContent .= "file " . escapeshellarg($af) . "\n";
+                // FFmpeg concat demuxer expects file entries, not shell-escaped args.
+                $normalized = str_replace('\\', '/', $af);
+                $escaped = str_replace("'", "'\\''", $normalized);
+                $concatContent .= "file '{$escaped}'\n";
             }
             file_put_contents($concatListPath, $concatContent);
 
             $mergedVoicePath = $tempDir . '/merged_voice.mp3';
             $concatCmd = sprintf(
                 '%s -y -f concat -safe 0 -i %s -c:a libmp3lame -b:a 192k %s 2>&1',
-                $ffmpeg,
+                escapeshellarg($ffmpeg),
                 escapeshellarg($concatListPath),
                 escapeshellarg($mergedVoicePath)
             );
@@ -9141,7 +10204,7 @@ class AudioBookController extends Controller
             // Get merged voice duration
             $dCmd = sprintf(
                 '%s -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 %s',
-                $ffprobe,
+                escapeshellarg($ffprobe),
                 escapeshellarg($mergedVoicePath)
             );
             $dOut = [];
@@ -9223,7 +10286,7 @@ class AudioBookController extends Controller
 
                 $mixCmd = sprintf(
                     '%s -y -i %s -i %s -filter_complex "%s" -map "[mixout]" -c:a libmp3lame -b:a 192k %s 2>&1',
-                    $ffmpeg,
+                    escapeshellarg($ffmpeg),
                     escapeshellarg($introMusicPath),
                     escapeshellarg($mergedVoicePath),
                     $audioFilterComplex,
@@ -9311,7 +10374,7 @@ class AudioBookController extends Controller
                     '%s -y -loop 1 -framerate 15 -i %s -i %s -filter_complex "%s" -map "[out]" -map 1:a ' .
                         '-c:v libx264 -preset ultrafast -tune stillimage -crf 28 -c:a aac -b:a 128k ' .
                         '-pix_fmt yuv420p -shortest -threads 0 -progress pipe:1 -stats %s',
-                    $ffmpeg,
+                    escapeshellarg($ffmpeg),
                     escapeshellarg($imagePath),
                     escapeshellarg($mixedAudioPath),
                     $filterComplex,
@@ -9321,7 +10384,7 @@ class AudioBookController extends Controller
                 $videoCmd = sprintf(
                     '%s -y -loop 1 -framerate 1 -i %s -i %s -c:v libx264 -preset ultrafast -tune stillimage -crf 28 ' .
                         '-c:a aac -b:a 128k -pix_fmt yuv420p -r 15 -shortest -threads 0 -vf "%s" -progress pipe:1 -stats %s',
-                    $ffmpeg,
+                    escapeshellarg($ffmpeg),
                     escapeshellarg($imagePath),
                     escapeshellarg($mixedAudioPath),
                     $baseFilter,
@@ -9359,7 +10422,7 @@ class AudioBookController extends Controller
             // Get actual video duration
             $durationCmd = sprintf(
                 '%s -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 %s',
-                $ffprobe,
+                escapeshellarg($ffprobe),
                 escapeshellarg($outputPath)
             );
             $durationOutput = [];
@@ -9718,6 +10781,13 @@ class AudioBookController extends Controller
 
     public function startBatchVideoGeneration(Request $request, AudioBook $audioBook)
     {
+        if (Cache::has("batch_video_lock_{$audioBook->id}")) {
+            return response()->json([
+                'success' => false,
+                'error' => 'Dang co batch video khac chay cho audiobook nay. Vui long doi job hien tai hoan tat.'
+            ], 409);
+        }
+
         $segmentIds = $request->input('segment_ids', []);
 
         // If specific IDs provided, use those; otherwise fall back to all pending/error

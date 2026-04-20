@@ -24,6 +24,9 @@
                     <x-nav-link :href="route('automation-reports.index')" :active="request()->routeIs('automation-reports.*')">
                         Automation
                     </x-nav-link>
+                    <x-nav-link :href="route('queue.monitor')" :active="request()->routeIs('queue.monitor')">
+                        📋 Queue
+                    </x-nav-link>
                 </div>
             </div>
 
@@ -100,6 +103,9 @@
             </x-responsive-nav-link>
             <x-responsive-nav-link :href="route('automation-reports.index')" :active="request()->routeIs('automation-reports.*')">
                 Automation
+            </x-responsive-nav-link>
+            <x-responsive-nav-link :href="route('queue.monitor')" :active="request()->routeIs('queue.monitor')">
+                📋 Queue
             </x-responsive-nav-link>
         </div>
 

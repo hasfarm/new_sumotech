@@ -344,7 +344,9 @@ function initTranslate() {
 
         const providerSelect = document.getElementById('translationProvider');
         const provider = providerSelect ? providerSelect.value : 'google';
-        console.log('Selected translation provider:', provider);
+        const styleSelect = document.getElementById('translationStyle');
+        const style = styleSelect ? styleSelect.value : 'default';
+        console.log('Selected translation provider:', provider, 'style:', style);
 
         showTranslationProgress(0);
 
@@ -360,7 +362,8 @@ function initTranslate() {
                 },
                 body: JSON.stringify({
                     segments,
-                    provider
+                    provider,
+                    style
                 })
             });
 
@@ -740,6 +743,11 @@ function hideTranslationProgress() {
 function initGenerateTTS() {
     const generateTTSBtn = document.getElementById('generateTTSBtn');
     if (!generateTTSBtn) return;
+
+    // Edit page has a dedicated selected-segments TTS flow.
+    if (generateTTSBtn.dataset.ttsMode === 'selected-segments') {
+        return;
+    }
     
     generateTTSBtn.addEventListener('click', async function() {
         if (!currentProjectId) return;

@@ -7,27 +7,55 @@
                 <h2 class="font-semibold text-2xl text-gray-800">
                     {{ __('Edit Project - DubSync Workflow') }}
                 </h2>
-                <a href="{{ route('projects.index') }}"
+                <a href="{{ route('youtube-channels.show', $project->youtube_channel_id) }}"
                     class="bg-black hover:bg-gray-800 text-white font-semibold py-2 px-4 rounded-lg transition duration-200">
-                    Back to Projects
+                    Back to Channel
                 </a>
             </div>
         </div>
         <div class="max-w-7xl mx-auto sm:px-6 lg:px-8">
-            @if (($project->status ?? '') === 'new')
+            @if (session('success'))
+                <div class="mb-4 rounded-lg border border-green-200 bg-green-50 px-4 py-3 text-sm text-green-800">
+                    {{ session('success') }}
+                </div>
+            @endif
+
+            @if ($errors->any())
+                <div class="mb-4 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+                    {{ $errors->first() }}
+                </div>
+            @endif
+
+            @php
+                $projectStatus = (string) ($project->status ?? '');
+                $projectSegments = $project->segments;
+                $hasSegments = is_array($projectSegments) ? count($projectSegments) > 0 : !empty($projectSegments);
+                $shouldShowGetTranscript = !$hasSegments;
+            @endphp
+
+            @if ($shouldShowGetTranscript)
                 <div
                     class="mb-6 bg-yellow-50 border border-yellow-200 text-yellow-800 px-4 py-3 rounded-lg flex items-center justify-between">
                     <div class="text-sm">
-                        Video đang ở trạng thái mới. Vui lòng lấy transcript để tiếp tục.
+                        @if ($projectStatus === 'error')
+                            Lay transcript truoc do bi loi. Bam lai de thu lai.
+                        @elseif (!$hasSegments)
+                            Chua co transcript/segments. Bam de lay transcript.
+                        @else
+                            Video dang o trang thai moi. Vui long lay transcript de tiep tuc.
+                        @endif
                     </div>
-                    <form action="{{ route('projects.get.transcript', $project) }}" method="POST">
+                    <form id="getTranscriptForm" action="{{ route('projects.get.transcript', $project) }}" method="POST"
+                        data-async-action="{{ route('projects.get.transcript.async', $project) }}">
                         @csrf
-                        <button type="submit"
+                        <button id="getTranscriptBtn" type="submit"
                             class="bg-green-600 hover:bg-green-700 text-white font-semibold py-2 px-4 rounded-lg transition duration-200">
-                            Get transcript
+                            {{ $projectStatus === 'error' ? 'Retry transcript' : 'Get transcript' }}
                         </button>
                     </form>
                 </div>
+                <div id="getTranscriptStatus"
+                    class="hidden mb-4 rounded-lg border border-blue-200 bg-blue-50 px-4 py-3 text-sm text-blue-700"></div>
             @endif
             <!-- Project Info Card -->
             <div class="bg-white overflow-hidden shadow-sm sm:rounded-lg mb-6">
@@ -45,6 +73,7 @@
                                             class="block w-full group max-w-xs">
                                             <div class="relative">
                                                 <img src="{{ $project->youtube_thumbnail }}" alt="YouTube Thumbnail"
+                                                    id="projectThumbnailPreview"
                                                     class="w-full h-auto rounded-md border border-black/10 group-hover:border-red-500 transition">
                                                 <div
                                                     class="absolute inset-0 bg-black/0 group-hover:bg-black/20 rounded-md transition flex items-center justify-center">
@@ -68,17 +97,47 @@
                                     <div class="mt-3 flex gap-2">
                                         <button type="button" id="downloadYoutubeVideoBtn"
                                             class="px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-md text-sm font-medium transition">
-                                            📥 Download Video
+                                            📥 Download Source Video
                                         </button>
-                                        <div id="downloadProgressContainer" class="hidden flex-1 flex items-center gap-2">
-                                            <div class="flex-1 bg-gray-200 rounded-full h-2 overflow-hidden">
-                                                <div id="downloadProgressBar"
-                                                    class="bg-red-600 h-full transition-all duration-300" style="width: 0%">
+                                        <div id="downloadProgressContainer" class="hidden flex-1 min-w-0">
+                                            <div class="flex items-center gap-2 mb-0.5">
+                                                <div class="flex-1 bg-gray-200 rounded-full h-3 overflow-hidden">
+                                                    <div id="downloadProgressBar"
+                                                        class="h-full transition-all duration-500 rounded-full"
+                                                        style="width: 0%; background: linear-gradient(90deg, #dc2626, #ef4444);">
+                                                    </div>
                                                 </div>
+                                                <span id="downloadProgressText"
+                                                    class="text-xs font-bold text-red-600 min-w-[36px] text-right">0%</span>
                                             </div>
-                                            <span id="downloadProgressText"
-                                                class="text-xs font-semibold text-red-600 min-w-10">0%</span>
+                                            <div class="flex items-center gap-1">
+                                                <span id="downloadProgressMessage"
+                                                    class="text-xs text-gray-500 truncate flex-1">Đang chờ...</span>
+                                                <span id="downloadProgressSpeed"
+                                                    class="text-xs font-semibold text-blue-500 whitespace-nowrap hidden"></span>
+                                            </div>
                                         </div>
+                                    </div>
+
+                                    <div class="mt-2 flex flex-wrap gap-2 items-center">
+                                        <select id="thumbnailRatioSelect"
+                                            class="px-3 py-2 border border-gray-300 rounded-md text-sm bg-white">
+                                            <option value="16:9" selected>16:9</option>
+                                            <option value="9:16">9:16</option>
+                                        </select>
+                                        <select id="thumbnailStyleSelect"
+                                            class="px-3 py-2 border border-gray-300 rounded-md text-sm bg-white">
+                                            <option value="cinematic" selected>Cinematic</option>
+                                            <option value="dramatic">Dramatic</option>
+                                            <option value="minimal">Minimal</option>
+                                            <option value="news">News</option>
+                                            <option value="bold">Bold Contrast</option>
+                                        </select>
+                                        <button type="button" id="generateThumbnailBtn"
+                                            class="px-4 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded-md text-sm font-medium transition">
+                                            🖼️ Tạo thumbnail
+                                        </button>
+                                        <span id="thumbnailStatus" class="text-xs text-gray-500 hidden"></span>
                                     </div>
                                 </div>
 
@@ -89,11 +148,23 @@
                                         <p class="text-teal-600 truncate"><span
                                                 class="px-1.5 py-0.5 rounded text-xs font-semibold text-blue-700 bg-blue-50 border border-blue-200">EN</span>
                                             {{ $project->youtube_title ?? 'N/A' }}</p>
-                                        @if ($project->youtube_title_vi)
-                                            <p class="text-gray-600 italic truncate"><span
-                                                    class="px-1.5 py-0.5 rounded text-xs font-semibold text-white bg-red-600">VI</span>
-                                                {{ $project->youtube_title_vi }}</p>
-                                        @endif
+                                        <div class="space-y-2">
+                                            <label for="youtubeTitleViInput" class="text-gray-700 text-sm font-medium flex items-center gap-2">
+                                                <span class="px-1.5 py-0.5 rounded text-xs font-semibold text-white bg-red-600">VI</span>
+                                                Tieu de tieng Viet
+                                            </label>
+                                            <textarea id="youtubeTitleViInput"
+                                                class="w-full border border-gray-300 rounded-lg p-2 text-sm text-gray-700 focus:ring-2 focus:ring-red-400 focus:border-red-400"
+                                                rows="2"
+                                                placeholder="Nhap va chinh sua tieu de VI...">{{ $project->youtube_title_vi ?? '' }}</textarea>
+                                            <div class="flex items-center gap-3">
+                                                <button type="button" id="saveTitleViBtn"
+                                                    class="px-3 py-1.5 bg-red-600 hover:bg-red-700 text-white rounded-md text-sm font-medium transition">
+                                                    Luu tieu de VI
+                                                </button>
+                                                <span id="titleViSaveStatus" class="text-xs text-gray-500 hidden"></span>
+                                            </div>
+                                        </div>
                                     </div>
                                 </div>
 
@@ -124,10 +195,30 @@
                                         </div>
                                         <div>
                                             <p class="font-medium text-gray-700 mb-1">Status</p>
-                                            <span
-                                                class="px-2 py-1 rounded bg-red-50 text-red-700 border border-red-200 inline-block">
-                                                {{ ucfirst(str_replace('_', ' ', $project->status)) }}
-                                            </span>
+                                            <div class="flex items-center gap-2 flex-wrap">
+                                                <span class="px-2 py-1 rounded bg-red-50 text-red-700 border border-red-200 inline-block text-sm">
+                                                    {{ ucfirst(str_replace('_', ' ', $project->status)) }}
+                                                </span>
+                                                <button type="button" id="changeStatusBtn"
+                                                    class="text-xs text-gray-500 hover:text-gray-800 underline">
+                                                    Đổi status
+                                                </button>
+                                            </div>
+                                            <div id="changeStatusPanel" class="hidden mt-2 flex items-center gap-2">
+                                                <select id="newStatusSelect" class="text-sm border border-gray-300 rounded px-2 py-1">
+                                                    @foreach(['new','source_downloaded','transcribed','translated','tts_generated','aligned','merged','completed','error'] as $s)
+                                                        <option value="{{ $s }}" {{ $project->status === $s ? 'selected' : '' }}>{{ $s }}</option>
+                                                    @endforeach
+                                                </select>
+                                                <button type="button" id="applyStatusBtn"
+                                                    class="text-xs bg-blue-600 hover:bg-blue-700 text-white px-3 py-1 rounded transition">
+                                                    Áp dụng
+                                                </button>
+                                                <button type="button" id="cancelStatusBtn"
+                                                    class="text-xs text-gray-500 hover:text-gray-700 underline">
+                                                    Huỷ
+                                                </button>
+                                            </div>
                                         </div>
                                         <div>
                                             <p class="font-medium text-gray-700 mb-1">Created</p>
@@ -159,6 +250,12 @@
                                             class="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:border-blue-500 focus:outline-none">
                                             <option value="" {{ !$project->tts_provider ? 'selected' : '' }}>--
                                                 Chọn TTS Provider --</option>
+                                            <option value="microsoft"
+                                                {{ ($project->tts_provider ?? '') === 'microsoft' ? 'selected' : '' }}>
+                                                🪟 Microsoft TTS</option>
+                                            <option value="vbee"
+                                                {{ ($project->tts_provider ?? '') === 'vbee' ? 'selected' : '' }}>
+                                                🇻🇳 Vbee TTS (Việt Nam)</option>
                                             <option value="openai"
                                                 {{ ($project->tts_provider ?? '') === 'openai' ? 'selected' : '' }}>
                                                 🤖 OpenAI TTS </option>
@@ -438,7 +535,51 @@
                                 <span id="bulkFixStatus" class="text-xs text-gray-500 hidden"></span>
                             </div>
                             <div id="segmentsList" class="space-y-3 mb-4">
-                                <!-- Segments will be loaded here dynamically -->
+                                @php
+                                    $fallbackTranslated = is_array($project->translated_segments) ? $project->translated_segments : [];
+                                    $fallbackOriginal = is_array($project->segments) ? $project->segments : [];
+                                    $fallbackSegments = count($fallbackTranslated) > 0 ? $fallbackTranslated : $fallbackOriginal;
+                                @endphp
+
+                                @if (count($fallbackSegments) > 0)
+                                    @foreach ($fallbackSegments as $index => $segment)
+                                        @php
+                                            $segmentText = is_array($segment) ? ($segment['text'] ?? '') : '';
+                                            $segmentOriginalText = is_array($segment)
+                                                ? ($segment['original_text'] ?? ($fallbackOriginal[$index]['text'] ?? $segmentText))
+                                                : '';
+                                            $startTime = is_array($segment)
+                                                ? ($segment['start_time'] ?? ($segment['start'] ?? 0))
+                                                : 0;
+                                            $endTime = is_array($segment)
+                                                ? ($segment['end_time'] ?? ($segment['end'] ?? $startTime))
+                                                : $startTime;
+                                        @endphp
+                                        <div class="bg-white border border-gray-200 rounded-lg p-4" data-segment-index="{{ $index }}">
+                                            <div class="flex justify-between items-start mb-2">
+                                                <div class="flex items-center gap-2">
+                                                    <input type="checkbox" class="segment-select" data-index="{{ $index }}">
+                                                    <span class="text-sm font-medium text-gray-600">
+                                                        Đoạn {{ $index + 1 }} ({{ is_numeric($startTime) ? number_format((float) $startTime, 2) : 0 }}s - {{ is_numeric($endTime) ? number_format((float) $endTime, 2) : 0 }}s)
+                                                    </span>
+                                                </div>
+                                            </div>
+                                            <div class="mb-2">
+                                                <label class="text-xs text-gray-600 font-medium">Original:</label>
+                                                <p class="text-sm text-teal-600">
+                                                    <span class="px-1.5 py-0.5 rounded text-xs font-semibold text-blue-700 bg-blue-50 border border-blue-200">EN</span>
+                                                    {{ $segmentOriginalText }}
+                                                </p>
+                                            </div>
+                                            <div class="mb-2">
+                                                <label class="text-xs text-gray-600 font-medium">Translated:</label>
+                                            </div>
+                                            <textarea class="w-full px-3 py-2 border border-gray-300 rounded-lg text-base font-semibold leading-relaxed segment-text" rows="2" data-index="{{ $index }}">{{ $segmentText }}</textarea>
+                                        </div>
+                                    @endforeach
+                                @else
+                                    <!-- Segments will be loaded here dynamically -->
+                                @endif
                             </div>
                         </div>
 
@@ -450,6 +591,10 @@
                                     <button id="saveTranscriptBtn"
                                         class="bg-teal-600 hover:bg-teal-700 text-white font-semibold py-2 px-4 rounded-lg transition duration-200 text-sm">
                                         💾 Save
+                                    </button>
+                                    <button id="rewriteTranscriptBtn"
+                                        class="bg-amber-600 hover:bg-amber-700 text-white font-semibold py-2 px-4 rounded-lg transition duration-200 text-sm">
+                                        ✍️ Viết lại
                                     </button>
                                     <button id="convertTranscriptToSpeechBtn"
                                         class="bg-purple-600 hover:bg-purple-700 text-white font-semibold py-2 px-4 rounded-lg transition duration-200 text-sm"
@@ -561,6 +706,17 @@
                                         class="bg-green-600 h-2 rounded-full transition-all duration-300"
                                         style="width: 0%"></div>
                                 </div>
+                                <div id="ttsBatchErrorPanel"
+                                    class="hidden mt-3 rounded-lg border border-amber-200 bg-amber-50 p-3">
+                                    <div class="flex items-center justify-between gap-2">
+                                        <div id="ttsBatchErrorSummary" class="text-xs font-medium text-amber-800"></div>
+                                        <button type="button" id="ttsBatchErrorToggle"
+                                            class="text-xs font-medium text-amber-700 hover:text-amber-900 hidden">
+                                            Xem them
+                                        </button>
+                                    </div>
+                                    <ul id="ttsBatchErrorList" class="mt-2 space-y-1 text-xs text-amber-900"></ul>
+                                </div>
                             </div>
 
                             <div class="flex flex-wrap gap-3 items-center">
@@ -569,8 +725,15 @@
                                 @if (in_array($project->status, ['transcribed', 'translated']))
                                     <select id="translationProvider"
                                         class="px-4 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-green-500 focus:border-transparent">
+                                        <option value="gemini" selected>Gemini (AI Context)</option>
                                         <option value="google">Google Translate</option>
                                         <option value="openai">OpenAI (GPT)</option>
+                                    </select>
+
+                                    <select id="translationStyle"
+                                        class="px-4 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-green-500 focus:border-transparent">
+                                        <option value="default" selected>🎯 Mặc định</option>
+                                        <option value="humorous">😂 Hài hước</option>
                                     </select>
 
                                     <button id="translateBtn"
@@ -595,10 +758,18 @@
 
                                 @if (!in_array($project->status, ['aligned', 'merged', 'completed']))
                                     <button id="generateTTSBtn"
+                                        data-tts-mode="selected-segments"
                                         class="bg-purple-600 hover:bg-purple-700 text-white font-semibold py-2 px-6 rounded-lg transition duration-200">
                                         Generate TTS Voice
                                     </button>
                                 @endif
+
+                                <button type="button" id="queueMonitorBtn"
+                                    class="bg-gray-700 hover:bg-gray-800 text-white font-semibold py-2 px-4 rounded-lg transition duration-200 relative"
+                                    title="Queue Monitor">
+                                    📋 Queue
+                                    <span id="queueBadge" class="hidden absolute -top-1.5 -right-1.5 bg-red-500 text-white text-[10px] font-bold rounded-full w-5 h-5 flex items-center justify-center">0</span>
+                                </button>
 
                                 @if ($project->status === 'tts_generated')
                                     <button type="button" id="alignTimingBtn"
@@ -607,10 +778,11 @@
                                     </button>
                                 @endif
 
-                                @if (in_array($project->status, ['aligned']) && !in_array($project->status, ['merged', 'completed']))
-                                    <button id="mergeAudioBtn"
-                                        class="bg-orange-600 hover:bg-orange-700 text-white font-semibold py-2 px-6 rounded-lg transition duration-200">
-                                        Merge Audio
+                                @if (in_array($project->status, ['tts_generated', 'aligned']) && !in_array($project->status, ['merged', 'completed']))
+                                    <button id="mergeSegmentsBtn"
+                                        class="bg-orange-600 hover:bg-orange-700 text-white font-semibold py-2 px-6 rounded-lg transition duration-200"
+                                        title="Ghép audio theo đúng timeline transcript gốc">
+                                        🎵 Merge Audio (Timeline)
                                     </button>
                                 @endif
 
@@ -624,6 +796,34 @@
                             </div>
                         </div>
                     </div>
+
+                    <!-- Merged Audio Result -->
+                    @if ($project->final_audio_path)
+                        @php
+                            $mergedUrl = \Illuminate\Support\Facades\Storage::url($project->final_audio_path);
+                            $mergedFilename = basename($project->final_audio_path);
+                        @endphp
+                        <div class="mt-6 bg-green-50 border border-green-200 rounded-lg p-4">
+                            <div class="flex items-center justify-between mb-3">
+                                <h4 class="font-semibold text-green-800">🎵 Merged Audio (Timeline)</h4>
+                                <div class="flex gap-2">
+                                    <a href="{{ $mergedUrl }}" download="{{ $mergedFilename }}"
+                                        class="bg-green-600 hover:bg-green-700 text-white text-sm font-medium py-1.5 px-4 rounded-lg transition">
+                                        ⬇ Download
+                                    </a>
+                                    <button id="remergeSegmentsBtn"
+                                        class="bg-orange-500 hover:bg-orange-600 text-white text-sm font-medium py-1.5 px-4 rounded-lg transition"
+                                        title="Merge lại theo timeline">
+                                        🔁 Re-merge
+                                    </button>
+                                </div>
+                            </div>
+                            <audio controls class="w-full" src="{{ $mergedUrl }}">
+                                Trình duyệt không hỗ trợ audio.
+                            </audio>
+                            <p class="text-xs text-green-700 mt-2">{{ $mergedFilename }}</p>
+                        </div>
+                    @endif
 
                     <!-- Export Section -->
                     @if (in_array($project->status, ['merged', 'completed']))
@@ -674,7 +874,40 @@
         </div>
     </div>
 
+    <!-- Queue Monitor Modal -->
+    <div id="queueMonitorModal" class="hidden fixed inset-0 z-[9999] flex items-center justify-center bg-black/50">
+        <div class="bg-white rounded-xl shadow-2xl w-full max-w-2xl max-h-[80vh] flex flex-col mx-4">
+            <div class="flex items-center justify-between px-5 py-3 border-b">
+                <h3 class="text-base font-bold text-gray-800">📋 Queue Monitor</h3>
+                <div class="flex items-center gap-2">
+                    <button type="button" id="queueRefreshBtn"
+                        class="px-3 py-1 text-xs bg-blue-600 hover:bg-blue-700 text-white rounded-md transition">
+                        🔄 Refresh
+                    </button>
+                    <button type="button" id="queueClearAllBtn"
+                        class="px-3 py-1 text-xs bg-red-600 hover:bg-red-700 text-white rounded-md transition">
+                        🗑️ Clear All Jobs
+                    </button>
+                    <button type="button" id="queueCloseBtn"
+                        class="text-gray-400 hover:text-gray-600 text-xl leading-none">&times;</button>
+                </div>
+            </div>
+            <div class="px-5 py-3 overflow-y-auto flex-1">
+                <div id="queueSummaryBar" class="flex gap-3 mb-3 text-xs font-semibold"></div>
+                <div id="queueContent" class="space-y-3">
+                    <p class="text-gray-500 text-sm text-center py-6">Đang tải...</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
     @push('scripts')
+        <style>
+            @keyframes dlStripe {
+                0%   { background-position: 0% 0; }
+                100% { background-position: 200% 0; }
+            }
+        </style>
         <script>
             // Pass project data to JavaScript
             window.projectData = {
@@ -700,6 +933,59 @@
         <script src="{{ asset('js/dubsync.js') }}?v={{ time() }}"></script>
         <script>
             // Global TTS helper functions (must be before DOMContentLoaded to be accessible)
+
+            function getTtsSettingsStorageKey(projectId) {
+                return `dubsync_tts_settings_${projectId}`;
+            }
+
+            function readPersistedTtsSettings(projectId) {
+                if (!projectId || !window.localStorage) return null;
+                try {
+                    const raw = localStorage.getItem(getTtsSettingsStorageKey(projectId));
+                    if (!raw) return null;
+                    return JSON.parse(raw);
+                } catch (error) {
+                    console.warn('[TTS settings] Failed to parse persisted data:', error);
+                    return null;
+                }
+            }
+
+            function persistTtsSettings(projectId, payload = {}) {
+                if (!projectId || !window.localStorage) return;
+                try {
+                    const existing = readPersistedTtsSettings(projectId) || {};
+                    const merged = {
+                        ...existing,
+                        ...payload,
+                        saved_at: Date.now()
+                    };
+                    localStorage.setItem(getTtsSettingsStorageKey(projectId), JSON.stringify(merged));
+                } catch (error) {
+                    console.warn('[TTS settings] Failed to persist data:', error);
+                }
+            }
+
+            function persistCurrentTtsSettings(projectId) {
+                if (!projectId) return;
+
+                const providerSelect = document.getElementById('ttsProviderSelect');
+                const styleInput = document.getElementById('ttsStyleInstruction');
+                const globalVoiceSelect = document.getElementById('globalVoiceName');
+                const globalVoiceGender = document.querySelector('input[name="globalVoiceGender"]:checked')?.value ||
+                    'female';
+
+                persistTtsSettings(projectId, {
+                    tts_provider: typeof currentTtsProvider !== 'undefined' ? (currentTtsProvider || '') :
+                        (providerSelect?.value || ''),
+                    audio_mode: typeof currentAudioMode !== 'undefined' ? currentAudioMode :
+                        (window.projectData?.audio_mode || 'single'),
+                    speakers_config: typeof speakersConfig !== 'undefined' ? speakersConfig :
+                        (window.projectData?.speakers_config || []),
+                    style_instruction: styleInput?.value || '',
+                    global_voice_gender: globalVoiceGender,
+                    global_voice_name: globalVoiceSelect?.value || ''
+                });
+            }
 
             // Function to enable/disable TTS settings based on provider selection
             function updateTtsSettingsState() {
@@ -784,11 +1070,15 @@
                 ttsButtons.forEach(btn => {
                     const segmentIndex = parseInt(btn.dataset.index);
                     const isReady = isSegmentReadyForTts(segmentIndex);
+                    const isGenerating = btn.dataset.generating === '1';
 
-                    btn.disabled = !isReady;
+                    // Keep button clickable so user gets immediate feedback from validation alerts.
+                    btn.dataset.ready = isReady ? '1' : '0';
+                    btn.disabled = isGenerating;
+
                     if (!isReady) {
                         btn.style.opacity = '0.5';
-                        btn.style.cursor = 'not-allowed';
+                        btn.style.cursor = isGenerating ? 'not-allowed' : 'pointer';
                         if (!hasProvider) {
                             btn.title = 'Vui lòng chọn TTS Provider trước';
                         } else if (currentAudioMode === 'single') {
@@ -798,7 +1088,7 @@
                         }
                     } else {
                         btn.style.opacity = '1';
-                        btn.style.cursor = 'pointer';
+                        btn.style.cursor = isGenerating ? 'not-allowed' : 'pointer';
                         btn.title = 'Generate TTS for this segment';
                     }
                 });
@@ -806,11 +1096,260 @@
 
             // Initialize edit mode when page loads
             document.addEventListener('DOMContentLoaded', function() {
+                function isLikelyChineseText(text) {
+                    const value = String(text || '').trim();
+                    if (!value) return false;
+                    return /[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]/.test(value);
+                }
+
+                function isLikelyVietnameseText(text) {
+                    const value = String(text || '').trim();
+                    if (!value) return false;
+
+                    return /[ăâêôơưđáàảãạắằẳẵặấầẩẫậéèẻẽẹếềểễệóòỏõọốồổỗộớờởỡợúùủũụứừửữựíìỉĩịýỳỷỹỵ]/iu
+                        .test(value) || /\b(khong|cua|nhung|duoc|trong|mot|voi|la|ban|toi)\b/iu.test(value);
+                }
+
+                function normalizeSegmentOrientation(projectData) {
+                    if (!projectData || !Array.isArray(projectData.translated_segments) || !Array.isArray(projectData.segments)) {
+                        return;
+                    }
+
+                    const translated = projectData.translated_segments;
+                    const original = projectData.segments;
+                    if (translated.length === 0 || original.length === 0) {
+                        return;
+                    }
+
+                    const sampleSize = Math.min(6, translated.length, original.length);
+                    let swapSignals = 0;
+
+                    for (let i = 0; i < sampleSize; i++) {
+                        const tSeg = translated[i] || {};
+                        const oSeg = original[i] || {};
+                        const tText = String(tSeg.text || '').trim();
+                        const tOriginal = String(tSeg.original_text || '').trim();
+                        const oText = String(oSeg.text || '').trim();
+
+                        if (!tText || !oText) {
+                            continue;
+                        }
+
+                        // Swapped symptom: translated text is Chinese while original segment text is Vietnamese.
+                        if (isLikelyChineseText(tText) && isLikelyVietnameseText(oText)) {
+                            swapSignals++;
+                            continue;
+                        }
+
+                        // Another swapped symptom: translated original_text is Vietnamese.
+                        if (tOriginal !== '' && isLikelyVietnameseText(tOriginal) && isLikelyChineseText(tText)) {
+                            swapSignals++;
+                        }
+                    }
+
+                    if (swapSignals < Math.max(1, Math.floor(sampleSize * 0.5))) {
+                        return;
+                    }
+
+                    projectData.translated_segments = translated.map((seg, index) => {
+                        const tSeg = seg || {};
+                        const oSeg = original[index] || {};
+
+                        const translatedTextCandidate = String(oSeg.text || '').trim();
+                        const originalTextCandidate = String(tSeg.text || '').trim();
+
+                        return {
+                            ...tSeg,
+                            text: translatedTextCandidate !== '' ? translatedTextCandidate : (tSeg.original_text || tSeg.text || ''),
+                            original_text: originalTextCandidate !== '' ? originalTextCandidate : (tSeg.original_text || '')
+                        };
+                    });
+
+                    console.warn('[edit.blade] Detected swapped transcript orientation. Auto-normalized translated_segments.');
+                }
+
+                function coerceSegmentsArray(rawValue) {
+                    if (Array.isArray(rawValue)) {
+                        return rawValue;
+                    }
+
+                    if (rawValue && typeof rawValue === 'object') {
+                        // Some legacy records may be saved as keyed objects instead of arrays.
+                        return Object.keys(rawValue)
+                            .sort((a, b) => Number(a) - Number(b))
+                            .map((key) => rawValue[key]);
+                    }
+
+                    if (typeof rawValue === 'string' && rawValue.trim() !== '') {
+                        try {
+                            const parsed = JSON.parse(rawValue);
+                            return coerceSegmentsArray(parsed);
+                        } catch (e) {
+                            console.warn('[edit.blade] Failed to parse segments JSON string:', e);
+                        }
+                    }
+
+                    return [];
+                }
+
+                function normalizeProjectSegmentPayload(projectData) {
+                    if (!projectData || typeof projectData !== 'object') {
+                        return;
+                    }
+
+                    projectData.segments = coerceSegmentsArray(projectData.segments);
+                    projectData.translated_segments = coerceSegmentsArray(projectData.translated_segments);
+                    projectData.original_transcript = coerceSegmentsArray(projectData.original_transcript);
+                }
+
+                let initialSegmentsHydrated = false;
+                function getInitialSegmentsFromProjectData() {
+                    if (!window.projectData) {
+                        return {
+                            translated: [],
+                            original: [],
+                            initial: []
+                        };
+                    }
+
+                    const translated = coerceSegmentsArray(window.projectData.translated_segments);
+                    const original = coerceSegmentsArray(window.projectData.segments);
+                    return {
+                        translated,
+                        original,
+                        initial: translated.length > 0 ? translated : original
+                    };
+                }
+
+                function hydrateInitialSegments() {
+                    if (!window.projectData) {
+                        return false;
+                    }
+
+                    const payload = getInitialSegmentsFromProjectData();
+                    if (payload.initial.length === 0) {
+                        return false;
+                    }
+
+                    try {
+                        loadExistingSegments(payload.initial);
+                        if (typeof currentSegmentsMode !== 'undefined') {
+                            currentSegmentsMode = payload.translated.length > 0 ? 'translated' : 'original';
+                        }
+                        initialSegmentsHydrated = true;
+                        console.log('[edit.blade] Hydrated initial segments:', payload.initial.length);
+                        return true;
+                    } catch (hydrateError) {
+                        console.error('[edit.blade] Failed to hydrate initial segments:', hydrateError);
+                        return false;
+                    }
+                }
+
+                function hydrateInitialSegmentsOnce() {
+                    if (initialSegmentsHydrated) {
+                        return;
+                    }
+                    hydrateInitialSegments();
+                }
+
+                async function recoverSegmentsFromApiIfNeeded() {
+                    const segmentsList = document.getElementById('segmentsList');
+                    const hasRenderedSegments = !!(segmentsList && segmentsList.children && segmentsList.children.length > 0);
+                    if (hasRenderedSegments || !currentProjectId) {
+                        return;
+                    }
+
+                    try {
+                        const response = await fetch(`/dubsync/projects/${currentProjectId}`, {
+                            headers: {
+                                'Accept': 'application/json'
+                            }
+                        });
+                        const data = await response.json();
+                        if (!response.ok || !data.success) {
+                            return;
+                        }
+
+                        window.projectData.segments = coerceSegmentsArray(data.segments);
+                        window.projectData.translated_segments = coerceSegmentsArray(data.translated_segments);
+                        hydrateInitialSegments();
+                    } catch (apiError) {
+                        console.warn('[edit.blade] Failed API recovery for segments:', apiError);
+                    }
+                }
+
+                function forceSyncVoiceConfigVisibility() {
+                    const singleRadio = document.getElementById('singleSpeakerRadio');
+                    const multiRadio = document.getElementById('multiSpeakerRadio');
+                    const singleConfig = document.getElementById('singleSpeakerConfig');
+                    const multiConfig = document.getElementById('multiSpeakerConfig');
+
+                    if (!singleRadio || !multiRadio || !singleConfig || !multiConfig) {
+                        return;
+                    }
+
+                    // Keep mode in sync with selected radio even if main init flow is interrupted.
+                    if (singleRadio.checked) {
+                        currentAudioMode = 'single';
+                        singleConfig.style.display = 'block';
+                        multiConfig.style.display = 'none';
+                    } else if (multiRadio.checked) {
+                        currentAudioMode = 'multi';
+                        singleConfig.style.display = 'none';
+                        multiConfig.style.display = 'block';
+                    } else {
+                        // Safe default
+                        currentAudioMode = 'single';
+                        singleRadio.checked = true;
+                        singleConfig.style.display = 'block';
+                        multiConfig.style.display = 'none';
+                    }
+                }
+
+                function bindVoiceVisibilityFallbackHandlers() {
+                    const singleRadio = document.getElementById('singleSpeakerRadio');
+                    const multiRadio = document.getElementById('multiSpeakerRadio');
+                    if (!singleRadio || !multiRadio) {
+                        return;
+                    }
+
+                    if (!singleRadio.dataset.voiceFallbackBound) {
+                        singleRadio.dataset.voiceFallbackBound = '1';
+                        singleRadio.addEventListener('change', forceSyncVoiceConfigVisibility);
+                    }
+                    if (!multiRadio.dataset.voiceFallbackBound) {
+                        multiRadio.dataset.voiceFallbackBound = '1';
+                        multiRadio.addEventListener('change', forceSyncVoiceConfigVisibility);
+                    }
+                }
+
                 // Set current project ID from projectData
                 if (window.projectData && window.projectData.id) {
                     currentProjectId = window.projectData.id;
                     console.log('Project ID set to:', currentProjectId);
                 }
+
+                normalizeProjectSegmentPayload(window.projectData);
+                hydrateInitialSegmentsOnce();
+
+                const persistedTtsSettings = readPersistedTtsSettings(currentProjectId);
+                if (persistedTtsSettings) {
+                    if (typeof persistedTtsSettings.audio_mode === 'string' && persistedTtsSettings.audio_mode !== '') {
+                        window.projectData.audio_mode = persistedTtsSettings.audio_mode;
+                    }
+                    if (Array.isArray(persistedTtsSettings.speakers_config)) {
+                        window.projectData.speakers_config = persistedTtsSettings.speakers_config;
+                    }
+                    if (typeof persistedTtsSettings.style_instruction === 'string') {
+                        window.projectData.style_instruction = persistedTtsSettings.style_instruction;
+                    }
+                    if (typeof persistedTtsSettings.tts_provider === 'string' && persistedTtsSettings.tts_provider !==
+                        '') {
+                        window.projectData.tts_provider = persistedTtsSettings.tts_provider;
+                    }
+                }
+
+                normalizeSegmentOrientation(window.projectData);
 
                 // Set current TTS provider (only if not empty)
                 if (window.projectData && window.projectData.tts_provider && window.projectData.tts_provider !== '') {
@@ -819,10 +1358,14 @@
 
                 const ttsProviderSelect = document.getElementById('ttsProviderSelect');
                 if (ttsProviderSelect) {
+                    if (!currentTtsProvider && ttsProviderSelect.value) {
+                        currentTtsProvider = ttsProviderSelect.value;
+                    }
                     ttsProviderSelect.value = currentTtsProvider || '';
 
                     ttsProviderSelect.addEventListener('change', async function(e) {
                         currentTtsProvider = e.target.value;
+                        persistCurrentTtsSettings(currentProjectId);
 
                         // Update state of other settings
                         updateTtsSettingsState();
@@ -852,28 +1395,44 @@
 
                 // Initialize audio mode
                 initAudioMode();
+                bindVoiceVisibilityFallbackHandlers();
+                forceSyncVoiceConfigVisibility();
+
+                // Sync enabled/disabled state immediately after mode + provider init.
+                updateTtsSettingsState();
 
                 // Set initial state after audio mode is initialized
                 // Use longer timeout to ensure DOM is ready
                 setTimeout(() => {
                     console.log('Setting initial TTS settings state...');
                     updateTtsSettingsState();
+                    forceSyncVoiceConfigVisibility();
                 }, 500);
 
-                if (window.projectData) {
-                    const translated = Array.isArray(window.projectData.translated_segments) ?
-                        window.projectData.translated_segments : [];
-                    const original = Array.isArray(window.projectData.segments) ?
-                        window.projectData.segments : [];
-                    const initialSegments = translated.length > 0 ? translated : original;
+                hydrateInitialSegmentsOnce();
 
-                    if (initialSegments && initialSegments.length > 0) {
-                        loadExistingSegments(initialSegments);
-                        if (typeof currentSegmentsMode !== 'undefined') {
-                            currentSegmentsMode = translated.length > 0 ? 'translated' : 'original';
-                        }
+                // Failsafe: if another initializer errors out and list is still empty, retry hydration.
+                setTimeout(() => {
+                    const segmentsList = document.getElementById('segmentsList');
+                    const hasRenderedSegments = !!(segmentsList && segmentsList.children && segmentsList.children.length > 0);
+                    if (!hasRenderedSegments) {
+                        hydrateInitialSegmentsOnce();
                     }
-                }
+                    forceSyncVoiceConfigVisibility();
+                }, 300);
+
+                // Additional recovery windows for late init errors/races.
+                setTimeout(() => {
+                    hydrateInitialSegmentsOnce();
+                    recoverSegmentsFromApiIfNeeded();
+                    forceSyncVoiceConfigVisibility();
+                }, 900);
+
+                setTimeout(() => {
+                    hydrateInitialSegmentsOnce();
+                    recoverSegmentsFromApiIfNeeded();
+                    forceSyncVoiceConfigVisibility();
+                }, 1800);
 
                 // Style preset buttons
                 const styleTextarea = document.getElementById('ttsStyleInstruction');
@@ -896,13 +1455,175 @@
                 if (styleTextarea) {
                     let saveTimeout;
                     styleTextarea.addEventListener('input', () => {
+                        persistCurrentTtsSettings(currentProjectId);
                         clearTimeout(saveTimeout);
                         saveTimeout = setTimeout(async () => {
                             await saveStyleInstruction(styleTextarea.value);
                         }, 1000); // Save after 1 second of no typing
                     });
                 }
+
+                const titleViInput = document.getElementById('youtubeTitleViInput');
+                const saveTitleViBtn = document.getElementById('saveTitleViBtn');
+                const titleViSaveStatus = document.getElementById('titleViSaveStatus');
+
+                if (titleViInput && saveTitleViBtn) {
+                    let isSavingTitleVi = false;
+                    const setTitleViStatus = (message, colorClass = 'text-gray-500') => {
+                        if (!titleViSaveStatus) return;
+                        titleViSaveStatus.classList.remove('hidden', 'text-gray-500', 'text-green-600',
+                            'text-red-500');
+                        titleViSaveStatus.classList.add(colorClass);
+                        titleViSaveStatus.textContent = message;
+                    };
+
+                    saveTitleViBtn.addEventListener('click', async () => {
+                        if (isSavingTitleVi) return;
+
+                        isSavingTitleVi = true;
+                        saveTitleViBtn.disabled = true;
+                        saveTitleViBtn.style.opacity = '0.7';
+                        setTitleViStatus('Dang luu...', 'text-gray-500');
+
+                        try {
+                            const value = titleViInput.value || '';
+                            await saveVietnameseTitle(value);
+                            setTitleViStatus('Da luu tieu de VI', 'text-green-600');
+                        } catch (error) {
+                            console.error('Failed to save VI title:', error);
+                            setTitleViStatus('Luu that bai', 'text-red-500');
+                        } finally {
+                            isSavingTitleVi = false;
+                            saveTitleViBtn.disabled = false;
+                            saveTitleViBtn.style.opacity = '1';
+                        }
+                    });
+                }
             });
+
+            let segmentAutoSaveTimer = null;
+            let segmentAutoSaving = false;
+
+            async function autoSaveSegmentsFromTextboxes() {
+                if (!currentProjectId || segmentAutoSaving || typeof collectSegments !== 'function') {
+                    return;
+                }
+
+                const textareas = document.querySelectorAll('.segment-text');
+                const hasDirtyTextarea = Array.from(textareas).some((textarea) => {
+                    return textarea.dataset.lastSavedValue !== textarea.value;
+                });
+
+                if (!hasDirtyTextarea) {
+                    return;
+                }
+
+                const statusEl = document.getElementById('bulkFixStatus');
+                segmentAutoSaving = true;
+                if (statusEl) {
+                    statusEl.classList.remove('hidden', 'text-red-500');
+                    statusEl.classList.add('text-gray-500');
+                    statusEl.textContent = 'Dang auto-save...';
+                }
+
+                try {
+                    const segments = collectSegments();
+                    const styleInstruction = document.getElementById('ttsStyleInstruction')?.value || '';
+                    const ttsProvider = (typeof currentTtsProvider !== 'undefined' && currentTtsProvider)
+                        ? currentTtsProvider
+                        : (window.projectData?.tts_provider || null);
+                    const audioMode = (typeof currentAudioMode !== 'undefined' && currentAudioMode)
+                        ? currentAudioMode
+                        : (window.projectData?.audio_mode || null);
+                    const speakersConfigPayload = (typeof speakersConfig !== 'undefined' && speakersConfig)
+                        ? speakersConfig
+                        : (window.projectData?.speakers_config || null);
+
+                    const payload = {
+                        tts_provider: ttsProvider,
+                        audio_mode: audioMode,
+                        speakers_config: speakersConfigPayload,
+                        style_instruction: styleInstruction
+                    };
+
+                    const isTranslatedMode = (typeof currentSegmentsMode !== 'undefined' && currentSegmentsMode ===
+                        'translated');
+                    if (isTranslatedMode) {
+                        payload.translated_segments = segments;
+                    } else {
+                        payload.segments = segments;
+                    }
+
+                    const response = await fetch(`/dubsync/projects/${currentProjectId}/save-segments`, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'X-CSRF-TOKEN': document.querySelector('meta[name="csrf-token"]').content
+                        },
+                        body: JSON.stringify(payload)
+                    });
+
+                    const data = await response.json();
+                    if (!response.ok || !data.success) {
+                        throw new Error(data.error || 'Khong the auto-save segments');
+                    }
+
+                    document.querySelectorAll('.segment-text').forEach((textarea) => {
+                        textarea.dataset.lastSavedValue = textarea.value;
+                    });
+
+                    if (statusEl) {
+                        statusEl.classList.remove('hidden', 'text-red-500');
+                        statusEl.classList.add('text-green-600');
+                        statusEl.textContent = 'Da auto-save';
+                        setTimeout(() => {
+                            statusEl.classList.add('hidden');
+                            statusEl.classList.remove('text-green-600');
+                        }, 1200);
+                    }
+                } catch (error) {
+                    console.error('[autoSaveSegmentsFromTextboxes] Error:', error);
+                    if (statusEl) {
+                        statusEl.classList.remove('hidden', 'text-gray-500');
+                        statusEl.classList.add('text-red-500');
+                        statusEl.textContent = 'Auto-save that bai';
+                    }
+                } finally {
+                    segmentAutoSaving = false;
+                }
+            }
+
+            function queueAutoSaveSegments() {
+                clearTimeout(segmentAutoSaveTimer);
+                segmentAutoSaveTimer = setTimeout(() => {
+                    autoSaveSegmentsFromTextboxes();
+                }, 250);
+            }
+
+            function getLatestSegmentText(segmentIndex, fallbackText = '') {
+                const textarea = document.querySelector(`.segment-text[data-index="${segmentIndex}"]`);
+                if (textarea) {
+                    return textarea.value;
+                }
+
+                return fallbackText;
+            }
+
+            async function flushLatestSegmentEdits() {
+                // Cancel pending debounce so we can flush immediately before TTS.
+                clearTimeout(segmentAutoSaveTimer);
+
+                // Sync in-memory model with current UI first.
+                if (Array.isArray(currentSegments)) {
+                    currentSegments.forEach((segment, index) => {
+                        if (!segment) return;
+                        segment.text = getLatestSegmentText(index, segment.text || '');
+                    });
+                }
+
+                // Persist latest edits before any generation request.
+                await autoSaveSegmentsFromTextboxes();
+            }
 
             function loadExistingSegments(segments) {
                 const segmentsList = document.getElementById('segmentsList');
@@ -947,19 +1668,19 @@
                             return segment.original_text;
                         }
 
+                        const originalTranscript = window.projectData?.original_transcript;
+                        if (Array.isArray(originalTranscript) && originalTranscript[index]) {
+                            const entry = originalTranscript[index];
+                            if (typeof entry === 'string') return entry;
+                            if (entry && typeof entry.text === 'string') return entry.text;
+                        }
+
                         const fallbackSegment = (window.projectData && Array.isArray(window.projectData
                                 .segments)) ?
                             window.projectData.segments[index] :
                             null;
                         if (fallbackSegment) {
                             return fallbackSegment.original_text || fallbackSegment.text || '';
-                        }
-
-                        const originalTranscript = window.projectData?.original_transcript;
-                        if (Array.isArray(originalTranscript) && originalTranscript[index]) {
-                            const entry = originalTranscript[index];
-                            if (typeof entry === 'string') return entry;
-                            if (entry && typeof entry.text === 'string') return entry.text;
                         }
 
                         return segment.text || '';
@@ -1018,7 +1739,7 @@
                             <label class="text-xs text-gray-600 font-medium">Translated:</label>
                         </div>
                         <textarea 
-                            class="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-red-500 focus:border-transparent segment-text"
+                            class="w-full px-3 py-2 border border-gray-300 rounded-lg text-base font-semibold leading-relaxed focus:ring-2 focus:ring-red-500 focus:border-transparent segment-text"
                             rows="2"
                             data-index="${index}"
                         >${segment.text}</textarea>
@@ -1044,6 +1765,11 @@
                     if (translatedTextarea && typeof autoResizeTextarea === 'function') {
                         autoResizeTextarea(translatedTextarea);
                         translatedTextarea.addEventListener('input', () => autoResizeTextarea(translatedTextarea));
+                    }
+                    if (translatedTextarea) {
+                        translatedTextarea.dataset.lastSavedValue = translatedTextarea.value;
+                        translatedTextarea.addEventListener('blur', queueAutoSaveSegments);
+                        translatedTextarea.addEventListener('mouseleave', queueAutoSaveSegments);
                     }
 
                     if (isMultiMode) {
@@ -1416,6 +2142,8 @@
                     return;
                 }
 
+                await flushLatestSegmentEdits();
+
                 const segment = currentSegments[segmentIndex];
                 if (!segment) {
                     alert('Segment not found');
@@ -1448,7 +2176,9 @@
                 }
 
                 const styleInstruction = document.getElementById('ttsStyleInstruction')?.value?.trim() || '';
-                const textToSend = styleInstruction ? `${styleInstruction}\n\n${segment.text}` : segment.text;
+                const latestText = getLatestSegmentText(segmentIndex, segment.text || '');
+                segment.text = latestText;
+                const textToSend = styleInstruction ? `${styleInstruction}\n\n${latestText}` : latestText;
 
                 const btn = document.querySelector(`.generate-segment-tts[data-index="${segmentIndex}"]`);
                 const progressBar = document.querySelector(`.tts-progress-${segmentIndex}`);
@@ -1460,10 +2190,11 @@
                 }
 
                 btn.innerHTML = '⏳';
+                btn.dataset.generating = '1';
                 btn.disabled = true;
 
                 try {
-                    const response = await fetch(`/dubsync/projects/${currentProjectId}/generate-segment-tts`, {
+                    const response = await fetchWithTimeout(`/dubsync/projects/${currentProjectId}/generate-segment-tts`, {
                         method: 'POST',
                         headers: {
                             'Content-Type': 'application/json',
@@ -1477,7 +2208,7 @@
                             voice_name: voiceName,
                             provider: currentTtsProvider
                         })
-                    });
+                    }, 120000);
 
                     const data = await response.json();
 
@@ -1505,20 +2236,27 @@
                     if (progressBar) {
                         progressBar.classList.add('hidden');
                     }
+                    delete btn.dataset.generating;
                     btn.innerHTML = originalText;
                     btn.disabled = false;
+                    updateTtsButtonsState();
                 }
             }
 
             // Voice options mapping
-            let currentTtsProvider; // Will be set from projectData in DOMContentLoaded
-            let currentAudioMode = 'single';
-            let speakersConfig = [];
-            let voiceOptionsCache = {};
+            var currentTtsProvider; // Will be set from projectData in DOMContentLoaded
+            var currentAudioMode = 'single';
+            var speakersConfig = [];
+            var voiceOptionsCache = {};
             // currentSegments will be set dynamically in loadExistingSegments()
 
             // Initialize audio mode
             function initAudioMode() {
+                if (window.__dubsyncAudioModeInitDone) {
+                    return;
+                }
+                window.__dubsyncAudioModeInitDone = true;
+
                 currentAudioMode = window.projectData?.audio_mode || 'single';
                 speakersConfig = window.projectData?.speakers_config || [];
 
@@ -1549,6 +2287,7 @@
                     if (this.checked) {
                         currentAudioMode = 'single';
                         toggleAudioModeUI();
+                        persistCurrentTtsSettings(currentProjectId);
                         saveAudioMode();
                         reloadSegments();
                     }
@@ -1558,12 +2297,16 @@
                     if (this.checked) {
                         currentAudioMode = 'multi';
                         toggleAudioModeUI();
+                        persistCurrentTtsSettings(currentProjectId);
                         saveAudioMode();
                         reloadSegments();
                     }
                 });
 
-                document.getElementById('addSpeakerBtn').addEventListener('click', addSpeaker);
+                const addSpeakerBtn = document.getElementById('addSpeakerBtn');
+                if (addSpeakerBtn) {
+                    addSpeakerBtn.addEventListener('click', addSpeaker);
+                }
             }
 
             function toggleAudioModeUI() {
@@ -1649,6 +2392,30 @@
                 }
             }
 
+            async function saveVietnameseTitle(youtubeTitleVi) {
+                if (!currentProjectId) {
+                    throw new Error('Project ID khong hop le');
+                }
+
+                const response = await fetch(`/dubsync/projects/${currentProjectId}/title-vi`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-CSRF-TOKEN': document.querySelector('meta[name="csrf-token"]').content
+                    },
+                    body: JSON.stringify({
+                        youtube_title_vi: youtubeTitleVi
+                    })
+                });
+
+                const data = await response.json();
+                if (!response.ok || !data.success) {
+                    throw new Error(data.error || 'Khong the luu tieu de VI');
+                }
+
+                return data;
+            }
+
             function getGlobalVoiceGender() {
                 const selected = document.querySelector('input[name="globalVoiceGender"]:checked');
                 return selected ? selected.value : 'female';
@@ -1659,10 +2426,19 @@
                 const genderRadios = document.querySelectorAll('input[name="globalVoiceGender"]');
                 const voiceSelect = document.getElementById('globalVoiceName');
                 const previewBtn = document.getElementById('globalVoicePreviewBtn');
+                const persisted = readPersistedTtsSettings(currentProjectId) || {};
 
                 if (genderRadios && genderRadios.length > 0) {
+                    const persistedGender = persisted.global_voice_gender;
+                    if (persistedGender === 'male' || persistedGender === 'female') {
+                        genderRadios.forEach((radio) => {
+                            radio.checked = radio.value === persistedGender;
+                        });
+                    }
+
                     genderRadios.forEach((radio) => {
                         radio.addEventListener('change', async function() {
+                            persistCurrentTtsSettings(currentProjectId);
                             await updateGlobalVoiceOptions(getGlobalVoiceGender());
                         });
                     });
@@ -1671,6 +2447,7 @@
                 // Add change listener to voice select to update button states
                 if (voiceSelect) {
                     voiceSelect.addEventListener('change', function() {
+                        persistCurrentTtsSettings(currentProjectId);
                         updateVoiceButtonStates();
                         updateConvertToSpeechButtonState();
                     });
@@ -1688,7 +2465,10 @@
                     });
                 }
 
-                updateGlobalVoiceOptions(getGlobalVoiceGender());
+                const initialGender = getGlobalVoiceGender();
+                const initialVoice = typeof persisted.global_voice_name === 'string' ? persisted.global_voice_name :
+                    '';
+                updateGlobalVoiceOptions(initialGender, initialVoice);
                 updateVoiceButtonStates(); // Initialize button states
             }
 
@@ -2009,6 +2789,8 @@
                     if (!response.ok || !data.success) {
                         throw new Error(data.error || 'Không thể lưu speakers config');
                     }
+
+                    persistCurrentTtsSettings(currentProjectId);
                 } catch (error) {
                     console.error('Failed to save speakers config:', error);
                 }
@@ -2066,6 +2848,8 @@
                     if (!response.ok || !data.success) {
                         throw new Error(data.error || 'Không thể lưu TTS provider');
                     }
+
+                    persistCurrentTtsSettings(currentProjectId);
                 } catch (error) {
                     console.error('Failed to save TTS provider:', error);
                     alert('Lỗi: ' + error.message);
@@ -2264,6 +3048,107 @@
             }
 
             let isGeneratingTTS = false; // Flag to prevent multiple concurrent TTS generation
+            let ttsBatchPollTimer = null;
+
+            const TTS_BATCH_ERROR_PREVIEW_LIMIT = 8;
+            let ttsBatchShowAllErrors = false;
+
+            const htmlEscape = (value) => String(value ?? '')
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#039;');
+
+            const parseSegmentError = (rawError) => {
+                const text = String(rawError ?? '');
+                const matched = text.match(/^\s*Segment\s+(\d+)\s*:\s*(.*)$/i);
+                if (!matched) {
+                    return {
+                        segmentIndex: null,
+                        segmentLabel: 'N/A',
+                        message: text || 'Unknown error'
+                    };
+                }
+
+                return {
+                    segmentIndex: Number(matched[1]),
+                    segmentLabel: matched[1],
+                    message: matched[2] || 'Unknown error'
+                };
+            };
+
+            const resetTtsBatchErrors = () => {
+                ttsBatchShowAllErrors = false;
+                const panel = document.getElementById('ttsBatchErrorPanel');
+                const summary = document.getElementById('ttsBatchErrorSummary');
+                const list = document.getElementById('ttsBatchErrorList');
+                const toggle = document.getElementById('ttsBatchErrorToggle');
+
+                if (summary) {
+                    summary.textContent = '';
+                }
+                if (list) {
+                    list.innerHTML = '';
+                }
+                if (toggle) {
+                    toggle.classList.add('hidden');
+                    toggle.textContent = 'Xem them';
+                }
+                if (panel) {
+                    panel.classList.add('hidden');
+                }
+            };
+
+            const renderTtsBatchErrors = (errors, failedCount = 0) => {
+                const panel = document.getElementById('ttsBatchErrorPanel');
+                const summary = document.getElementById('ttsBatchErrorSummary');
+                const list = document.getElementById('ttsBatchErrorList');
+                const toggle = document.getElementById('ttsBatchErrorToggle');
+
+                if (!panel || !summary || !list || !toggle) {
+                    return;
+                }
+
+                const normalizedErrors = Array.isArray(errors) ? errors.filter(Boolean).map(parseSegmentError) : [];
+                const totalErrors = normalizedErrors.length;
+                const displayCount = ttsBatchShowAllErrors ? totalErrors : Math.min(totalErrors, TTS_BATCH_ERROR_PREVIEW_LIMIT);
+
+                if (totalErrors === 0 && Number(failedCount || 0) === 0) {
+                    resetTtsBatchErrors();
+                    return;
+                }
+
+                panel.classList.remove('hidden');
+                const countLabel = Number(failedCount || totalErrors || 0);
+                summary.textContent = `Chi tiet loi theo segment (${countLabel} loi)`;
+
+                const visibleErrors = normalizedErrors.slice(0, displayCount);
+                list.innerHTML = visibleErrors.map((err) => {
+                    const indexHtml = err.segmentIndex !== null ? `<span class="font-semibold">Segment ${htmlEscape(err.segmentLabel)}</span>` : '<span class="font-semibold">Segment N/A</span>';
+                    return `<li class="rounded border border-amber-200 bg-white px-2 py-1">${indexHtml}: ${htmlEscape(err.message)}</li>`;
+                }).join('');
+
+                if (totalErrors > TTS_BATCH_ERROR_PREVIEW_LIMIT) {
+                    toggle.classList.remove('hidden');
+                    const hiddenCount = totalErrors - TTS_BATCH_ERROR_PREVIEW_LIMIT;
+                    toggle.textContent = ttsBatchShowAllErrors ? 'Thu gon' : `Xem them ${hiddenCount} loi`;
+                    toggle.onclick = () => {
+                        ttsBatchShowAllErrors = !ttsBatchShowAllErrors;
+                        renderTtsBatchErrors(errors, failedCount);
+                    };
+                } else {
+                    toggle.classList.add('hidden');
+                    toggle.onclick = null;
+                }
+            };
+
+            const stopTtsBatchPolling = () => {
+                if (ttsBatchPollTimer) {
+                    clearInterval(ttsBatchPollTimer);
+                    ttsBatchPollTimer = null;
+                }
+            };
 
             // Generate TTS for all selected segments (PARALLEL processing for speed)
             async function generateTTSForSelectedSegments(event) {
@@ -2292,12 +3177,32 @@
                     generateBtn.disabled = true;
                 }
 
+                const unlockGenerateTTS = () => {
+                    isGeneratingTTS = false;
+                    const btn = document.getElementById('generateTTSBtn');
+                    if (btn) {
+                        btn.disabled = false;
+                    }
+                };
+
                 // Get all selected segment indices
                 const selectedCheckboxes = document.querySelectorAll('.segment-select:checked');
                 const selectedIndices = Array.from(selectedCheckboxes).map(checkbox => parseInt(checkbox.dataset.index));
 
                 if (selectedIndices.length === 0) {
                     alert('Vui lòng chọn ít nhất một segment trước');
+                    unlockGenerateTTS();
+                    return;
+                }
+
+                // Fast path: if only one segment is selected, reuse single-segment flow
+                // so users don't wait on bulk progress simulation at 90%.
+                if (selectedIndices.length === 1) {
+                    try {
+                        await generateSegmentTTS(selectedIndices[0]);
+                    } finally {
+                        unlockGenerateTTS();
+                    }
                     return;
                 }
 
@@ -2320,13 +3225,22 @@
                 const progressContainer = document.getElementById('progressContainer');
                 const progressBar = document.getElementById('progressBar');
                 const progressPercent = document.getElementById('progressPercent');
-                const progressLabel = progressContainer.querySelector('span:first-child');
+                const progressLabel = document.getElementById('progressLabel');
 
                 progressContainer.classList.remove('hidden');
+                progressBar.style.width = '1%';
+                progressPercent.textContent = '1%';
+                resetTtsBatchErrors();
+                if (progressLabel) {
+                    progressLabel.textContent = `Đang xếp hàng tạo TTS cho ${selectedIndices.length} đoạn...`;
+                }
 
                 const totalCount = selectedIndices.length;
+                let keepLockedForAsync = false;
 
                 try {
+                    await flushLatestSegmentEdits();
+
                     // Ensure voice selected in single mode
                     if (currentAudioMode === 'single') {
                         const voiceSelect = document.getElementById('globalVoiceName');
@@ -2338,11 +3252,19 @@
 
                     // Prepare request payload with voice settings for each segment
                     const voiceSettingsMap = {};
+                    const segmentTextsMap = {};
 
                     selectedIndices.forEach(segmentIndex => {
                         const segment = currentSegments[segmentIndex];
                         let voiceGender = 'female';
                         let voiceName = '';
+
+                        // Always send the exact text currently shown/edited in UI for this segment.
+                        const latestText = getLatestSegmentText(segmentIndex, segment?.text || '');
+                        if (segment) {
+                            segment.text = latestText;
+                        }
+                        segmentTextsMap[segmentIndex] = latestText;
 
                         if (currentAudioMode === 'multi') {
                             const speakerName = segment.speaker_name;
@@ -2369,8 +3291,8 @@
 
                     console.log(`Bắt đầu tạo TTS cho ${totalCount} segments: ${selectedIndices.join(', ')}`);
 
-                    // Send ONE request with all selected segment indices
-                    const response = await fetchWithTimeout(
+                    // Start async queue job for bulk TTS
+                    const response = await fetch(
                         `/dubsync/projects/${currentProjectId}/generate-segment-tts`, {
                             method: 'POST',
                             headers: {
@@ -2379,12 +3301,13 @@
                             },
                             body: JSON.stringify({
                                 segment_indices: selectedIndices,
+                                segment_texts: segmentTextsMap,
                                 voice_settings: voiceSettingsMap,
                                 style_instruction: styleInstruction,
-                                provider: currentTtsProvider
+                                provider: currentTtsProvider,
+                                async: true
                             })
-                        },
-                        300000 // 300 second timeout for bulk TTS generation
+                        }
                     );
 
                     const data = await response.json();
@@ -2393,54 +3316,83 @@
                         throw new Error(data.error || 'Lỗi tạo TTS');
                     }
 
-                    console.log('TTS generation response:', data);
-                    console.log(
-                        `✅ Backend says it generated ${data.generated_count} segments from request for ${totalCount} segments`
-                    );
-                    if (data.segments_data) {
-                        console.log(`📦 Returned audio for segments: ${Object.keys(data.segments_data).join(', ')}`);
-                    }
-
-                    // Update segments with audio info from response
-                    if (data.segments_data) {
-                        Object.keys(data.segments_data).forEach(indexStr => {
+                    const applySegmentsData = (segmentsData) => {
+                        if (!segmentsData) return;
+                        Object.keys(segmentsData).forEach(indexStr => {
                             const idx = parseInt(indexStr);
-                            if (currentSegments[idx] && data.segments_data[indexStr]) {
-                                const segmentData = data.segments_data[indexStr];
+                            if (currentSegments[idx] && segmentsData[indexStr]) {
+                                const segmentData = segmentsData[indexStr];
                                 currentSegments[idx].audio_path = segmentData.audio_path;
                                 currentSegments[idx].audio_url = segmentData.audio_url;
-                                currentSegments[idx].tts_provider = currentTtsProvider;
-                                if (voiceSettingsMap[idx]) {
-                                    currentSegments[idx].voice_gender = voiceSettingsMap[idx].voice_gender;
-                                    currentSegments[idx].voice_name = voiceSettingsMap[idx].voice_name;
-                                }
+                                currentSegments[idx].tts_provider = segmentData.tts_provider || currentTtsProvider;
+                                currentSegments[idx].voice_gender = segmentData.voice_gender;
+                                currentSegments[idx].voice_name = segmentData.voice_name;
                             }
                         });
-                    }
+                    };
 
-                    // Update progress to 100%
-                    progressBar.style.width = '100%';
-                    progressPercent.textContent = '100%';
+                    const pollProgress = async () => {
+                        try {
+                            const progressResp = await fetch(`/dubsync/projects/${currentProjectId}/generate-segment-tts-progress`, {
+                                method: 'GET',
+                                headers: {
+                                    'X-CSRF-TOKEN': document.querySelector('meta[name="csrf-token"]').content
+                                }
+                            });
 
-                    if (progressLabel) {
-                        const statusMsg = data.generated_count ?
-                            `✅ n lấy g! (${data.generated_count}/${totalCount})` :
-                            `✅ Tạo TTS xong!`;
-                        progressLabel.textContent = statusMsg;
-                    }
+                            const progressData = await progressResp.json();
+                            const status = progressData.status || 'processing';
+                            const pctRaw = Number(progressData.percent ?? 0);
+                            const pct = Number.isFinite(pctRaw) ? Math.max(0, Math.min(100, Math.floor(pctRaw))) : 0;
 
-                    // Hide progress bar after 2 seconds
-                    setTimeout(() => {
-                        progressContainer.classList.add('hidden');
-                        progressBar.style.width = '0%';
-                        progressPercent.textContent = '0%';
-                    }, 2000);
+                            progressBar.style.width = `${pct}%`;
+                            progressPercent.textContent = `${pct}%`;
 
-                    // Reload segments UI
-                    reloadSegments();
+                            if (progressLabel) {
+                                const msg = progressData.message || 'Đang xử lý TTS...';
+                                progressLabel.textContent = msg;
+                            }
+
+                            renderTtsBatchErrors(progressData.errors || [], progressData.failed_count || 0);
+
+                            if (status === 'completed' || status === 'completed_with_errors') {
+                                stopTtsBatchPolling();
+                                applySegmentsData(progressData.segments_data || {});
+                                reloadSegments();
+                                unlockGenerateTTS();
+
+                                if (status === 'completed_with_errors') {
+                                    const errCount = Number(progressData.failed_count || 0);
+                                    alert(`⚠️ Batch TTS hoàn tất nhưng có ${errCount} lỗi. Kiểm tra log hoặc thử lại các đoạn lỗi.`);
+                                }
+
+                                setTimeout(() => {
+                                    progressContainer.classList.add('hidden');
+                                    progressBar.style.width = '0%';
+                                    progressPercent.textContent = '0%';
+                                }, 1500);
+                            } else if (status === 'error' || status === 'failed') {
+                                stopTtsBatchPolling();
+                                const errMsg = progressData.message || 'Batch TTS thất bại';
+                                progressLabel.textContent = `❌ ${errMsg}`;
+                                progressBar.style.width = '100%';
+                                progressPercent.textContent = '❌';
+                                unlockGenerateTTS();
+                                alert('❌ Lỗi tạo TTS: ' + errMsg);
+                            }
+                        } catch (pollError) {
+                            console.warn('Poll TTS batch progress failed:', pollError);
+                        }
+                    };
+
+                    stopTtsBatchPolling();
+                    await pollProgress();
+                    ttsBatchPollTimer = setInterval(pollProgress, 2000);
+                    keepLockedForAsync = true;
 
                 } catch (error) {
                     console.error('Batch TTS generation error:', error);
+                    stopTtsBatchPolling();
 
                     // Update progress bar to show error
                     progressBar.style.width = '100%';
@@ -2455,12 +3407,11 @@
                     setTimeout(() => {
                         progressContainer.classList.add('hidden');
                     }, 3000);
+
+                    unlockGenerateTTS();
                 } finally {
-                    // Reset flag to allow next generation
-                    isGeneratingTTS = false;
-                    const generateBtn = document.getElementById('generateTTSBtn');
-                    if (generateBtn) {
-                        generateBtn.disabled = false;
+                    if (!keepLockedForAsync) {
+                        unlockGenerateTTS();
                     }
                 }
             }
@@ -2471,6 +3422,81 @@
                 const ttsContent = document.getElementById('ttsContent');
                 const ttsToggleIcon = document.getElementById('ttsToggleIcon');
                 let isExpanded = true;
+
+                const getTranscriptForm = document.getElementById('getTranscriptForm');
+                const getTranscriptBtn = document.getElementById('getTranscriptBtn');
+                const getTranscriptStatus = document.getElementById('getTranscriptStatus');
+
+                if (getTranscriptForm && getTranscriptBtn) {
+                    getTranscriptForm.addEventListener('submit', async function(event) {
+                        event.preventDefault();
+
+                        const asyncUrl = getTranscriptForm.dataset.asyncAction || getTranscriptForm.action;
+                        const csrfToken = document.querySelector('meta[name="csrf-token"]')?.content || '';
+                        const originalBtnText = getTranscriptBtn.textContent;
+
+                        getTranscriptBtn.disabled = true;
+                        getTranscriptBtn.classList.add('opacity-70', 'cursor-not-allowed');
+                        getTranscriptBtn.textContent = 'Dang lay transcript...';
+
+                        if (getTranscriptStatus) {
+                            getTranscriptStatus.classList.remove('hidden', 'border-red-200', 'bg-red-50',
+                                'text-red-700', 'border-green-200', 'bg-green-50', 'text-green-700');
+                            getTranscriptStatus.classList.add('border-blue-200', 'bg-blue-50', 'text-blue-700');
+                            getTranscriptStatus.textContent =
+                                'Dang xu ly transcript, vui long doi trong giay lat...';
+                        }
+
+                        try {
+                            const response = await fetch(asyncUrl, {
+                                method: 'POST',
+                                headers: {
+                                    'X-CSRF-TOKEN': csrfToken,
+                                    'Accept': 'application/json',
+                                    'X-Requested-With': 'XMLHttpRequest'
+                                }
+                            });
+
+                            let data = {};
+                            try {
+                                data = await response.json();
+                            } catch (jsonError) {
+                                data = {
+                                    error: 'Phan hoi tu server khong hop le.'
+                                };
+                            }
+
+                            if (!response.ok || !data.success) {
+                                throw new Error(data.error || 'Khong the lay transcript.');
+                            }
+
+                            if (getTranscriptStatus) {
+                                getTranscriptStatus.classList.remove('border-blue-200', 'bg-blue-50',
+                                    'text-blue-700', 'border-red-200', 'bg-red-50', 'text-red-700');
+                                getTranscriptStatus.classList.add('border-green-200', 'bg-green-50', 'text-green-700');
+                                getTranscriptStatus.textContent =
+                                    'Lay transcript thanh cong. Dang tai lai trang...';
+                            }
+
+                            setTimeout(() => {
+                                window.location.reload();
+                            }, 500);
+                        } catch (error) {
+                            if (getTranscriptStatus) {
+                                getTranscriptStatus.classList.remove('border-blue-200', 'bg-blue-50',
+                                    'text-blue-700', 'border-green-200', 'bg-green-50', 'text-green-700');
+                                getTranscriptStatus.classList.add('border-red-200', 'bg-red-50', 'text-red-700');
+                                getTranscriptStatus.textContent = `Loi: ${error.message}`;
+                            } else {
+                                alert('Loi: ' + error.message);
+                            }
+                        } finally {
+                            getTranscriptBtn.disabled = false;
+                            getTranscriptBtn.classList.remove('opacity-70', 'cursor-not-allowed');
+                            getTranscriptBtn.textContent = originalBtnText;
+                        }
+                    });
+                }
 
                 ttsToggleBtn.addEventListener('click', function() {
                     isExpanded = !isExpanded;
@@ -2495,10 +3521,15 @@
                     alignTimingBtn.addEventListener('click', performAlignTiming);
                 }
 
-                // Add event listener for Merge Audio button
-                const mergeAudioBtn = document.getElementById('mergeAudioBtn');
-                if (mergeAudioBtn) {
-                    mergeAudioBtn.addEventListener('click', performMergeAudio);
+                // Add event listener for Merge Segments (Timeline) button
+                const mergeSegmentsBtn = document.getElementById('mergeSegmentsBtn');
+                if (mergeSegmentsBtn) {
+                    mergeSegmentsBtn.addEventListener('click', performMergeAudio);
+                }
+
+                const remergeSegmentsBtn = document.getElementById('remergeSegmentsBtn');
+                if (remergeSegmentsBtn) {
+                    remergeSegmentsBtn.addEventListener('click', performMergeAudio);
                 }
             });
 
@@ -2631,11 +3662,11 @@
                     return;
                 }
 
-                if (!confirm('Bạn có muốn gộp tất cả audio segments thành file âm thanh hoàn chỉnh?')) {
+                if (!confirm('Bạn có muốn gộp tất cả audio segments theo đúng timeline transcript gốc?')) {
                     return;
                 }
 
-                const mergeBtn = document.getElementById('mergeAudioBtn');
+                const mergeBtn = document.getElementById('mergeSegmentsBtn');
                 const progressContainer = document.getElementById('progressContainer');
                 const progressBar = document.getElementById('progressBar');
                 const progressPercent = document.getElementById('progressPercent');
@@ -2650,7 +3681,7 @@
                     // Show progress
                     progressContainer.classList.remove('hidden');
                     if (progressLabel) {
-                        progressLabel.textContent = 'Đang gộp audio...';
+                        progressLabel.textContent = 'Đang gộp audio theo timeline...';
                     }
                     progressBar.style.width = '50%';
                     progressPercent.textContent = '50%';
@@ -2665,7 +3696,8 @@
                         headers: {
                             'Content-Type': 'application/json',
                             'X-CSRF-TOKEN': document.querySelector('meta[name="csrf-token"]').content
-                        }
+                        },
+                        body: JSON.stringify({ merge_mode: 'timeline' })
                     });
 
                     const data = await response.json();
@@ -2678,7 +3710,7 @@
                     progressBar.style.width = '100%';
                     progressPercent.textContent = '100%';
                     if (progressLabel) {
-                        progressLabel.textContent = '✅ Gộp audio xong!';
+                        progressLabel.textContent = '✅ Gộp audio theo timeline xong!';
                     }
 
                     // Hide progress after 2 seconds and reload page
@@ -2693,7 +3725,7 @@
                     progressContainer.classList.add('hidden');
                     if (mergeBtn) {
                         mergeBtn.disabled = false;
-                        mergeBtn.innerHTML = '🎙️ Merge';
+                        mergeBtn.innerHTML = '🎵 Merge Audio (Timeline)';
                     }
                 }
             }
@@ -2721,69 +3753,93 @@
                     // Create modal
                     const modal = document.createElement('div');
                     modal.className = 'fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4';
-                    modal.innerHTML = `
-                        <div class="bg-white rounded-lg shadow-xl max-w-4xl w-full max-h-[90vh] overflow-hidden">
-                            <div class="bg-gradient-to-r from-indigo-600 to-purple-600 px-6 py-4 flex justify-between items-center">
-                                <h3 class="text-xl font-bold text-white">📚 Audio Versions - Segment ${segmentIndex + 1}</h3>
-                                <button class="close-modal text-white hover:text-gray-200 text-2xl font-bold">&times;</button>
-                            </div>
-                            <div class="p-6 overflow-y-auto max-h-[calc(90vh-80px)]">
-                                ${data.versions.length === 0 ? `
-                                                                                                                                                                            <p class="text-gray-500 text-center py-8">Chưa có audio version nào cho segment này</p>
-                                                                                                                                                                        ` : `
-                                                                                                                                                                            <div class="space-y-4">
-                                                                                                                                                                                ${data.versions.map((version, idx) => `
-                                            <div class="border rounded-lg p-4 hover:shadow-md transition ${idx === 0 ? 'bg-green-50 border-green-300' : 'bg-gray-50'}">
-                                                <div class="flex justify-between items-start mb-3">
-                                                    <div>
-                                                        <div class="flex items-center gap-2 mb-1">
-                                                            ${idx === 0 ? '<span class="bg-green-600 text-white text-xs px-2 py-1 rounded font-medium">✓ Current</span>' : ''}
-                                                            <span class="text-sm font-medium text-gray-700">${version.filename}</span>
-                                                        </div>
-                                                        <div class="text-xs text-gray-500">${version.created_at}</div>
-                                                    </div>
-                                                    <div class="text-right">
-                                                        <div class="text-xs text-gray-500">${(version.size / 1024).toFixed(1)} KB</div>
-                                                    </div>
-                                                </div>
-                                                <div class="grid grid-cols-3 gap-3 mb-3 text-sm">
-                                                    <div>
-                                                        <span class="text-gray-600 font-medium">Provider:</span>
-                                                        <span class="ml-1 px-2 py-0.5 rounded ${
-                                                            version.provider === 'gemini' ? 'bg-purple-100 text-purple-800' :
-                                                            version.provider === 'openai' ? 'bg-blue-100 text-blue-800' :
-                                                            'bg-gray-100 text-gray-800'
-                                                        }">${version.provider.toUpperCase()}</span>
-                                                    </div>
-                                                    <div>
-                                                        <span class="text-gray-600 font-medium">Gender:</span>
-                                                        <span class="ml-1">${version.voice_gender === 'male' ? '👨 Male' : version.voice_gender === 'female' ? '👩 Female' : '❓ Unknown'}</span>
-                                                    </div>
-                                                    <div>
-                                                        <span class="text-gray-600 font-medium">Voice:</span>
-                                                        <span class="ml-1 font-mono text-xs">${version.voice_name || 'N/A'}</span>
-                                                    </div>
-                                                </div>
-                                                <div class="bg-white rounded p-2">
-                                                    <audio controls class="w-full" preload="metadata">
-                                                        <source src="${version.url}" type="audio/wav">
-                                                        Your browser does not support audio playback.
-                                                    </audio>
-                                                </div>
-                                                ${idx === 0 ? '' : `
-                                                                                                                                                                                            <div class="mt-2 flex gap-2">
-                                                                                                                                                                                                <button class="use-this-version text-xs bg-green-600 hover:bg-green-700 text-white px-3 py-1 rounded font-medium transition" data-url="${version.url}" data-path="${version.path}" data-index="${segmentIndex}" data-voice-gender="${version.voice_gender}" data-voice-name="${version.voice_name}" data-provider="${version.provider}">
-                                                                                                                                                                                                    ✓ Sử dụng version này
-                                                                                                                                                                                                </button>
-                                                                                                                                                                                            </div>
-                                                                                                                                                                                        `}
-                                            </div>
-                                        `).join('')}
-                                                                                                                                                                            </div>
-                                                                                                                                                                        `}
-                            </div>
-                        </div>
-                    `;
+
+                    const escapeHtml = (value) => String(value ?? '').replace(/[&<>"']/g, (char) => ({
+                        '&': '&amp;',
+                        '<': '&lt;',
+                        '>': '&gt;',
+                        '"': '&quot;',
+                        "'": '&#39;'
+                    }[char]));
+
+                    const versions = Array.isArray(data.versions) ? data.versions : [];
+                    const versionsHtml = versions.map((version, idx) => {
+                        const provider = String(version.provider || 'unknown');
+                        const providerClass = provider === 'gemini'
+                            ? 'bg-purple-100 text-purple-800'
+                            : (provider === 'openai' ? 'bg-blue-100 text-blue-800' : 'bg-gray-100 text-gray-800');
+                        const gender = String(version.voice_gender || 'unknown');
+                        const genderLabel = gender === 'male'
+                            ? 'Male'
+                            : (gender === 'female' ? 'Female' : 'Unknown');
+                        const fileSize = Number(version.size || 0);
+                        const currentTag = idx === 0
+                            ? '<span class="bg-green-600 text-white text-xs px-2 py-1 rounded font-medium">Current</span>'
+                            : '';
+                        const useVersionButton = idx === 0
+                            ? ''
+                            : '<div class="mt-2 flex gap-2">'
+                                + '<button class="use-this-version text-xs bg-green-600 hover:bg-green-700 text-white px-3 py-1 rounded font-medium transition"'
+                                + ' data-url="' + escapeHtml(version.url || '') + '"'
+                                + ' data-path="' + escapeHtml(version.path || '') + '"'
+                                + ' data-index="' + segmentIndex + '"'
+                                + ' data-voice-gender="' + escapeHtml(gender) + '"'
+                                + ' data-voice-name="' + escapeHtml(version.voice_name || '') + '"'
+                                + ' data-provider="' + escapeHtml(provider) + '">'
+                                + 'Use this version'
+                                + '</button>'
+                                + '</div>';
+
+                        return '<div class="border rounded-lg p-4 hover:shadow-md transition ' + (idx === 0 ? 'bg-green-50 border-green-300' : 'bg-gray-50') + '">'
+                            + '<div class="flex justify-between items-start mb-3">'
+                            + '<div>'
+                            + '<div class="flex items-center gap-2 mb-1">'
+                            + currentTag
+                            + '<span class="text-sm font-medium text-gray-700">' + escapeHtml(version.filename || '') + '</span>'
+                            + '</div>'
+                            + '<div class="text-xs text-gray-500">' + escapeHtml(version.created_at || '') + '</div>'
+                            + '</div>'
+                            + '<div class="text-right">'
+                            + '<div class="text-xs text-gray-500">' + (fileSize / 1024).toFixed(1) + ' KB</div>'
+                            + '</div>'
+                            + '</div>'
+                            + '<div class="grid grid-cols-3 gap-3 mb-3 text-sm">'
+                            + '<div>'
+                            + '<span class="text-gray-600 font-medium">Provider:</span>'
+                            + '<span class="ml-1 px-2 py-0.5 rounded ' + providerClass + '">' + escapeHtml(provider.toUpperCase()) + '</span>'
+                            + '</div>'
+                            + '<div>'
+                            + '<span class="text-gray-600 font-medium">Gender:</span>'
+                            + '<span class="ml-1">' + escapeHtml(genderLabel) + '</span>'
+                            + '</div>'
+                            + '<div>'
+                            + '<span class="text-gray-600 font-medium">Voice:</span>'
+                            + '<span class="ml-1 font-mono text-xs">' + escapeHtml(version.voice_name || 'N/A') + '</span>'
+                            + '</div>'
+                            + '</div>'
+                            + '<div class="bg-white rounded p-2">'
+                            + '<audio controls class="w-full" preload="metadata">'
+                            + '<source src="' + escapeHtml(version.url || '') + '" type="audio/wav">'
+                            + 'Your browser does not support audio playback.'
+                            + '</audio>'
+                            + '</div>'
+                            + useVersionButton
+                            + '</div>';
+                    }).join('');
+
+                    const modalBodyHtml = versions.length === 0
+                        ? '<p class="text-gray-500 text-center py-8">No audio versions for this segment yet.</p>'
+                        : '<div class="space-y-4">' + versionsHtml + '</div>';
+
+                    modal.innerHTML = '<div class="bg-white rounded-lg shadow-xl max-w-4xl w-full max-h-[90vh] overflow-hidden">'
+                        + '<div class="bg-gradient-to-r from-indigo-600 to-purple-600 px-6 py-4 flex justify-between items-center">'
+                        + '<h3 class="text-xl font-bold text-white">Audio Versions - Segment ' + (segmentIndex + 1) + '</h3>'
+                        + '<button class="close-modal text-white hover:text-gray-200 text-2xl font-bold">&times;</button>'
+                        + '</div>'
+                        + '<div class="p-6 overflow-y-auto max-h-[calc(90vh-80px)]">'
+                        + modalBodyHtml
+                        + '</div>'
+                        + '</div>';
 
                     document.body.appendChild(modal);
 
@@ -3304,74 +4360,232 @@
                 }
             }
 
+            let downloadProgressPollTimer = null;
+
+            function setDownloadButtonDownloadedState(downloaded = true) {
+                const btn = document.getElementById('downloadYoutubeVideoBtn');
+                if (!btn) return;
+
+                if (downloaded) {
+                    btn.disabled = true;
+                    btn.innerHTML = '✅ Source Video Downloaded';
+                    btn.classList.remove('bg-red-600', 'hover:bg-red-700');
+                    btn.classList.add('bg-gray-400', 'cursor-not-allowed');
+                } else {
+                    btn.disabled = false;
+                    btn.innerHTML = '📥 Download Source Video';
+                    btn.classList.remove('bg-gray-400', 'cursor-not-allowed');
+                    btn.classList.add('bg-red-600', 'hover:bg-red-700');
+                }
+            }
+
+            function updateDownloadProgressUI(progress) {
+                const progressBar     = document.getElementById('downloadProgressBar');
+                const progressText    = document.getElementById('downloadProgressText');
+                const progressMessage = document.getElementById('downloadProgressMessage');
+                const progressSpeed   = document.getElementById('downloadProgressSpeed');
+
+                const pct = typeof progress.percent === 'number'
+                    ? Math.max(0, Math.min(100, progress.percent)) : 0;
+
+                if (progressBar) {
+                    progressBar.style.width = `${pct}%`;
+                    // Animated stripe effect while downloading
+                    if (progress.status === 'processing') {
+                        progressBar.style.backgroundImage =
+                            'linear-gradient(90deg,#dc2626 0%,#f87171 50%,#dc2626 100%)';
+                        progressBar.style.backgroundSize = '200% 100%';
+                        progressBar.style.animation = 'dlStripe 1.5s linear infinite';
+                    } else if (progress.status === 'completed') {
+                        progressBar.style.backgroundImage = 'none';
+                        progressBar.style.background = '#16a34a';
+                        progressBar.style.animation = 'none';
+                    } else if (progress.status === 'error') {
+                        progressBar.style.backgroundImage = 'none';
+                        progressBar.style.background = '#dc2626';
+                        progressBar.style.animation = 'none';
+                    } else {
+                        progressBar.style.backgroundImage =
+                            'linear-gradient(90deg, #dc2626, #ef4444)';
+                        progressBar.style.animation = 'none';
+                    }
+                }
+                if (progressText) progressText.textContent = `${Math.floor(pct)}%`;
+                if (progressMessage) progressMessage.textContent = progress.message || 'Đang tải...';
+                if (progressSpeed) {
+                    if (progress.speed) {
+                        progressSpeed.textContent = progress.speed;
+                        progressSpeed.classList.remove('hidden');
+                    } else {
+                        progressSpeed.textContent = '';
+                        progressSpeed.classList.add('hidden');
+                    }
+                }
+            }
+
+            async function pollDownloadSourceProgress() {
+                if (!currentProjectId) return;
+                try {
+                    const response = await fetch(
+                        `/dubsync/projects/${currentProjectId}/download-youtube-video-progress`, {
+                            method: 'GET',
+                            headers: { 'X-CSRF-TOKEN': document.querySelector('meta[name="csrf-token"]').content }
+                        });
+                    const data = await response.json();
+                    updateDownloadProgressUI(data?.progress || {});
+                } catch (error) {
+                    console.warn('Poll download progress failed:', error);
+                }
+            }
+
             async function downloadYoutubeVideo() {
                 const btn = document.getElementById('downloadYoutubeVideoBtn');
                 const progressContainer = document.getElementById('downloadProgressContainer');
-                const progressBar = document.getElementById('downloadProgressBar');
-                const progressText = document.getElementById('downloadProgressText');
-
                 if (!btn || !progressContainer) return;
 
                 const originalText = btn.innerHTML;
                 btn.disabled = true;
                 progressContainer.classList.remove('hidden');
+                updateDownloadProgressUI({ status: 'processing', percent: 0, message: 'Đang khởi tạo...' });
+
+                if (downloadProgressPollTimer) clearInterval(downloadProgressPollTimer);
 
                 try {
-                    // Animate progress 0-100% with smooth easing curve
-                    // Progress accelerates quickly then slows down as it approaches 100%
-                    let progress = 0;
-                    let lastUpdateTime = Date.now();
-                    const startTime = Date.now();
-                    let responseReceived = false;
-
-                    const progressInterval = setInterval(() => {
-                        const elapsedMs = Date.now() - startTime;
-                        const elapsedSeconds = elapsedMs / 1000;
-
-                        if (!responseReceived) {
-                            // Use easing curve: progress = 1 - e^(-t)
-                            // This makes progress accelerate quickly then slow down
-                            progress = Math.min(99, 100 * (1 - Math.exp(-elapsedSeconds / 8)));
-                        } else {
-                            // Once response received, quickly jump to 100%
-                            progress = 100;
-                        }
-
-                        progressBar.style.width = progress + '%';
-                        progressText.textContent = Math.floor(progress) + '%';
-
-                        if (progress >= 100) {
-                            clearInterval(progressInterval);
-                        }
-                    }, 200); // Update every 200ms for smooth animation
-
+                    // Dispatch job — returns immediately regardless of download duration.
                     const response = await fetch(
                         `/dubsync/projects/${currentProjectId}/download-youtube-video`, {
                             method: 'POST',
                             headers: {
                                 'Content-Type': 'application/json',
                                 'X-CSRF-TOKEN': document.querySelector('meta[name="csrf-token"]').content
-                            }
+                            },
+                            body: JSON.stringify({})
                         });
-
-                    responseReceived = true;
                     const data = await response.json();
 
-                    if (!response.ok || !data.success) {
-                        throw new Error(data.error || 'Lỗi tải video');
+                    if (!response.ok || !data.success) throw new Error(data.error || 'Lỗi tải video');
+
+                    // If video already existed, progress is already at 100% completed.
+                    if (!data.queued) {
+                        await pollDownloadSourceProgress();
+                        const sizeMB = data.size ? (data.size / 1024 / 1024).toFixed(2) + ' MB' : '';
+                        setDownloadButtonDownloadedState(true);
+                        alert(`✅ Video đã tồn tại!\n\nFile: ${data.filename}\n${sizeMB}`);
+                        return;
                     }
 
-                    alert(
-                        `✅ Tải video thành công!\n\nFile: ${data.filename}\nKích thước: ${(data.size / 1024 / 1024).toFixed(2)} MB`
-                    );
+                    // Job queued — poll until completed or error.
+                    await new Promise((resolve, reject) => {
+                        downloadProgressPollTimer = setInterval(async () => {
+                            try {
+                                const res  = await fetch(`/dubsync/projects/${currentProjectId}/download-youtube-video-progress`, {
+                                    headers: { 'X-CSRF-TOKEN': document.querySelector('meta[name="csrf-token"]').content }
+                                });
+                                const json = await res.json();
+                                const progress = json?.progress || {};
+                                updateDownloadProgressUI(progress);
+
+                                if (progress.status === 'completed') {
+                                    clearInterval(downloadProgressPollTimer);
+                                    downloadProgressPollTimer = null;
+                                    setDownloadButtonDownloadedState(true);
+                                    const sizeMB = progress.size ? (progress.size / 1024 / 1024).toFixed(2) + ' MB' : '';
+                                    const platform = progress.platform ? `Nguồn: ${progress.platform}\n` : '';
+                                    alert(`✅ Tải video thành công!\n\n${platform}File: ${progress.filename}\n${sizeMB}`);
+                                    resolve();
+                                } else if (progress.status === 'error') {
+                                    clearInterval(downloadProgressPollTimer);
+                                    downloadProgressPollTimer = null;
+                                    reject(new Error(progress.message || 'Lỗi tải video'));
+                                }
+                            } catch (pollErr) {
+                                console.warn('Poll download progress failed:', pollErr);
+                            }
+                        }, 1000);
+                    });
 
                 } catch (error) {
-                    console.error('Download YouTube video error:', error);
+                    console.error('Download source video error:', error);
+                    updateDownloadProgressUI({ status: 'error', percent: 100, message: '❌ ' + error.message });
                     alert('❌ Lỗi: ' + error.message);
-                    progressContainer.classList.add('hidden');
+                } finally {
+                    if (downloadProgressPollTimer) {
+                        clearInterval(downloadProgressPollTimer);
+                        downloadProgressPollTimer = null;
+                    }
+                    if (btn.innerHTML !== '✅ Source Video Downloaded') {
+                        btn.disabled = false;
+                        btn.innerHTML = originalText;
+                    }
+                }
+            }
+
+            async function generateProjectThumbnail() {
+                const btn = document.getElementById('generateThumbnailBtn');
+                const ratioSelect = document.getElementById('thumbnailRatioSelect');
+                const styleSelect = document.getElementById('thumbnailStyleSelect');
+                const statusEl = document.getElementById('thumbnailStatus');
+                const previewImg = document.getElementById('projectThumbnailPreview');
+
+                if (!btn || !ratioSelect || !styleSelect) return;
+
+                const ratio = ratioSelect.value;
+                const style = styleSelect.value;
+
+                const originalLabel = btn.innerHTML;
+                btn.disabled = true;
+                btn.innerHTML = '⏳ Đang tạo...';
+
+                if (statusEl) {
+                    statusEl.classList.remove('hidden', 'text-red-600', 'text-green-600');
+                    statusEl.classList.add('text-gray-600');
+                    statusEl.textContent = `Đang tạo thumbnail ${ratio} (${style})...`;
+                }
+
+                try {
+                    const response = await fetch(`/dubsync/projects/${currentProjectId}/generate-thumbnail`, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'X-CSRF-TOKEN': document.querySelector('meta[name="csrf-token"]').content
+                        },
+                        body: JSON.stringify({
+                            ratio,
+                            style,
+                        })
+                    });
+
+                    const data = await response.json();
+                    if (!response.ok || !data.success) {
+                        throw new Error(data.error || 'Không thể tạo thumbnail');
+                    }
+
+                    if (previewImg && data.thumbnail_url) {
+                        const cacheBust = `t=${Date.now()}`;
+                        previewImg.src = data.thumbnail_url.includes('?')
+                            ? `${data.thumbnail_url}&${cacheBust}`
+                            : `${data.thumbnail_url}?${cacheBust}`;
+                    } else {
+                        window.location.reload();
+                    }
+
+                    if (statusEl) {
+                        statusEl.classList.remove('text-gray-600', 'text-red-600');
+                        statusEl.classList.add('text-green-600');
+                        statusEl.textContent = '✅ Tạo thumbnail thành công';
+                    }
+                } catch (error) {
+                    console.error('Generate thumbnail error:', error);
+                    if (statusEl) {
+                        statusEl.classList.remove('text-gray-600', 'text-green-600');
+                        statusEl.classList.add('text-red-600');
+                        statusEl.textContent = `❌ ${error.message}`;
+                    } else {
+                        alert('Lỗi tạo thumbnail: ' + error.message);
+                    }
                 } finally {
                     btn.disabled = false;
-                    btn.innerHTML = originalText;
+                    btn.innerHTML = originalLabel;
                 }
             }
 
@@ -3591,6 +4805,11 @@
 
                 const translatedContent = document.getElementById('translatedFullTranscriptContent');
                 const hasText = translatedContent && translatedContent.value.trim() !== '';
+                const providerSelect = document.getElementById('ttsProviderSelect');
+                const activeProvider = (providerSelect && providerSelect.value)
+                    ? providerSelect.value
+                    : (typeof currentTtsProvider !== 'undefined' ? currentTtsProvider : '');
+                const hasProvider = !!activeProvider;
 
                 let hasVoice = false;
                 if (currentAudioMode === 'single') {
@@ -3601,7 +4820,7 @@
                     hasVoice = speakersConfig.some(speaker => speaker.voice);
                 }
 
-                const canConvert = hasText && hasVoice;
+                const canConvert = hasText && hasProvider && hasVoice;
                 convertBtn.disabled = !canConvert;
                 convertBtn.style.opacity = canConvert ? '1' : '0.5';
                 convertBtn.style.cursor = canConvert ? 'pointer' : 'not-allowed';
@@ -3774,6 +4993,7 @@
                 const convertBtn = document.getElementById('convertTranscriptToSpeechBtn');
                 if (convertBtn) {
                     convertBtn.addEventListener('click', async function() {
+                        const transcriptContent = document.getElementById('fullTranscriptContent');
                         const translatedContent = document.getElementById(
                             'translatedFullTranscriptContent');
                         const fullText = translatedContent ? translatedContent.value.trim() : '';
@@ -3782,6 +5002,19 @@
                             alert('No translated transcript text to convert');
                             return;
                         }
+
+                        const providerSelect = document.getElementById('ttsProviderSelect');
+                        const provider = (providerSelect && providerSelect.value)
+                            ? providerSelect.value
+                            : (typeof currentTtsProvider !== 'undefined' ? currentTtsProvider : '');
+
+                        if (!provider) {
+                            alert('Vui lòng chọn TTS Provider trong TTS Audio Settings');
+                            return;
+                        }
+
+                        // Keep provider state in sync with current UI selection.
+                        currentTtsProvider = provider;
 
                         // Get voice settings
                         let voiceGender, voiceName;
@@ -3807,18 +5040,45 @@
                         const styleInstruction = document.getElementById('ttsStyleInstruction')?.value
                             ?.trim() || '';
 
-                        const words = fullText.split(/\s+/).filter(Boolean);
-                        const chunks = [];
-                        for (let i = 0; i < words.length; i += 1000) {
-                            chunks.push(words.slice(i, i + 1000).join(' '));
-                        }
+                        const buildVbeeSafeChunks = (text, maxChars = 1500) => {
+                            const words = text.split(/\s+/).filter(Boolean);
+                            const output = [];
+                            let currentWords = [];
+                            let currentLength = 0;
 
-                        const startPartIndex = 3; // start from part 4
-                        if (chunks.length <= startPartIndex) {
-                            alert('Không đủ đoạn để chạy từ đoạn 4 trở đi.');
-                            return;
-                        }
+                            words.forEach((word) => {
+                                const addition = currentLength === 0 ? word.length : (word.length + 1);
+                                if (currentLength + addition > maxChars && currentWords.length > 0) {
+                                    output.push(currentWords.join(' '));
+                                    currentWords = [word];
+                                    currentLength = word.length;
+                                    return;
+                                }
 
+                                currentWords.push(word);
+                                currentLength += addition;
+                            });
+
+                            if (currentWords.length > 0) {
+                                output.push(currentWords.join(' '));
+                            }
+
+                            return output;
+                        };
+
+                        const providerLower = String(provider || '').toLowerCase();
+                        const chunks = providerLower === 'vbee'
+                            ? buildVbeeSafeChunks(fullText, 1500)
+                            : (() => {
+                                const words = fullText.split(/\s+/).filter(Boolean);
+                                const byWordChunks = [];
+                                for (let i = 0; i < words.length; i += 1000) {
+                                    byWordChunks.push(words.slice(i, i + 1000).join(' '));
+                                }
+                                return byWordChunks;
+                            })();
+
+                        const startPartIndex = 0; // process from part 1
                         const targetChunks = chunks.slice(startPartIndex);
                         const totalChars = targetChunks.reduce((sum, chunk) => sum + chunk.length, 0) || 1;
 
@@ -3839,6 +5099,26 @@
                         let processedChars = 0;
 
                         try {
+                            // Persist latest transcript text before converting.
+                            await saveFullTranscriptToDb(
+                                transcriptContent ? transcriptContent.value : '',
+                                translatedContent ? translatedContent.value : ''
+                            );
+
+                            // Start a fresh conversion run to avoid mixing audio from old settings/content.
+                            const cleanupResp = await fetch(
+                                `/dubsync/projects/${currentProjectId}/delete-all-full-transcript-audio`, {
+                                    method: 'POST',
+                                    headers: {
+                                        'Content-Type': 'application/json',
+                                        'X-CSRF-TOKEN': document.querySelector('meta[name="csrf-token"]').content
+                                    }
+                                });
+                            const cleanupData = await cleanupResp.json();
+                            if (!cleanupResp.ok || !cleanupData.success) {
+                                throw new Error(cleanupData.error || 'Không thể dọn audio cũ trước khi convert');
+                            }
+
                             for (let i = 0; i < targetChunks.length; i++) {
                                 const partIndex = startPartIndex + i + 1;
                                 const chunkText = targetChunks[i];
@@ -3870,7 +5150,7 @@
                                             part_index: partIndex,
                                             voice_gender: voiceGender,
                                             voice_name: voiceName,
-                                            provider: currentTtsProvider
+                                            provider: provider
                                         })
                                     });
 
@@ -3888,7 +5168,7 @@
                                     `Đang tạo TTS: đoạn ${partIndex}/${chunks.length} • 100% của đoạn`);
                             }
 
-                            setProgress(100, `✅ Hoàn tất ${targetChunks.length} đoạn (từ đoạn 4 đến hết)`);
+                            setProgress(100, `✅ Hoàn tất ${targetChunks.length} đoạn`);
                             convertBtn.innerHTML = `✅ Done! (${targetChunks.length} parts)`;
                             setTimeout(() => {
                                 convertBtn.innerHTML = originalText;
@@ -3902,6 +5182,72 @@
                             convertBtn.innerHTML = originalText;
                             updateConvertToSpeechButtonState();
                             if (progressContainer) progressContainer.classList.add('hidden');
+                        }
+                    });
+                }
+
+                // Rewrite translated full transcript with Gemini
+                const rewriteBtn = document.getElementById('rewriteTranscriptBtn');
+                if (rewriteBtn) {
+                    rewriteBtn.addEventListener('click', async function() {
+                        const transcriptContent = document.getElementById('fullTranscriptContent');
+                        const translatedContent = document.getElementById('translatedFullTranscriptContent');
+
+                        if (!translatedContent) {
+                            alert('Không tìm thấy vùng nội dung bản dịch');
+                            return;
+                        }
+
+                        const sourceText = (translatedContent.value || '').trim();
+                        if (!sourceText) {
+                            alert('Vui lòng nhập nội dung trong Translated Full Transcript (VI) trước khi viết lại.');
+                            return;
+                        }
+
+                        if (!confirm('Viết lại nội dung tiếng Việt bằng Gemini theo prompt đã cấu hình?')) {
+                            return;
+                        }
+
+                        const originalLabel = rewriteBtn.innerHTML;
+                        rewriteBtn.disabled = true;
+                        rewriteBtn.innerHTML = '⏳ Đang viết lại...';
+
+                        try {
+                            const response = await fetch(`/dubsync/projects/${currentProjectId}/rewrite-full-transcript`, {
+                                method: 'POST',
+                                headers: {
+                                    'Content-Type': 'application/json',
+                                    'X-CSRF-TOKEN': document.querySelector('meta[name="csrf-token"]').content
+                                },
+                                body: JSON.stringify({
+                                    translated_full_transcript: sourceText
+                                })
+                            });
+
+                            const data = await response.json();
+                            if (!response.ok || !data.success) {
+                                throw new Error(data.error || 'Không thể viết lại transcript');
+                            }
+
+                            translatedContent.value = data.rewritten_transcript || '';
+                            updateTranscriptWordCounts();
+                            updateConvertToSpeechButtonState();
+
+                            await saveFullTranscriptToDb(
+                                transcriptContent ? transcriptContent.value : '',
+                                translatedContent.value
+                            );
+
+                            rewriteBtn.innerHTML = '✅ Đã viết lại';
+                            setTimeout(() => {
+                                rewriteBtn.innerHTML = originalLabel;
+                                rewriteBtn.disabled = false;
+                            }, 1800);
+                        } catch (error) {
+                            console.error('Rewrite transcript error:', error);
+                            alert('Lỗi khi viết lại transcript: ' + error.message);
+                            rewriteBtn.innerHTML = originalLabel;
+                            rewriteBtn.disabled = false;
                         }
                     });
                 }
@@ -3959,7 +5305,313 @@
                 if (downloadYoutubeVideoBtn) {
                     downloadYoutubeVideoBtn.addEventListener('click', downloadYoutubeVideo);
                 }
+
+                const generateThumbnailBtn = document.getElementById('generateThumbnailBtn');
+                if (generateThumbnailBtn) {
+                    generateThumbnailBtn.addEventListener('click', generateProjectThumbnail);
+                }
+
+                // Export Files button
+                const exportBtn = document.getElementById('exportBtn');
+                if (exportBtn) {
+                    exportBtn.addEventListener('click', async () => {
+                        const formats = [...document.querySelectorAll('.export-format:checked')].map(el => el.value);
+                        if (formats.length === 0) { alert('Chọn ít nhất 1 format.'); return; }
+
+                        const originalText = exportBtn.innerHTML;
+                        exportBtn.disabled = true;
+                        exportBtn.innerHTML = '⏳ Exporting...';
+
+                        try {
+                            const res = await fetch(`/dubsync/projects/${currentProjectId}/export`, {
+                                method: 'POST',
+                                headers: {
+                                    'Content-Type': 'application/json',
+                                    'X-CSRF-TOKEN': document.querySelector('meta[name="csrf-token"]').content
+                                },
+                                body: JSON.stringify({ formats })
+                            });
+                            const data = await res.json();
+                            if (!res.ok || !data.success) throw new Error(data.error || 'Export failed');
+
+                            // Show download links
+                            const linksDiv = document.getElementById('downloadLinks');
+                            const linksList = document.getElementById('downloadLinksList');
+                            linksList.innerHTML = '';
+                            for (const [type, path] of Object.entries(data.files)) {
+                                const url = `/dubsync/projects/${currentProjectId}/download/${type}`;
+                                linksList.innerHTML += `<a href="${url}" download class="flex items-center gap-2 text-sm text-blue-600 hover:underline">⬇ ${type.toUpperCase()}</a>`;
+                            }
+                            linksDiv.classList.remove('hidden');
+                            exportBtn.innerHTML = '✅ Done';
+                        } catch (e) {
+                            alert('❌ ' + e.message);
+                            exportBtn.disabled = false;
+                            exportBtn.innerHTML = originalText;
+                        }
+                    });
+                }
+
+                // On page load, resume polling if a download job is still in progress.
+                resumeDownloadProgressIfRunning();
+
+                // Change project status
+                const changeStatusBtn = document.getElementById('changeStatusBtn');
+                const cancelStatusBtn = document.getElementById('cancelStatusBtn');
+                const applyStatusBtn  = document.getElementById('applyStatusBtn');
+                const changeStatusPanel = document.getElementById('changeStatusPanel');
+
+                if (changeStatusBtn) {
+                    changeStatusBtn.addEventListener('click', () => {
+                        changeStatusPanel.classList.toggle('hidden');
+                    });
+                }
+                if (cancelStatusBtn) {
+                    cancelStatusBtn.addEventListener('click', () => {
+                        changeStatusPanel.classList.add('hidden');
+                    });
+                }
+                if (applyStatusBtn) {
+                    applyStatusBtn.addEventListener('click', async () => {
+                        const newStatus = document.getElementById('newStatusSelect').value;
+                        applyStatusBtn.disabled = true;
+                        applyStatusBtn.textContent = '...';
+                        try {
+                            const res = await fetch(`/dubsync/projects/${currentProjectId}/change-status`, {
+                                method: 'POST',
+                                headers: {
+                                    'Content-Type': 'application/json',
+                                    'X-CSRF-TOKEN': document.querySelector('meta[name="csrf-token"]').content
+                                },
+                                body: JSON.stringify({ status: newStatus })
+                            });
+                            const data = await res.json();
+                            if (!res.ok || !data.success) throw new Error(data.error || 'Failed');
+                            location.reload();
+                        } catch (e) {
+                            alert('❌ ' + e.message);
+                            applyStatusBtn.disabled = false;
+                            applyStatusBtn.textContent = 'Áp dụng';
+                        }
+                    });
+                }
             });
+
+            async function resumeDownloadProgressIfRunning() {
+                if (!currentProjectId) return;
+                try {
+                    const res      = await fetch(`/dubsync/projects/${currentProjectId}/download-youtube-video-progress`, {
+                        headers: { 'X-CSRF-TOKEN': document.querySelector('meta[name="csrf-token"]').content }
+                    });
+                    const json     = await res.json();
+                    const progress = json?.progress || {};
+
+                    if (progress.status === 'completed') {
+                        setDownloadButtonDownloadedState(true);
+                        return;
+                    }
+
+                    if (progress.status !== 'processing') return;
+
+                    // A job is running — show the progress UI and resume polling.
+                    const btn               = document.getElementById('downloadYoutubeVideoBtn');
+                    const progressContainer = document.getElementById('downloadProgressContainer');
+                    if (progressContainer) progressContainer.classList.remove('hidden');
+                    if (btn) btn.disabled = true;
+                    updateDownloadProgressUI(progress);
+
+                    if (downloadProgressPollTimer) clearInterval(downloadProgressPollTimer);
+
+                    downloadProgressPollTimer = setInterval(async () => {
+                        try {
+                            const r  = await fetch(`/dubsync/projects/${currentProjectId}/download-youtube-video-progress`, {
+                                headers: { 'X-CSRF-TOKEN': document.querySelector('meta[name="csrf-token"]').content }
+                            });
+                            const j  = await r.json();
+                            const p  = j?.progress || {};
+                            updateDownloadProgressUI(p);
+
+                            if (p.status === 'completed') {
+                                clearInterval(downloadProgressPollTimer);
+                                downloadProgressPollTimer = null;
+                                setDownloadButtonDownloadedState(true);
+                                const sizeMB   = p.size ? (p.size / 1024 / 1024).toFixed(2) + ' MB' : '';
+                                const platform = p.platform ? `Nguồn: ${p.platform}\n` : '';
+                                alert(`✅ Tải video thành công!\n\n${platform}File: ${p.filename}\n${sizeMB}`);
+                            } else if (p.status === 'error') {
+                                clearInterval(downloadProgressPollTimer);
+                                downloadProgressPollTimer = null;
+                                if (btn) { btn.disabled = false; }
+                            }
+                        } catch (e) {
+                            console.warn('Resume poll failed:', e);
+                        }
+                    }, 1000);
+                } catch (e) {
+                    // Silently ignore — page just loaded, not critical.
+                }
+            }
+        </script>
+        <script>
+            // Queue Monitor
+            (function() {
+                const modal = document.getElementById('queueMonitorModal');
+                const openBtn = document.getElementById('queueMonitorBtn');
+                const closeBtn = document.getElementById('queueCloseBtn');
+                const refreshBtn = document.getElementById('queueRefreshBtn');
+                const clearBtn = document.getElementById('queueClearAllBtn');
+                const summaryBar = document.getElementById('queueSummaryBar');
+                const content = document.getElementById('queueContent');
+                const badge = document.getElementById('queueBadge');
+                let autoRefreshTimer = null;
+
+                if (!modal || !openBtn) return;
+
+                openBtn.addEventListener('click', () => {
+                    modal.classList.remove('hidden');
+                    loadQueueStatus();
+                    autoRefreshTimer = setInterval(loadQueueStatus, 5000);
+                });
+
+                closeBtn.addEventListener('click', closeModal);
+                modal.addEventListener('click', (e) => { if (e.target === modal) closeModal(); });
+
+                function closeModal() {
+                    modal.classList.add('hidden');
+                    clearInterval(autoRefreshTimer);
+                }
+
+                refreshBtn.addEventListener('click', loadQueueStatus);
+
+                clearBtn.addEventListener('click', async () => {
+                    if (!confirm('Xóa tất cả jobs đang chờ và đã lỗi? Bạn sẽ cần chạy lại các tác vụ.')) return;
+                    clearBtn.disabled = true;
+                    clearBtn.textContent = 'Đang xóa...';
+                    try {
+                        const res = await fetch('/dubsync/queue-clear', {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json',
+                                'X-CSRF-TOKEN': document.querySelector('meta[name="csrf-token"]').content
+                            }
+                        });
+                        const data = await res.json();
+                        if (data.success) {
+                            alert(`Đã xóa ${data.cleared_pending} pending + ${data.cleared_failed} failed jobs`);
+                            loadQueueStatus();
+                        } else {
+                            alert('Lỗi: ' + (data.error || 'Không thể xóa'));
+                        }
+                    } catch (err) {
+                        alert('Lỗi kết nối: ' + err.message);
+                    } finally {
+                        clearBtn.disabled = false;
+                        clearBtn.textContent = '🗑️ Clear All Jobs';
+                    }
+                });
+
+                async function loadQueueStatus() {
+                    try {
+                        const res = await fetch('/dubsync/queue-status');
+                        const data = await res.json();
+                        if (!data.success) {
+                            content.innerHTML = '<p class="text-red-500 text-sm">Lỗi: ' + (data.error || 'Unknown') + '</p>';
+                            return;
+                        }
+                        renderSummary(data.summary);
+                        renderJobs(data);
+                        updateBadge(data.summary);
+                    } catch (err) {
+                        content.innerHTML = '<p class="text-red-500 text-sm">Không thể tải: ' + err.message + '</p>';
+                    }
+                }
+
+                function renderSummary(s) {
+                    summaryBar.innerHTML = `
+                        <span class="px-2 py-1 rounded bg-yellow-100 text-yellow-800">⏳ Running: ${s.running}</span>
+                        <span class="px-2 py-1 rounded bg-blue-100 text-blue-800">📥 Pending: ${s.pending}</span>
+                        <span class="px-2 py-1 rounded bg-red-100 text-red-800">❌ Failed: ${s.failed}</span>
+                        <span class="px-2 py-1 rounded bg-gray-100 text-gray-700">Tổng: ${s.total}</span>
+                    `;
+                }
+
+                function updateBadge(s) {
+                    const total = s.running + s.pending + s.failed;
+                    if (total > 0) {
+                        badge.textContent = total > 99 ? '99+' : total;
+                        badge.classList.remove('hidden');
+                    } else {
+                        badge.classList.add('hidden');
+                    }
+                }
+
+                function renderJobs(data) {
+                    let html = '';
+
+                    if (data.running.length > 0) {
+                        html += '<div><h4 class="text-xs font-bold text-yellow-700 mb-1">🔄 RUNNING</h4>';
+                        html += '<div class="space-y-1">' + data.running.map(j => jobRow(j, 'yellow')).join('') + '</div></div>';
+                    }
+
+                    if (data.pending.length > 0) {
+                        html += '<div><h4 class="text-xs font-bold text-blue-700 mb-1">⏳ PENDING</h4>';
+                        html += '<div class="space-y-1">' + data.pending.map(j => jobRow(j, 'blue')).join('') + '</div></div>';
+                    }
+
+                    if (data.failed.length > 0) {
+                        html += '<div><h4 class="text-xs font-bold text-red-700 mb-1">❌ FAILED</h4>';
+                        html += '<div class="space-y-1">' + data.failed.map(j => failedRow(j)).join('') + '</div></div>';
+                    }
+
+                    if (!html) {
+                        html = '<p class="text-gray-400 text-sm text-center py-6">Không có job nào trong queue</p>';
+                    }
+
+                    content.innerHTML = html;
+                }
+
+                function jobRow(j, color) {
+                    return `<div class="flex items-center justify-between text-xs bg-${color}-50 border border-${color}-200 rounded px-3 py-1.5">
+                        <div class="flex items-center gap-2">
+                            <span class="font-mono font-bold text-${color}-800">#${j.id}</span>
+                            <span class="font-semibold">${esc(j.job)}</span>
+                            <span class="text-gray-500">att:${j.attempts}</span>
+                        </div>
+                        <span class="text-gray-400">${j.created_at || ''}</span>
+                    </div>`;
+                }
+
+                function failedRow(j) {
+                    const errSnippet = (j.error || '').substring(0, 120);
+                    return `<div class="text-xs bg-red-50 border border-red-200 rounded px-3 py-1.5">
+                        <div class="flex items-center justify-between">
+                            <div class="flex items-center gap-2">
+                                <span class="font-mono font-bold text-red-800">#${j.id}</span>
+                                <span class="font-semibold">${esc(j.job)}</span>
+                            </div>
+                            <span class="text-gray-400">${j.failed_at || ''}</span>
+                        </div>
+                        <p class="text-red-600 mt-1 break-all">${esc(errSnippet)}</p>
+                    </div>`;
+                }
+
+                function esc(str) {
+                    const d = document.createElement('div');
+                    d.textContent = str || '';
+                    return d.innerHTML;
+                }
+
+                // Poll badge count every 15s even when modal is closed
+                async function pollBadge() {
+                    try {
+                        const res = await fetch('/dubsync/queue-status');
+                        const data = await res.json();
+                        if (data.success) updateBadge(data.summary);
+                    } catch (e) {}
+                }
+                setInterval(pollBadge, 15000);
+                pollBadge();
+            })();
         </script>
     @endpush
 @endsection

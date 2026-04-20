@@ -385,10 +385,10 @@
 <div class="mt-8 border-t border-gray-200 pt-6" id="referenceChannelSection" style="display: {{ ($channel && $channel->content_type === 'dub') || old('content_type') === 'dub' ? 'block' : 'none' }}">
     <div class="mb-4 p-3 bg-purple-50 rounded-lg border border-purple-100">
         <p class="text-xs font-medium text-purple-800 mb-1">📺 Reference Channels (Chỉ cho kênh Dub)</p>
-        <p class="text-xs text-purple-700">Thêm các kênh YouTube gốc để lấy video và lồng tiếng.</p>
+        <p class="text-xs text-purple-700">Thêm kênh YouTube hoặc Bilibili Space để lấy video nguồn.</p>
     </div>
 
-    <h4 class="text-sm font-semibold text-gray-900 mb-3">Reference YouTube Channel</h4>
+    <h4 class="text-sm font-semibold text-gray-900 mb-3">Reference Source Channel</h4>
     <input type="hidden" id="currentChannelId" value="{{ $channel?->id }}">
     <input type="hidden" name="ref_channels_json" id="refChannelsJson" value="{{ old('ref_channels_json') }}">
     <input type="hidden" id="refAddEndpoint"
@@ -402,13 +402,13 @@
         <div class="flex flex-wrap items-center gap-3">
             <input type="text" id="refChannelUrl"
                 class="flex-1 min-w-[240px] px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-transparent"
-                placeholder="https://www.youtube.com/@AstrumEarth">
+                placeholder="https://www.youtube.com/@AstrumEarth hoặc https://space.bilibili.com/3493294331923099">
             <button id="refChannelQuickAddBtn" type="button"
                 class="bg-red-600 hover:bg-red-700 text-white font-semibold py-2 px-4 rounded-lg transition duration-200">
                 Add
             </button>
         </div>
-        <p class="text-xs text-gray-500 mt-2">Supports @handle or /channel/ ID URLs.</p>
+        <p class="text-xs text-gray-500 mt-2">Supports YouTube (@handle, /channel/) and Bilibili Space (/123456).</p>
     </div>
 
     <div class="flex flex-wrap items-center gap-3 hidden">
@@ -596,7 +596,7 @@
                 if (event) event.preventDefault();
                 const channelUrl = urlInput.value?.trim();
                 if (!channelUrl) {
-                    alert('Vui lòng nhập URL kênh YouTube');
+                    alert('Vui lòng nhập URL kênh nguồn');
                     return;
                 }
 
@@ -617,7 +617,7 @@
 
                 if (statusEl) {
                     statusEl.classList.remove('hidden');
-                    statusEl.textContent = 'Đang gọi YouTube API...';
+                    statusEl.textContent = 'Đang lấy dữ liệu kênh...';
                 }
 
                 try {
@@ -734,7 +734,7 @@
                 quickAddBtn.addEventListener('click', () => {
                     const channelUrl = urlInput.value?.trim();
                     if (!channelUrl) {
-                        alert('Vui lòng nhập URL kênh YouTube');
+                        alert('Vui lòng nhập URL kênh nguồn');
                         return;
                     }
 

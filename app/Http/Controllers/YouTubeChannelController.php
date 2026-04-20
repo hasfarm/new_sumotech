@@ -6,9 +6,11 @@ use App\Models\AudioBook;
 use App\Models\DubSyncProject;
 use App\Models\YoutubeChannel;
 use App\Models\YoutubeChannelReference;
+use App\Services\TranslationService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Storage;
 
 class YouTubeChannelController extends Controller
 {
@@ -170,7 +172,7 @@ class YouTubeChannelController extends Controller
             ])
             ->withSum('chapters as total_duration_seconds', 'total_duration')
             ->orderByDesc('created_at')
-            ->paginate(10);
+            ->paginate(12);
 
         return view('youtube_channels.show', compact('youtubeChannel', 'projects', 'referenceChannels', 'audioBooks', 'search', 'status', 'abSearch', 'abStatus'));
     }
@@ -296,11 +298,16 @@ class YouTubeChannelController extends Controller
                 ->with('error', 'Chức năng Fetch video chỉ áp dụng cho kênh Dub (Lồng tiếng).');
         }
 
+        $validated = $request->validate([
+            'fetch_scope' => 'nullable|in:latest,all',
+            'max_results' => 'nullable|integer|min:20|max:500',
+        ]);
+
+        $fetchScope = $validated['fetch_scope'] ?? 'latest';
+        $fetchAll = $fetchScope === 'all';
+        $maxPerReference = $fetchAll ? 1000 : (int) ($validated['max_results'] ?? 100);
+
         $apiKey = config('services.youtube.api_key');
-        if (!$apiKey) {
-            return redirect()->route('youtube-channels.show', $youtubeChannel)
-                ->with('success', 'Thiếu YOUTUBE_API_KEY trong .env');
-        }
 
         $references = $youtubeChannel->referenceChannels()->get();
         if ($references->isEmpty()) {
@@ -309,25 +316,124 @@ class YouTubeChannelController extends Controller
         }
 
         $videos = collect();
+        $missingYoutubeApiKey = false;
 
         foreach ($references as $ref) {
+            if ($this->isBilibiliSpaceUrl($ref->ref_channel_url)) {
+                $bilibiliVideos = $this->fetchBilibiliReferenceVideos($ref->ref_channel_url, $maxPerReference, $fetchAll);
+                $videos = $videos->merge($bilibiliVideos);
+                continue;
+            }
+
+            if (!$apiKey) {
+                $missingYoutubeApiKey = true;
+                continue;
+            }
+
             $channelInfo = $this->resolveChannelFromUrl($ref->ref_channel_url, $apiKey, $ref->ref_channel_id);
             if (!$channelInfo || empty($channelInfo['uploads_playlist_id'])) {
                 continue;
             }
 
-            $playlistResponse = Http::get('https://www.googleapis.com/youtube/v3/playlistItems', [
-                'part' => 'snippet,contentDetails',
-                'playlistId' => $channelInfo['uploads_playlist_id'],
-                'maxResults' => 20,
-                'key' => $apiKey,
-            ]);
+            $youtubeVideos = $this->fetchYouTubePlaylistVideos(
+                $channelInfo['uploads_playlist_id'],
+                $apiKey,
+                $maxPerReference,
+                $fetchAll
+            );
 
-            if (!$playlistResponse->ok()) {
-                continue;
+            $videos = $videos->merge($youtubeVideos);
+        }
+
+        $videos = $videos->unique('video_id')->values();
+        if ($videos->isEmpty()) {
+            if ($missingYoutubeApiKey) {
+                return redirect()->route('youtube-channels.show', $youtubeChannel)
+                    ->with('success', 'Thiếu YOUTUBE_API_KEY: chỉ quét được reference Bilibili, bỏ qua reference YouTube.');
             }
 
-            $items = collect($playlistResponse->json('items', []))
+            return redirect()->route('youtube-channels.show', $youtubeChannel)
+                ->with('success', 'Đã hoàn tất. Không có video mới.');
+        }
+
+        $userId = auth()->id();
+        $existingIds = DubSyncProject::where('youtube_channel_id', $youtubeChannel->id)
+            ->where('user_id', $userId)
+            ->whereIn('video_id', $videos->pluck('video_id'))
+            ->pluck('video_id')
+            ->all();
+
+        $existingLookup = array_fill_keys($existingIds, true);
+        $newVideos = $videos->reject(function ($video) use ($existingLookup) {
+            $videoId = (string) ($video['video_id'] ?? '');
+            return isset($existingLookup[$videoId]);
+        });
+
+        if ($newVideos->isEmpty()) {
+            return redirect()->route('youtube-channels.show', $youtubeChannel)
+                ->with('success', 'Đã hoàn tất. Không có video mới (các video đã fetch trước đó được bỏ qua).');
+        }
+
+        $created = 0;
+        foreach ($newVideos as $video) {
+            $thumbnail = $this->normalizeBilibiliImageUrl($video['youtube_thumbnail'] ?? null);
+            $translatedTitleVi = null;
+            $videoId = (string) ($video['video_id'] ?? '');
+
+            if (str_starts_with($videoId, 'bili:')) {
+                $translatedTitleVi = $this->translateBilibiliTitleToVietnamese($video['youtube_title'] ?? '');
+            }
+
+            // Store thumbnails locally to avoid remote hotlink blocks (403) on listing pages.
+            $thumbnail = $this->persistFetchedThumbnailLocally($thumbnail, $videoId) ?? $thumbnail;
+
+            $project = DubSyncProject::firstOrCreate([
+                'user_id' => $userId,
+                'youtube_channel_id' => $youtubeChannel->id,
+                'video_id' => $videoId,
+            ], [
+                'youtube_url' => $video['youtube_url'],
+                'youtube_title' => $video['youtube_title'],
+                'youtube_title_vi' => $translatedTitleVi,
+                'youtube_thumbnail' => $thumbnail,
+                'status' => 'new',
+            ]);
+
+            if ($project->wasRecentlyCreated) {
+                $created++;
+            }
+        }
+
+        $scopeLabel = $fetchAll ? 'toan bo' : "toi da {$maxPerReference}/reference";
+
+        return redirect()->route('youtube-channels.show', $youtubeChannel)
+            ->with('success', "Da hoan tat ({$scopeLabel}). Da them {$created} video moi.");
+    }
+
+    private function fetchYouTubePlaylistVideos(string $playlistId, string $apiKey, int $maxResults = 100, bool $fetchAll = false)
+    {
+        $limit = $fetchAll ? 1000 : max(20, $maxResults);
+        $collected = collect();
+        $pageToken = null;
+
+        do {
+            $params = [
+                'part' => 'snippet,contentDetails',
+                'playlistId' => $playlistId,
+                'maxResults' => 50,
+                'key' => $apiKey,
+            ];
+
+            if ($pageToken) {
+                $params['pageToken'] = $pageToken;
+            }
+
+            $response = Http::get('https://www.googleapis.com/youtube/v3/playlistItems', $params);
+            if (!$response->ok()) {
+                break;
+            }
+
+            $items = collect($response->json('items', []))
                 ->map(function ($item) {
                     $videoId = data_get($item, 'contentDetails.videoId');
                     $title = data_get($item, 'snippet.title');
@@ -344,37 +450,386 @@ class YouTubeChannelController extends Controller
                 ->filter(fn($video) => !empty($video['video_id']))
                 ->values();
 
-            $videos = $videos->merge($items);
+            $collected = $collected->merge($items)->unique('video_id')->values();
+            $pageToken = $response->json('nextPageToken');
+
+            if ($collected->count() >= $limit) {
+                break;
+            }
+        } while (!empty($pageToken));
+
+        return $collected->take($limit)->values();
+    }
+
+    public function thumbnailProxy(Request $request, YoutubeChannel $youtubeChannel)
+    {
+        $url = trim((string) $request->query('url', ''));
+        if ($url === '') {
+            abort(404);
         }
 
-        $videos = $videos->unique('video_id')->values();
-        if ($videos->isEmpty()) {
-            return redirect()->route('youtube-channels.show', $youtubeChannel)
-                ->with('success', 'Đã hoàn tất. Không có video mới.');
+        $parts = parse_url($url);
+        $scheme = strtolower((string) ($parts['scheme'] ?? ''));
+        $host = strtolower((string) ($parts['host'] ?? ''));
+
+        if (!in_array($scheme, ['http', 'https'], true) || $host === '') {
+            abort(400, 'Invalid thumbnail URL.');
         }
 
-        $existingIds = DubSyncProject::whereIn('video_id', $videos->pluck('video_id'))
-            ->pluck('video_id')
-            ->all();
+        $isBilibiliHost = str_ends_with($host, '.biliimg.com') || str_ends_with($host, '.hdslb.com')
+            || in_array($host, ['archive.biliimg.com', 'i0.hdslb.com', 'i1.hdslb.com', 'i2.hdslb.com'], true);
+        $isYouTubeHost = in_array($host, ['i.ytimg.com', 'img.youtube.com', 'yt3.ggpht.com'], true);
 
-        $newVideos = $videos->reject(fn($video) => in_array($video['video_id'], $existingIds, true));
+        if (!$isBilibiliHost && !$isYouTubeHost) {
+            abort(403, 'Host is not allowed for proxy.');
+        }
 
-        $created = 0;
-        foreach ($newVideos as $video) {
-            DubSyncProject::create([
-                'user_id' => auth()->id(),
-                'youtube_channel_id' => $youtubeChannel->id,
-                'video_id' => $video['video_id'],
-                'youtube_url' => $video['youtube_url'],
-                'youtube_title' => $video['youtube_title'],
-                'youtube_thumbnail' => $video['youtube_thumbnail'],
-                'status' => 'new',
+        $ext = strtolower((string) pathinfo((string) ($parts['path'] ?? ''), PATHINFO_EXTENSION));
+        if (!preg_match('/^[a-z0-9]{2,5}$/', $ext)) {
+            $ext = 'jpg';
+        }
+
+        $cachePath = 'remote_thumbnails/' . sha1($url) . '.' . $ext;
+        if (Storage::disk('public')->exists($cachePath)) {
+            $mimeType = Storage::disk('public')->mimeType($cachePath) ?: 'image/jpeg';
+            return response(Storage::disk('public')->get($cachePath), 200, [
+                'Content-Type' => $mimeType,
+                'Cache-Control' => 'public, max-age=604800',
             ]);
-            $created++;
         }
 
-        return redirect()->route('youtube-channels.show', $youtubeChannel)
-            ->with('success', "Đã hoàn tất. Đã thêm {$created} video mới.");
+        try {
+            $http = Http::withHeaders([
+                'User-Agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+            ])->timeout(20);
+
+            if ($isBilibiliHost) {
+                $http = $http->withHeaders([
+                    'Referer' => 'https://www.bilibili.com/',
+                    'Origin' => 'https://www.bilibili.com',
+                ]);
+            }
+
+            $remote = $http->get($url);
+            if ($remote->ok() && strlen($remote->body()) > 0) {
+                $body = $remote->body();
+                $contentType = (string) ($remote->header('Content-Type') ?: 'image/jpeg');
+                Storage::disk('public')->put($cachePath, $body);
+
+                return response($body, 200, [
+                    'Content-Type' => $contentType,
+                    'Cache-Control' => 'public, max-age=604800',
+                ]);
+            }
+        } catch (\Throwable $e) {
+            Log::warning('thumbnailProxy fetch failed', [
+                'url' => $url,
+                'error' => $e->getMessage(),
+            ]);
+        }
+
+        // Return a tiny valid SVG placeholder so browser won't report a failed resource load.
+        return response('<svg xmlns="http://www.w3.org/2000/svg" width="120" height="80"><rect width="120" height="80" fill="#e5e7eb"/><text x="60" y="44" text-anchor="middle" font-size="10" fill="#6b7280">No image</text></svg>', 200, [
+            'Content-Type' => 'image/svg+xml; charset=UTF-8',
+            'Cache-Control' => 'no-store',
+        ]);
+    }
+
+    private function isBilibiliSpaceUrl(string $channelUrl): bool
+    {
+        return preg_match('/space\.bilibili\.com\/\d+/i', $channelUrl) === 1;
+    }
+
+    private function extractBilibiliMid(string $channelUrl): ?string
+    {
+        if (preg_match('/space\.bilibili\.com\/(\d+)/i', $channelUrl, $matches)) {
+            return $matches[1];
+        }
+
+        return null;
+    }
+
+    private function normalizeBilibiliImageUrl(?string $url): ?string
+    {
+        if (!$url) {
+            return null;
+        }
+
+        if (str_starts_with($url, '//')) {
+            return 'https:' . $url;
+        }
+
+        if (str_starts_with($url, 'http://')) {
+            return 'https://' . substr($url, 7);
+        }
+
+        return $url;
+    }
+
+    private function translateBilibiliTitleToVietnamese(string $title): ?string
+    {
+        $title = trim($title);
+        if ($title === '') {
+            return null;
+        }
+
+        // Only translate when title contains Han characters.
+        if (@preg_match('/\p{Han}/u', $title) !== 1) {
+            return null;
+        }
+
+        try {
+            $translator = app(TranslationService::class);
+            $translated = $translator->translateText($title, 'zh-CN', 'vi', 'google');
+            $translated = trim((string) $translated);
+
+            return $translated !== '' ? $translated : null;
+        } catch (\Throwable $e) {
+            Log::warning('Bilibili title translation failed', [
+                'title_preview' => mb_substr($title, 0, 120),
+                'error' => $e->getMessage(),
+            ]);
+
+            return null;
+        }
+    }
+
+    private function persistBilibiliThumbnailLocally(?string $thumbnailUrl, string $videoId): ?string
+    {
+        if (!$thumbnailUrl || !str_starts_with($videoId, 'bili:')) {
+            return $thumbnailUrl;
+        }
+
+        try {
+            $safeVideoId = preg_replace('/[^a-zA-Z0-9_\-]/', '_', $videoId);
+            $path = "bilibili_thumbnails/{$safeVideoId}.jpg";
+
+            $response = Http::withHeaders([
+                'User-Agent' => 'Mozilla/5.0',
+                'Referer' => 'https://www.bilibili.com/',
+            ])->timeout(20)->get($thumbnailUrl);
+
+            if (!$response->ok()) {
+                return $thumbnailUrl;
+            }
+
+            Storage::disk('public')->put($path, $response->body());
+
+            return Storage::url($path);
+        } catch (\Throwable $e) {
+            Log::warning('Persist Bilibili thumbnail failed', [
+                'video_id' => $videoId,
+                'thumbnail' => $thumbnailUrl,
+                'error' => $e->getMessage(),
+            ]);
+
+            return $thumbnailUrl;
+        }
+    }
+
+    private function persistFetchedThumbnailLocally(?string $thumbnailUrl, string $videoId): ?string
+    {
+        if (!$thumbnailUrl) {
+            return null;
+        }
+
+        if (!preg_match('/^https?:\/\//i', $thumbnailUrl)) {
+            return $thumbnailUrl;
+        }
+
+        try {
+            $safeVideoId = preg_replace('/[^a-zA-Z0-9_\-]/', '_', $videoId ?: 'video');
+            $folder = str_starts_with($videoId, 'bili:') ? 'bilibili_thumbnails' : 'youtube_thumbnails';
+            $path = "{$folder}/{$safeVideoId}.jpg";
+
+            if (Storage::disk('public')->exists($path)) {
+                return Storage::url($path);
+            }
+
+            $request = Http::timeout(20);
+            if (str_starts_with($videoId, 'bili:')) {
+                $request = $request->withHeaders([
+                    'User-Agent' => 'Mozilla/5.0',
+                    'Referer' => 'https://www.bilibili.com/',
+                ]);
+            }
+
+            $response = $request->get($thumbnailUrl);
+            if (!$response->ok()) {
+                return $thumbnailUrl;
+            }
+
+            Storage::disk('public')->put($path, $response->body());
+
+            return Storage::url($path);
+        } catch (\Throwable $e) {
+            Log::warning('Persist fetched thumbnail failed', [
+                'video_id' => $videoId,
+                'thumbnail' => $thumbnailUrl,
+                'error' => $e->getMessage(),
+            ]);
+
+            return $thumbnailUrl;
+        }
+    }
+
+    private function fetchBilibiliReferenceVideos(string $channelUrl, int $maxResults = 100, bool $fetchAll = false)
+    {
+        $mid = $this->extractBilibiliMid($channelUrl);
+        if (!$mid) {
+            return collect();
+        }
+
+        try {
+            $limit = $fetchAll ? 2000 : max(20, $maxResults);
+            $specificSeasonId = $this->extractBilibiliSeasonId($channelUrl);
+
+            if ($specificSeasonId !== null) {
+                return $this->fetchBilibiliSeasonArchives($mid, $specificSeasonId, $channelUrl, $limit, $fetchAll);
+            }
+
+            $response = Http::withHeaders([
+                'User-Agent' => 'Mozilla/5.0',
+                'Referer' => $channelUrl,
+                'Origin' => 'https://space.bilibili.com',
+            ])->timeout(20)->get('https://api.bilibili.com/x/polymer/web-space/home/seasons_series', [
+                'mid' => $mid,
+                'page_num' => 1,
+                'page_size' => 20,
+                'web_location' => '333.1387',
+            ]);
+
+            if (!$response->ok()) {
+                return collect();
+            }
+
+            $json = $response->json();
+            if (($json['code'] ?? -1) !== 0) {
+                return collect();
+            }
+
+            $seasonIds = collect(data_get($json, 'data.items_lists.seasons_list', []))
+                ->map(fn($season) => (int) data_get($season, 'meta.season_id'))
+                ->filter(fn($id) => $id > 0)
+                ->unique()
+                ->values();
+
+            $collected = collect();
+            foreach ($seasonIds as $seasonId) {
+                $seasonVideos = $this->fetchBilibiliSeasonArchives($mid, (int) $seasonId, $channelUrl, $limit, $fetchAll);
+                $collected = $collected->merge($seasonVideos)->unique('video_id')->values();
+                if ($collected->count() >= $limit) {
+                    break;
+                }
+            }
+
+            // Fallback: keep preview archives behavior when seasons metadata is missing.
+            if ($collected->isEmpty()) {
+                $previewItems = collect(data_get($json, 'data.items_lists.seasons_list', []))
+                    ->flatMap(fn($season) => collect(data_get($season, 'archives', [])))
+                    ->map(function ($item) {
+                        $bvid = data_get($item, 'bvid');
+
+                        return [
+                            'video_id' => $bvid ? ('bili:' . $bvid) : null,
+                            'youtube_url' => $bvid ? "https://www.bilibili.com/video/{$bvid}" : null,
+                            'youtube_title' => data_get($item, 'title'),
+                            'youtube_thumbnail' => $this->normalizeBilibiliImageUrl(data_get($item, 'pic')),
+                        ];
+                    })
+                    ->filter(fn($video) => !empty($video['video_id']))
+                    ->unique('video_id')
+                    ->values();
+
+                $collected = $previewItems;
+            }
+
+            return $collected->take($limit)->values();
+        } catch (\Throwable $e) {
+            Log::warning('Bilibili reference fetch failed', [
+                'channel_url' => $channelUrl,
+                'error' => $e->getMessage(),
+            ]);
+
+            return collect();
+        }
+    }
+
+    private function extractBilibiliSeasonId(string $channelUrl): ?int
+    {
+        if (preg_match('/\/lists\/(\d+)/i', $channelUrl, $matches)) {
+            return (int) $matches[1];
+        }
+
+        return null;
+    }
+
+    private function fetchBilibiliSeasonArchives(string $mid, int $seasonId, string $refererUrl, int $limit, bool $fetchAll)
+    {
+        $page = 1;
+        $pageSize = 30;
+        $maxPages = $fetchAll ? 200 : 30;
+        $collected = collect();
+
+        while ($page <= $maxPages && $collected->count() < $limit) {
+            $response = Http::withHeaders([
+                'User-Agent' => 'Mozilla/5.0',
+                'Referer' => $refererUrl,
+                'Origin' => 'https://space.bilibili.com',
+            ])->timeout(20)->get('https://api.bilibili.com/x/polymer/web-space/seasons_archives_list', [
+                'mid' => $mid,
+                'season_id' => $seasonId,
+                'page_num' => $page,
+                'page_size' => $pageSize,
+            ]);
+
+            if (!$response->ok()) {
+                break;
+            }
+
+            $json = $response->json();
+            if (($json['code'] ?? -1) !== 0) {
+                break;
+            }
+
+            $items = collect(data_get($json, 'data.archives', []))
+                ->map(function ($item) {
+                    $bvid = data_get($item, 'bvid');
+
+                    return [
+                        'video_id' => $bvid ? ('bili:' . $bvid) : null,
+                        'youtube_url' => $bvid ? "https://www.bilibili.com/video/{$bvid}" : null,
+                        'youtube_title' => data_get($item, 'title'),
+                        'youtube_thumbnail' => $this->normalizeBilibiliImageUrl(data_get($item, 'pic')),
+                    ];
+                })
+                ->filter(fn($video) => !empty($video['video_id']))
+                ->values();
+
+            if ($items->isEmpty()) {
+                break;
+            }
+
+            $beforeCount = $collected->count();
+            $collected = $collected->merge($items)->unique('video_id')->values();
+
+            if ($collected->count() === $beforeCount) {
+                break;
+            }
+
+            $total = (int) data_get($json, 'data.page.total', 0);
+            if ($total > 0 && $collected->count() >= $total) {
+                break;
+            }
+
+            if ($items->count() < $pageSize) {
+                break;
+            }
+
+            $page++;
+        }
+
+        return $collected->take($limit)->values();
     }
 
     private function syncReferenceChannels(YoutubeChannel $channel, ?string $refsJson): void
