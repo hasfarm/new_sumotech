@@ -26,6 +26,7 @@
                         <input type="hidden" name="book_url" id="bookUrlHidden">
                         <input type="hidden" name="book_source" id="bookSourceHidden">
                         <input type="hidden" name="cover_image_url" id="coverImageUrlHidden">
+                        <input type="hidden" name="youtube_transcript_content" id="youtubeTranscriptContentHidden">
 
                         <!-- URL Auto-Fill Section -->
                         <div class="mb-6 p-4 bg-blue-50 border border-blue-200 rounded-lg">
@@ -50,6 +51,36 @@
                                 <p class="text-xs font-medium text-blue-900 mb-2">📷 Ảnh bìa từ URL:</p>
                                 <img id="coverImagePreviewImg" src="" alt="Cover"
                                     class="w-32 h-auto rounded-lg border-2 border-blue-300">
+                            </div>
+                        </div>
+
+                        <!-- YouTube Transcript Section -->
+                        <div class="mb-6 p-4 bg-red-50 border border-red-200 rounded-lg">
+                            <label class="block text-sm font-medium text-red-900 mb-2">🎬 Lấy transcript từ video
+                                YouTube (làm Chương 1)</label>
+                            <div class="flex gap-2">
+                                <input type="url" id="youtubeUrl"
+                                    class="flex-1 px-3 py-2 border border-red-300 rounded-lg text-sm"
+                                    placeholder="https://www.youtube.com/watch?v=...">
+                                <button type="button" id="fetchYoutubeTranscriptBtn"
+                                    class="bg-red-600 hover:bg-red-700 text-white font-semibold py-2 px-4 rounded-lg transition duration-200">
+                                    Lấy transcript
+                                </button>
+                            </div>
+                            <p class="text-xs text-red-700 mt-2">
+                                Ưu tiên lấy phụ đề có sẵn của YouTube; nếu video không có phụ đề, tự động chuyển
+                                audio thành text bằng AI (Gemini) — tối đa 20 phút đầu.
+                            </p>
+                            <div id="youtubeTranscriptStatus" class="mt-2 text-sm"></div>
+                            <div id="youtubeTranscriptPreviewWrap" class="mt-3 hidden">
+                                <div class="flex items-center justify-between mb-1">
+                                    <p class="text-xs font-medium text-red-900">📄 Nội dung Chương 1 (có thể sửa
+                                        trước khi lưu):</p>
+                                    <button type="button" id="clearYoutubeTranscriptBtn"
+                                        class="text-xs text-red-600 hover:underline">Xóa</button>
+                                </div>
+                                <textarea id="youtubeTranscriptPreview" rows="8"
+                                    class="w-full px-3 py-2 border border-red-300 rounded-lg text-sm"></textarea>
                             </div>
                         </div>
 
@@ -416,6 +447,146 @@ https://nhasachmienphi.com/doc-online/..."></textarea>
                     if (e.key === 'Enter') {
                         e.preventDefault();
                         fetchMetadataBtn.click();
+                    }
+                });
+            }
+
+            // YouTube transcript fetch
+            const youtubeUrlInput = document.getElementById('youtubeUrl');
+            const fetchYoutubeTranscriptBtn = document.getElementById('fetchYoutubeTranscriptBtn');
+            const youtubeTranscriptStatus = document.getElementById('youtubeTranscriptStatus');
+            const youtubeTranscriptPreviewWrap = document.getElementById('youtubeTranscriptPreviewWrap');
+            const youtubeTranscriptPreview = document.getElementById('youtubeTranscriptPreview');
+            const youtubeTranscriptContentHidden = document.getElementById('youtubeTranscriptContentHidden');
+            const clearYoutubeTranscriptBtn = document.getElementById('clearYoutubeTranscriptBtn');
+            const titleInput = document.querySelector('input[name="title"]');
+
+            function showYoutubeStatus(type, message) {
+                const colors = {
+                    loading: 'text-blue-700 bg-blue-50 border border-blue-200',
+                    success: 'text-green-700 bg-green-50 border border-green-200',
+                    warning: 'text-amber-700 bg-amber-50 border border-amber-200',
+                    error: 'text-red-700 bg-red-50 border border-red-200'
+                };
+                youtubeTranscriptStatus.className = `mt-2 p-3 text-sm rounded-lg ${colors[type] || 'text-gray-700'}`;
+                youtubeTranscriptStatus.innerHTML = message;
+            }
+
+            // Keep the hidden field in sync if the user edits the preview textarea directly.
+            if (youtubeTranscriptPreview) {
+                youtubeTranscriptPreview.addEventListener('input', () => {
+                    youtubeTranscriptContentHidden.value = youtubeTranscriptPreview.value;
+                });
+            }
+
+            if (clearYoutubeTranscriptBtn) {
+                clearYoutubeTranscriptBtn.addEventListener('click', () => {
+                    youtubeTranscriptPreviewWrap.classList.add('hidden');
+                    youtubeTranscriptPreview.value = '';
+                    youtubeTranscriptContentHidden.value = '';
+                    youtubeTranscriptStatus.innerHTML = '';
+                });
+            }
+
+            const youtubeStageLabels = {
+                starting: '⏳ Đang khởi tạo...',
+                fetching_metadata: '⏳ Đang lấy thông tin video...',
+                fetching_captions: '⏳ Đang lấy phụ đề YouTube...',
+                downloading_audio: '⏳ Video không có phụ đề sẵn — đang tải audio...',
+                transcribing_ai: '🤖 Đang chuyển audio thành text bằng AI (Gemini)...',
+                translating: '🌐 Đang dịch sang tiếng Việt bằng Gemini...',
+                unknown: '⏳ Đang khởi tạo...',
+            };
+
+            function pollYoutubeTranscriptStatus(token) {
+                const statusUrl = '{{ url('audiobooks/fetch-youtube-transcript') }}/' + token + '/status';
+
+                const timer = setInterval(async () => {
+                    let data;
+                    try {
+                        const resp = await fetch(statusUrl, { headers: { Accept: 'application/json' } });
+                        data = await resp.json();
+                    } catch (e) {
+                        return; // transient network hiccup — try again on next tick
+                    }
+
+                    if (data.stage === 'done') {
+                        clearInterval(timer);
+                        youtubeTranscriptPreview.value = data.content || '';
+                        youtubeTranscriptContentHidden.value = data.content || '';
+                        youtubeTranscriptPreviewWrap.classList.remove('hidden');
+
+                        if (data.title && titleInput && !titleInput.value.trim()) {
+                            titleInput.value = data.title;
+                        }
+
+                        const sourceLabel = data.source === 'youtube_captions' ?
+                            '✓ Lấy từ phụ đề YouTube có sẵn' :
+                            '✓ Tạo bằng AI (Gemini) — video không có phụ đề sẵn';
+                        const translatedLabel = data.translated ?
+                            '<br>🌐 Nội dung gốc không phải tiếng Việt — đã tự động dịch bằng Gemini' :
+                            '';
+                        showYoutubeStatus(data.source === 'youtube_captions' ? 'success' : 'warning',
+                            sourceLabel + translatedLabel + (data.warning ? '<br>⚠️ ' + data.warning : ''));
+
+                        fetchYoutubeTranscriptBtn.disabled = false;
+                        fetchYoutubeTranscriptBtn.textContent = 'Lấy transcript';
+                    } else if (data.stage === 'failed') {
+                        clearInterval(timer);
+                        showYoutubeStatus('error', data.error || 'Lỗi khi lấy transcript');
+                        fetchYoutubeTranscriptBtn.disabled = false;
+                        fetchYoutubeTranscriptBtn.textContent = 'Lấy transcript';
+                    } else {
+                        showYoutubeStatus('loading', youtubeStageLabels[data.stage] || youtubeStageLabels.unknown);
+                    }
+                }, 2000);
+            }
+
+            if (fetchYoutubeTranscriptBtn && youtubeUrlInput) {
+                fetchYoutubeTranscriptBtn.addEventListener('click', async function() {
+                    const youtubeUrl = youtubeUrlInput.value.trim();
+                    if (!youtubeUrl) {
+                        showYoutubeStatus('error', 'Vui lòng nhập URL video YouTube');
+                        return;
+                    }
+
+                    fetchYoutubeTranscriptBtn.disabled = true;
+                    fetchYoutubeTranscriptBtn.textContent = 'Đang lấy...';
+                    showYoutubeStatus('loading', youtubeStageLabels.starting);
+
+                    try {
+                        const response = await fetch('{{ route('audiobooks.fetch.youtube.transcript') }}', {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json',
+                                'X-CSRF-TOKEN': csrfToken,
+                                'Accept': 'application/json'
+                            },
+                            body: JSON.stringify({
+                                youtube_url: youtubeUrl
+                            })
+                        });
+
+                        const data = await response.json();
+
+                        if (response.ok && data.success && data.token) {
+                            pollYoutubeTranscriptStatus(data.token);
+                        } else {
+                            showYoutubeStatus('error', data.error || 'Lỗi khi lấy transcript');
+                            fetchYoutubeTranscriptBtn.disabled = false;
+                            fetchYoutubeTranscriptBtn.textContent = 'Lấy transcript';
+                        }
+                    } catch (error) {
+                        showYoutubeStatus('error', 'Lỗi kết nối. Vui lòng thử lại.');
+                        fetchYoutubeTranscriptBtn.disabled = false;
+                        fetchYoutubeTranscriptBtn.textContent = 'Lấy transcript';
+                    }
+                });
+
+                youtubeUrlInput.addEventListener('keypress', function(e) {
+                    if (e.key === 'Enter') {
+                        e.preventDefault();
+                        fetchYoutubeTranscriptBtn.click();
                     }
                 });
             }

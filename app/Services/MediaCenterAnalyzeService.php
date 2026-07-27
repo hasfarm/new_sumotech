@@ -9,6 +9,133 @@ use Illuminate\Support\Facades\Http;
 class MediaCenterAnalyzeService
 {
     /**
+     * @return array{sentences:array<int,array{image_prompt:string}>}
+     */
+    public function buildImagePromptPlanWithGrok(MediaCenterProject $project, string $commonInstruction = ''): array
+    {
+        $world = $this->buildWorldProfile($project);
+        $apiKey = trim((string) config('services.openai.api_key', ''));
+
+        if ($apiKey === '') {
+            throw new \RuntimeException('Thieu OPENAI_API_KEY trong cau hinh runtime.');
+        }
+
+        $baseUrl = rtrim((string) config('services.openai.base_url', 'https://api.openai.com/v1'), '/');
+        $model = trim((string) config('services.openai.chat_model', 'gpt-4o-mini')) ?: 'gpt-4o-mini';
+
+        $sentenceLines = $project->sentences
+            ->map(function (MediaCenterSentence $sentence) {
+                return '[' . $sentence->sentence_index . '] ' . $sentence->sentence_text;
+            })
+            ->implode("\n");
+
+        $userInstructionBlock = $commonInstruction !== ''
+            ? ("\nYeu cau chung tu user (uu tien ap dung cho moi cau):\n" . $commonInstruction . "\n")
+            : "\n";
+
+        $prompt = "Ban la prompt engineer tao image prompt cho tung cau truyen.\n"
+            . "Nhiem vu: tao image_prompt bang tieng Anh cho TAT CA cac cau duoi day.\n"
+            . "Tra ve STRICT JSON object dang: {\"sentences\": [{\"index\": 1, \"image_prompt\": \"...\"}, ...]}\n"
+            . "Yeu cau bat buoc:\n"
+            . "- Moi image_prompt phai cu the, khong chung chung, 90-160 tu.\n"
+            . "- Co du: subject action, environment/props, camera framing, lighting/color mood, texture/material details, continuity constraints.\n"
+            . "- Prompt phai dung boi canh thoi dai, THEO DUNG ho so boi canh.\n"
+            . "- Khong su dung yeu to cam.\n"
+            . "- Output chi la JSON hop le, khong markdown.\n"
+            . "\nHo so boi canh:\n"
+            . "- Thoi dai: {$world['story_era']}\n"
+            . "- The loai: {$world['story_genre']}\n"
+            . "- Boi canh the gioi: {$world['world_context']}\n"
+            . "- Ti le khung anh: {$world['image_aspect_ratio']}\n"
+            . "- Phong cach anh: {$world['image_style']}\n"
+            . "- Yeu to cam: {$world['forbidden_elements_text']}\n"
+            . $userInstructionBlock
+            . "Danh sach cau:\n"
+            . $sentenceLines;
+
+        $requestPayload = [
+            'model' => $model,
+            'temperature' => 0.3,
+            'messages' => [
+                [
+                    'role' => 'system',
+                    'content' => 'Return valid JSON only. No markdown fences.',
+                ],
+                [
+                    'role' => 'user',
+                    'content' => $prompt,
+                ],
+            ],
+        ];
+
+        $response = Http::acceptJson()
+            ->withToken($apiKey)
+            ->connectTimeout(15)
+            ->timeout(180)
+            ->post($baseUrl . '/chat/completions', $requestPayload);
+
+        if (!$response->successful()) {
+            $errorBody = trim((string) $response->body());
+            $shortBody = mb_substr($errorBody, 0, 500);
+            throw new \RuntimeException('OpenAI API loi HTTP ' . $response->status() . ($shortBody !== '' ? (': ' . $shortBody) : ''));
+        }
+
+        $content = trim((string) data_get($response->json(), 'choices.0.message.content', ''));
+        $decoded = json_decode($content, true);
+        if (!is_array($decoded)) {
+            $normalizedContent = preg_replace('/^```(?:json)?\s*|\s*```$/i', '', $content) ?: $content;
+            $decoded = json_decode(trim($normalizedContent), true);
+        }
+        if (!is_array($decoded)) {
+            throw new \RuntimeException('OpenAI tra ve noi dung khong phai JSON hop le.');
+        }
+
+        $rows = is_array($decoded['sentences'] ?? null) ? $decoded['sentences'] : [];
+        $sentences = [];
+
+        foreach ($rows as $row) {
+            if (!is_array($row)) {
+                continue;
+            }
+
+            $index = (int) ($row['index'] ?? 0);
+            if ($index <= 0) {
+                continue;
+            }
+
+            $imagePrompt = trim((string) ($row['image_prompt'] ?? ''));
+            if ($imagePrompt === '') {
+                continue;
+            }
+
+            $sentences[$index] = [
+                'image_prompt' => $imagePrompt,
+            ];
+        }
+
+        if (empty($sentences)) {
+            throw new \RuntimeException('OpenAI khong tra ve danh sach image_prompt hop le.');
+        }
+
+        foreach ($project->sentences as $sentence) {
+            $idx = (int) $sentence->sentence_index;
+            if (!isset($sentences[$idx])) {
+                $defaultPlan = $this->buildDefaultSentencePlan(
+                    (string) ($sentence->tts_text ?: $sentence->sentence_text),
+                    []
+                );
+                $sentences[$idx] = [
+                    'image_prompt' => trim((string) ($defaultPlan['image_prompt'] ?? '')),
+                ];
+            }
+        }
+
+        return [
+            'sentences' => $sentences,
+        ];
+    }
+
+    /**
      * @return array<string,mixed>
      */
     public function buildCharacterAndPromptPlan(MediaCenterProject $project): array
@@ -267,6 +394,35 @@ class MediaCenterAnalyzeService
             'image_style' => $imageStyle,
             'forbidden_elements' => $forbidden,
             'forbidden_elements_text' => implode(', ', $forbidden),
+        ];
+    }
+
+    /**
+     * @param array{story_era:string,story_genre:string,world_context:string,image_aspect_ratio:string,image_style:string,forbidden_elements:array<int,string>,forbidden_elements_text:string} $world
+     * @return array{sentences:array<int,array{image_prompt:string}>}
+     */
+    private function buildFallbackImagePromptPlan(MediaCenterProject $project, array $world): array
+    {
+        $sentences = [];
+
+        foreach ($project->sentences as $sentence) {
+            $text = trim((string) ($sentence->tts_text ?: $sentence->sentence_text));
+            $defaultPlan = $this->buildDefaultSentencePlan($text, []);
+            $plan = [
+                'tts_text' => $text,
+                'image_prompt' => trim((string) ($defaultPlan['image_prompt'] ?? '')),
+                'video_prompt' => trim((string) ($defaultPlan['video_prompt'] ?? '')),
+                'character_notes' => trim((string) ($defaultPlan['character_notes'] ?? '')),
+            ];
+
+            $sanitized = $this->sanitizeSentencePlanByWorld($plan, $world);
+            $sentences[(int) $sentence->sentence_index] = [
+                'image_prompt' => trim((string) ($sanitized['image_prompt'] ?? $plan['image_prompt'])),
+            ];
+        }
+
+        return [
+            'sentences' => $sentences,
         ];
     }
 

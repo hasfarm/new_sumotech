@@ -10,6 +10,7 @@ use App\Services\GeminiImageService;
 use App\Services\MediaCenterAnalyzeService;
 use App\Services\TTSService;
 use App\Services\TranslationService;
+use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Symfony\Component\HttpFoundation\BinaryFileResponse;
@@ -23,7 +24,246 @@ use ZipArchive;
 
 class MediaCenterController extends Controller
 {
-    public function index(Request $request)
+    public function index()
+    {
+        return view('media_center.index', [
+            'projects' => $this->loadProjectListing(),
+        ]);
+    }
+
+    public function create()
+    {
+        return view('media_center.create');
+    }
+
+    public function show(MediaCenterProject $project)
+    {
+        $this->authorizeProject($project);
+
+        $selectedProject = MediaCenterProject::with('sentences')->findOrFail($project->id);
+        $this->hydrateSentenceImageGalleryPaths($selectedProject);
+
+        return view('media_center.show', [
+            'projects' => $this->loadProjectListing(),
+            'selectedProject' => $selectedProject,
+            'selectedId' => (int) $selectedProject->id,
+            'workspaceStats' => $this->buildWorkspaceStats($selectedProject),
+        ]);
+    }
+
+    public function edit(MediaCenterProject $project)
+    {
+        $this->authorizeProject($project);
+
+        return view('media_center.edit', [
+            'project' => $project,
+        ]);
+    }
+
+    public function store(Request $request): JsonResponse|RedirectResponse
+    {
+        $data = $request->validate([
+            'title' => 'nullable|string|max:200',
+            'source_text' => 'required|string|min:20',
+            'language' => 'nullable|string|max:12',
+            'story_era' => 'nullable|string|max:120',
+            'story_genre' => 'nullable|string|max:120',
+            'world_context' => 'nullable|string|max:1000',
+            'forbidden_elements' => 'nullable|string|max:1000',
+            'image_aspect_ratio' => 'nullable|string|in:16:9,9:16,1:1',
+            'image_style' => 'nullable|string|max:120',
+        ]);
+
+        $sourceText = trim((string) $data['source_text']);
+        $sentences = $this->splitSentences($sourceText);
+
+        if (empty($sentences)) {
+            if (!$request->expectsJson()) {
+                return redirect()->back()->withInput()->withErrors([
+                    'source_text' => 'Không tách được câu từ văn bản đã nhập.',
+                ]);
+            }
+
+            return response()->json([
+                'success' => false,
+                'message' => 'Không tách được câu từ văn bản đã nhập.',
+            ], 422);
+        }
+
+        $project = MediaCenterProject::create([
+            'user_id' => Auth::id(),
+            'title' => trim((string) ($data['title'] ?? '')) ?: ('Media Center ' . now()->format('Y-m-d H:i')),
+            'source_text' => $sourceText,
+            'language' => trim((string) ($data['language'] ?? 'vi')) ?: 'vi',
+            'settings_json' => [
+                'story_era' => trim((string) ($data['story_era'] ?? '')),
+                'story_genre' => trim((string) ($data['story_genre'] ?? '')),
+                'world_context' => trim((string) ($data['world_context'] ?? '')),
+                'forbidden_elements' => trim((string) ($data['forbidden_elements'] ?? '')),
+                'image_aspect_ratio' => trim((string) ($data['image_aspect_ratio'] ?? '16:9')) ?: '16:9',
+                'image_style' => trim((string) ($data['image_style'] ?? 'Cinematic')) ?: 'Cinematic',
+                'use_character_reference' => false,
+            ],
+            'status' => 'draft',
+        ]);
+
+        $rows = [];
+        foreach ($sentences as $idx => $sentence) {
+            $rows[] = [
+                'media_center_project_id' => $project->id,
+                'sentence_index' => $idx + 1,
+                'sentence_text' => $sentence,
+                'tts_text' => $sentence,
+                'created_at' => now(),
+                'updated_at' => now(),
+            ];
+        }
+        MediaCenterSentence::insert($rows);
+
+        if ($request->expectsJson()) {
+            return response()->json([
+                'success' => true,
+                'project_id' => $project->id,
+                'redirect_url' => route('media-center.show', $project),
+            ]);
+        }
+
+        return redirect()
+            ->route('media-center.show', $project)
+            ->with('success', 'Đã tạo content thành công.');
+    }
+
+    public function updateProject(Request $request, MediaCenterProject $project): JsonResponse|RedirectResponse
+    {
+        $this->authorizeProject($project);
+
+        $data = $request->validate([
+            'title' => 'nullable|string|max:200',
+            'source_text' => 'required|string|min:20',
+            'language' => 'nullable|string|max:12',
+            'story_era' => 'nullable|string|max:120',
+            'story_genre' => 'nullable|string|max:120',
+            'world_context' => 'nullable|string|max:1000',
+            'forbidden_elements' => 'nullable|string|max:1000',
+            'image_aspect_ratio' => 'nullable|string|in:16:9,9:16,1:1',
+            'image_style' => 'nullable|string|max:120',
+            'rebuild_sentences' => 'nullable|boolean',
+        ]);
+
+        $sourceText = trim((string) $data['source_text']);
+        $rebuild = (bool) ($data['rebuild_sentences'] ?? false);
+        $sourceChanged = $sourceText !== (string) $project->source_text;
+
+        $settings = is_array($project->settings_json) ? $project->settings_json : [];
+        $settings['story_era'] = trim((string) ($data['story_era'] ?? ''));
+        $settings['story_genre'] = trim((string) ($data['story_genre'] ?? ''));
+        $settings['world_context'] = trim((string) ($data['world_context'] ?? ''));
+        $settings['forbidden_elements'] = trim((string) ($data['forbidden_elements'] ?? ''));
+        $settings['image_aspect_ratio'] = trim((string) ($data['image_aspect_ratio'] ?? ($settings['image_aspect_ratio'] ?? '16:9'))) ?: '16:9';
+        $settings['image_style'] = trim((string) ($data['image_style'] ?? ($settings['image_style'] ?? 'Cinematic'))) ?: 'Cinematic';
+
+        $project->forceFill([
+            'title' => trim((string) ($data['title'] ?? '')) ?: $project->title,
+            'source_text' => $sourceText,
+            'language' => trim((string) ($data['language'] ?? 'vi')) ?: 'vi',
+            'settings_json' => $settings,
+        ])->save();
+
+        if ($rebuild && $sourceChanged) {
+            $sentences = $this->splitSentences($sourceText);
+            if (empty($sentences)) {
+                if (!$request->expectsJson()) {
+                    return redirect()->back()->withInput()->withErrors([
+                        'source_text' => 'Không tách được câu sau khi cập nhật source text.',
+                    ]);
+                }
+
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Không tách được câu sau khi cập nhật source text.',
+                ], 422);
+            }
+
+            $project->sentences()->delete();
+
+            $rows = [];
+            foreach ($sentences as $idx => $sentence) {
+                $rows[] = [
+                    'media_center_project_id' => $project->id,
+                    'sentence_index' => $idx + 1,
+                    'sentence_text' => $sentence,
+                    'tts_text' => $sentence,
+                    'created_at' => now(),
+                    'updated_at' => now(),
+                ];
+            }
+            MediaCenterSentence::insert($rows);
+
+            $project->forceFill([
+                'status' => 'draft',
+                'main_character_name' => null,
+                'main_character_profile' => null,
+                'characters_json' => null,
+            ])->save();
+
+            $settings = is_array($project->settings_json) ? $project->settings_json : [];
+            foreach ($this->extractMainCharacterReferenceImagePaths($project) as $refPath) {
+                $this->deletePublicStorageFile($refPath);
+            }
+            unset($settings['main_character_reference_images'], $settings['main_character_identity_lock']);
+            $settings['use_character_reference'] = false;
+
+            $project->forceFill([
+                'settings_json' => $settings,
+            ])->save();
+        }
+
+        if ($request->expectsJson()) {
+            return response()->json([
+                'success' => true,
+                'project_id' => $project->id,
+                'redirect_url' => route('media-center.show', $project),
+            ]);
+        }
+
+        return redirect()
+            ->route('media-center.show', $project)
+            ->with('success', 'Đã cập nhật content thành công.');
+    }
+
+    public function destroy(Request $request, MediaCenterProject $project): JsonResponse|RedirectResponse
+    {
+        $this->authorizeProject($project);
+
+        $projectId = (int) $project->id;
+        $sentences = $project->sentences()->get(['tts_audio_path', 'image_path', 'metadata_json']);
+
+        foreach ($sentences as $sentence) {
+            $this->deletePublicStorageFile((string) ($sentence->tts_audio_path ?? ''));
+
+            foreach ($this->extractImagePathsFromSentence($sentence) as $imagePath) {
+                $this->deletePublicStorageFile($imagePath);
+            }
+        }
+
+        $project->sentences()->delete();
+        $project->delete();
+
+        Storage::disk('public')->deleteDirectory('media_center/' . $projectId);
+
+        if ($request->expectsJson()) {
+            return response()->json([
+                'success' => true,
+                'redirect_url' => route('media-center.index'),
+            ]);
+        }
+
+        return redirect()
+            ->route('media-center.index')
+            ->with('success', 'Đã xoá content thành công.');
+    }
+
+    private function loadProjectListing()
     {
         $projects = MediaCenterProject::query()
             ->when(Auth::check(), function ($query) {
@@ -65,223 +305,43 @@ class MediaCenterController extends Controller
             });
         }
 
-        $selectedId = (int) $request->query('project_id', 0);
-        if (!$projects->contains('id', $selectedId) && $projects->isNotEmpty()) {
-            $selectedId = (int) $projects->first()->id;
-        }
-
-        $selectedProject = $selectedId > 0
-            ? MediaCenterProject::with('sentences')->find($selectedId)
-            : null;
-
-        if ($selectedProject) {
-            $this->hydrateSentenceImageGalleryPaths($selectedProject);
-        }
-
-        $workspaceStats = $selectedProject
-            ? $this->buildWorkspaceStats($selectedProject)
-            : null;
-
-        return view('media_center.index', [
-            'projects' => $projects,
-            'selectedProject' => $selectedProject,
-            'selectedId' => $selectedId,
-            'workspaceStats' => $workspaceStats,
-        ]);
-    }
-
-    public function store(Request $request): JsonResponse
-    {
-        $data = $request->validate([
-            'title' => 'nullable|string|max:200',
-            'source_text' => 'required|string|min:20',
-            'language' => 'nullable|string|max:12',
-            'story_era' => 'nullable|string|max:120',
-            'story_genre' => 'nullable|string|max:120',
-            'world_context' => 'nullable|string|max:1000',
-            'forbidden_elements' => 'nullable|string|max:1000',
-            'image_aspect_ratio' => 'nullable|string|in:16:9,9:16,1:1',
-            'image_style' => 'nullable|string|max:120',
-        ]);
-
-        $sourceText = trim((string) $data['source_text']);
-        $sentences = $this->splitSentences($sourceText);
-
-        if (empty($sentences)) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Không tách được câu từ văn bản đã nhập.',
-            ], 422);
-        }
-
-        $project = MediaCenterProject::create([
-            'user_id' => Auth::id(),
-            'title' => trim((string) ($data['title'] ?? '')) ?: ('Media Center ' . now()->format('Y-m-d H:i')),
-            'source_text' => $sourceText,
-            'language' => trim((string) ($data['language'] ?? 'vi')) ?: 'vi',
-            'settings_json' => [
-                'story_era' => trim((string) ($data['story_era'] ?? '')),
-                'story_genre' => trim((string) ($data['story_genre'] ?? '')),
-                'world_context' => trim((string) ($data['world_context'] ?? '')),
-                'forbidden_elements' => trim((string) ($data['forbidden_elements'] ?? '')),
-                'image_aspect_ratio' => trim((string) ($data['image_aspect_ratio'] ?? '16:9')) ?: '16:9',
-                'image_style' => trim((string) ($data['image_style'] ?? 'Cinematic')) ?: 'Cinematic',
-                'use_character_reference' => false,
-            ],
-            'status' => 'draft',
-        ]);
-
-        $rows = [];
-        foreach ($sentences as $idx => $sentence) {
-            $rows[] = [
-                'media_center_project_id' => $project->id,
-                'sentence_index' => $idx + 1,
-                'sentence_text' => $sentence,
-                'tts_text' => $sentence,
-                'created_at' => now(),
-                'updated_at' => now(),
-            ];
-        }
-        MediaCenterSentence::insert($rows);
-
-        return response()->json([
-            'success' => true,
-            'project_id' => $project->id,
-            'redirect_url' => route('media-center.index', ['project_id' => $project->id]),
-        ]);
-    }
-
-    public function updateProject(Request $request, MediaCenterProject $project): JsonResponse
-    {
-        $this->authorizeProject($project);
-
-        $data = $request->validate([
-            'title' => 'nullable|string|max:200',
-            'source_text' => 'required|string|min:20',
-            'language' => 'nullable|string|max:12',
-            'story_era' => 'nullable|string|max:120',
-            'story_genre' => 'nullable|string|max:120',
-            'world_context' => 'nullable|string|max:1000',
-            'forbidden_elements' => 'nullable|string|max:1000',
-            'image_aspect_ratio' => 'nullable|string|in:16:9,9:16,1:1',
-            'image_style' => 'nullable|string|max:120',
-            'rebuild_sentences' => 'nullable|boolean',
-        ]);
-
-        $sourceText = trim((string) $data['source_text']);
-        $rebuild = (bool) ($data['rebuild_sentences'] ?? false);
-        $sourceChanged = $sourceText !== (string) $project->source_text;
-
-        $settings = is_array($project->settings_json) ? $project->settings_json : [];
-        $settings['story_era'] = trim((string) ($data['story_era'] ?? ''));
-        $settings['story_genre'] = trim((string) ($data['story_genre'] ?? ''));
-        $settings['world_context'] = trim((string) ($data['world_context'] ?? ''));
-        $settings['forbidden_elements'] = trim((string) ($data['forbidden_elements'] ?? ''));
-        $settings['image_aspect_ratio'] = trim((string) ($data['image_aspect_ratio'] ?? ($settings['image_aspect_ratio'] ?? '16:9'))) ?: '16:9';
-        $settings['image_style'] = trim((string) ($data['image_style'] ?? ($settings['image_style'] ?? 'Cinematic'))) ?: 'Cinematic';
-
-        $project->forceFill([
-            'title' => trim((string) ($data['title'] ?? '')) ?: $project->title,
-            'source_text' => $sourceText,
-            'language' => trim((string) ($data['language'] ?? 'vi')) ?: 'vi',
-            'settings_json' => $settings,
-        ])->save();
-
-        if ($rebuild && $sourceChanged) {
-            $sentences = $this->splitSentences($sourceText);
-            if (empty($sentences)) {
-                return response()->json([
-                    'success' => false,
-                    'message' => 'Không tách được câu sau khi cập nhật source text.',
-                ], 422);
-            }
-
-            $project->sentences()->delete();
-
-            $rows = [];
-            foreach ($sentences as $idx => $sentence) {
-                $rows[] = [
-                    'media_center_project_id' => $project->id,
-                    'sentence_index' => $idx + 1,
-                    'sentence_text' => $sentence,
-                    'tts_text' => $sentence,
-                    'created_at' => now(),
-                    'updated_at' => now(),
-                ];
-            }
-            MediaCenterSentence::insert($rows);
-
-            $project->forceFill([
-                'status' => 'draft',
-                'main_character_name' => null,
-                'main_character_profile' => null,
-                'characters_json' => null,
-            ])->save();
-
-            $settings = is_array($project->settings_json) ? $project->settings_json : [];
-            foreach ($this->extractMainCharacterReferenceImagePaths($project) as $refPath) {
-                $this->deletePublicStorageFile($refPath);
-            }
-            unset($settings['main_character_reference_images'], $settings['main_character_identity_lock']);
-            $settings['use_character_reference'] = false;
-
-            $project->forceFill([
-                'settings_json' => $settings,
-            ])->save();
-        }
-
-        return response()->json([
-            'success' => true,
-            'project_id' => $project->id,
-            'redirect_url' => route('media-center.index', ['project_id' => $project->id]),
-        ]);
-    }
-
-    public function destroy(MediaCenterProject $project): JsonResponse
-    {
-        $this->authorizeProject($project);
-
-        $projectId = (int) $project->id;
-        $sentences = $project->sentences()->get(['tts_audio_path', 'image_path', 'metadata_json']);
-
-        foreach ($sentences as $sentence) {
-            $this->deletePublicStorageFile((string) ($sentence->tts_audio_path ?? ''));
-
-            foreach ($this->extractImagePathsFromSentence($sentence) as $imagePath) {
-                $this->deletePublicStorageFile($imagePath);
-            }
-        }
-
-        $project->sentences()->delete();
-        $project->delete();
-
-        Storage::disk('public')->deleteDirectory('media_center/' . $projectId);
-
-        return response()->json([
-            'success' => true,
-            'redirect_url' => route('media-center.index'),
-        ]);
+        return $projects;
     }
 
     public function analyze(Request $request, MediaCenterProject $project): JsonResponse
     {
         $this->authorizeProject($project);
 
+        $data = $request->validate([
+            'common_instruction' => 'nullable|string|max:2000',
+        ]);
+
         $total = $project->sentences()->count();
+        $commonInstruction = trim((string) ($data['common_instruction'] ?? ''));
+
+        if ($total <= 0) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Project chưa có câu nào để tạo prompt ảnh.',
+            ], 422);
+        }
+
         $settings = is_array($project->settings_json) ? $project->settings_json : [];
         $settings['analyze'] = [
-            'status' => 'queued',
-            'progress' => 0,
-            'message' => 'Đã đưa vào hàng đợi phân tích...',
+            'status'              => 'queued',
+            'progress'            => 0,
+            'message'             => 'Đã đưa vào hàng đợi, đang chờ xử lý...',
             'processed_sentences' => 0,
-            'total_sentences' => $total,
-            'error' => null,
-            'updated_at' => now()->toIso8601String(),
-            'finished_at' => null,
+            'total_sentences'     => $total,
+            'error'               => null,
+            'mode'                => 'openai_image_prompt_all',
+            'common_instruction'  => $commonInstruction,
+            'updated_at'          => now()->toIso8601String(),
+            'finished_at'         => null,
         ];
 
         $project->forceFill([
-            'status' => 'analyzing',
+            'status'        => 'analyzing',
             'settings_json' => $settings,
         ])->save();
 
@@ -289,8 +349,8 @@ class MediaCenterController extends Controller
 
         return response()->json([
             'success' => true,
-            'queued' => true,
-            'project_id' => $project->id,
+            'queued'  => true,
+            'message' => 'Đã đưa vào hàng đợi. Job đang chạy nền.',
         ]);
     }
 

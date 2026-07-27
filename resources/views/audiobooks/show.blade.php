@@ -118,6 +118,10 @@ ch  @extends('layouts.app')
                                      class="sidebar-menu-btn w-full text-left px-3 py-2 rounded-lg border border-transparent text-sm font-medium text-gray-600 hover:bg-gray-50 hover:text-gray-900 transition">
                                      🚀 Auto Publish
                                  </button>
+                                 <a href="{{ route('audiobooks.video.pipeline.page', $audioBook) }}"
+                                     class="sidebar-menu-btn w-full text-left px-3 py-2 rounded-lg border border-transparent text-sm font-medium text-gray-600 hover:bg-gray-50 hover:text-gray-900 transition block">
+                                     🎬 Video Pipeline (AI)
+                                 </a>
                              </div>
                          </div>
                      </div>
@@ -2728,6 +2732,10 @@ ch  @extends('layouts.app')
                                      class="bg-purple-600 hover:bg-purple-700 text-white font-semibold py-2 px-4 rounded-lg transition duration-200 inline-block">
                                      📄 Xuất TXT
                                  </a>
+                                 <button onclick="openSummaryModal()"
+                                     class="bg-teal-600 hover:bg-teal-700 text-white font-semibold py-2 px-4 rounded-lg transition duration-200">
+                                     🧠 Tóm tắt sách
+                                 </button>
                                  <a href="{{ route('audiobooks.chapters.create', $audioBook) }}"
                                      class="bg-blue-600 hover:bg-blue-700 text-white font-semibold py-2 px-4 rounded-lg transition duration-200">
                                      + Thêm chương
@@ -14936,6 +14944,769 @@ Hệ thống sẽ:
          // Close modal when clicking backdrop
          document.getElementById('findReplaceModal').addEventListener('click', function(e) {
              if (e.target === this) closeFindReplaceModal();
+         });
+     </script>
+
+     <!-- AI Tóm tắt sách Modal -->
+     <div id="summaryModal" class="fixed inset-0 bg-black bg-opacity-50 z-50 flex items-center justify-center p-4"
+         style="display:none !important;">
+         <div class="bg-white rounded-xl shadow-2xl w-full max-w-5xl mx-4 max-h-[90vh] flex flex-col">
+             <div class="flex justify-between items-center px-6 py-4 border-b border-gray-200 flex-shrink-0">
+                 <h3 class="text-lg font-semibold text-gray-800">🧠 Tóm tắt sách bằng AI (Gemini)</h3>
+                 <button onclick="closeSummaryModal()" class="text-gray-400 hover:text-gray-600 text-2xl leading-none">&times;</button>
+             </div>
+
+             <div class="flex gap-2 px-6 pt-4 flex-shrink-0 border-b border-gray-100">
+                 <button id="summaryTabBtn-step1" onclick="switchSummaryTab('step1')"
+                     class="px-4 py-2 rounded-t-lg text-sm font-medium bg-teal-600 text-white">
+                     Bước 1: Cụm sự kiện
+                 </button>
+                 <button id="summaryTabBtn-step2" onclick="switchSummaryTab('step2')"
+                     class="px-4 py-2 rounded-t-lg text-sm font-medium bg-gray-100 text-gray-700">
+                     Bước 2: Timeline
+                 </button>
+                 <button id="summaryTabBtn-step3" onclick="switchSummaryTab('step3')"
+                     class="px-4 py-2 rounded-t-lg text-sm font-medium bg-gray-100 text-gray-700">
+                     Bước 3: Kể lại chuyện
+                 </button>
+             </div>
+
+             <div class="p-6 overflow-y-auto flex-1">
+                 <div id="summaryTab-step1"></div>
+                 <div id="summaryTab-step2" class="hidden"></div>
+                 <div id="summaryTab-step3" class="hidden"></div>
+             </div>
+         </div>
+     </div>
+
+     <script>
+         const summaryUrls = {
+             status: @json(route('audiobooks.summary.status', $audioBook)),
+             start: @json(route('audiobooks.summary.start', $audioBook)),
+             outro: @json(route('audiobooks.summary.outro', $audioBook)),
+             reset: @json(route('audiobooks.summary.reset', $audioBook)),
+             retellsReset: @json(route('audiobooks.summary.retells.reset', $audioBook)),
+             level: @json(route('audiobooks.summary.level', $audioBook)),
+             versionsSave: @json(route('audiobooks.summary.versions.save', $audioBook)),
+             timelineTemplate: @json(route('audiobooks.summary.timeline', [$audioBook, '__IDX__'])),
+             retellTemplate: @json(route('audiobooks.summary.retell', [$audioBook, '__IDX__'])),
+             versionDeleteTemplate: @json(route('audiobooks.summary.versions.delete', [$audioBook, '__VID__'])),
+             timeline(idx) { return this.timelineTemplate.replace('__IDX__', idx); },
+             retell(idx) { return this.retellTemplate.replace('__IDX__', idx); },
+             versionDelete(id) { return this.versionDeleteTemplate.replace('__VID__', id); },
+         };
+
+         const videoPipelineUrl = @json(route('audiobooks.video.pipeline.page', $audioBook));
+         let summaryData = null;
+         let summaryLevels = {};
+         let summaryPollTimer = null;
+         let autoRunState = { step2: false, step3: false };
+         let showLevelPicker = false;
+         const SUMMARY_CHARS_PER_MINUTE = 1000;
+
+         function formatSummaryMinutes(minutes) {
+             const m = Math.max(1, Math.round(minutes));
+             if (m < 60) return `${m} phút`;
+             const h = Math.floor(m / 60);
+             const rem = m % 60;
+             return rem > 0 ? `${h}h${rem}p` : `${h}h`;
+         }
+
+         function escapeHtml(str) {
+             const div = document.createElement('div');
+             div.textContent = str ?? '';
+             return div.innerHTML;
+         }
+
+         function openSummaryModal() {
+             document.getElementById('summaryModal').style.cssText = '';
+             switchSummaryTab('step1');
+             loadSummaryStatus();
+         }
+
+         function closeSummaryModal() {
+             document.getElementById('summaryModal').style.cssText = 'display:none !important;';
+             if (summaryPollTimer) {
+                 clearInterval(summaryPollTimer);
+                 summaryPollTimer = null;
+             }
+             autoRunState.step2 = false;
+             autoRunState.step3 = false;
+         }
+
+         function switchSummaryTab(tab) {
+             ['step1', 'step2', 'step3'].forEach(t => {
+                 document.getElementById('summaryTab-' + t).classList.toggle('hidden', t !== tab);
+                 const btn = document.getElementById('summaryTabBtn-' + t);
+                 btn.classList.toggle('bg-teal-600', t === tab);
+                 btn.classList.toggle('text-white', t === tab);
+                 btn.classList.toggle('bg-gray-100', t !== tab);
+                 btn.classList.toggle('text-gray-700', t !== tab);
+             });
+         }
+
+         async function loadSummaryStatus() {
+             try {
+                 const resp = await fetch(summaryUrls.status, { headers: { 'Accept': 'application/json' } });
+                 const data = await safeJson(resp);
+                 summaryData = data.summary;
+                 if (data.levels) summaryLevels = data.levels;
+             } catch (e) {
+                 summaryData = null;
+             }
+
+             renderSummaryAll();
+
+             const isRunning = summaryData && ['queued', 'clustering', 'consolidating'].includes(summaryData.status);
+             if (isRunning && !summaryPollTimer) {
+                 summaryPollTimer = setInterval(loadSummaryStatus, 3000);
+             } else if (!isRunning && summaryPollTimer) {
+                 clearInterval(summaryPollTimer);
+                 summaryPollTimer = null;
+             }
+         }
+
+         function renderSummaryAll() {
+             renderSummaryStep1();
+             renderSummaryStep2();
+             renderSummaryStep3();
+         }
+
+         function renderClustersList(clusters) {
+             return clusters.map(c => `
+                <div class="border border-gray-200 rounded-lg mb-3 overflow-hidden">
+                    <button type="button" onclick="this.nextElementSibling.classList.toggle('hidden')"
+                        class="w-full text-left px-4 py-3 bg-gray-50 hover:bg-gray-100 flex justify-between items-center">
+                        <span class="font-medium text-gray-800">Cụm ${c.index}: ${escapeHtml(c.title)}</span>
+                        <span class="text-xs text-gray-400 flex-shrink-0 ml-3">${(c.content || '').length} ký tự</span>
+                    </button>
+                    <div class="hidden px-4 py-3 text-sm text-gray-700 whitespace-pre-line max-h-64 overflow-y-auto border-t border-gray-100">${escapeHtml(c.content)}</div>
+                </div>`).join('');
+         }
+
+         function renderSummaryStep1() {
+             const el = document.getElementById('summaryTab-step1');
+             const status = summaryData ? summaryData.status : null;
+
+             if (!status || status === 'idle') {
+                 el.innerHTML = `
+                    <div class="text-center py-10">
+                        <p class="text-gray-600 mb-4">AI sẽ đọc toàn bộ nội dung các chương và chia thành các cụm sự kiện theo đúng thứ tự xuất hiện.</p>
+                        <button onclick="startSummaryGeneration()" class="bg-teal-600 hover:bg-teal-700 text-white font-semibold py-2 px-6 rounded-lg">🚀 Bắt đầu tóm tắt</button>
+                    </div>`;
+                 return;
+             }
+
+             if (status === 'queued' || status === 'clustering') {
+                 const total = summaryData.total_batches || 0;
+                 const done = summaryData.processed_batches || 0;
+                 const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+                 el.innerHTML = `
+                    <div class="py-4">
+                        <p class="text-gray-700 mb-2">⏳ Đang chia cụm sự kiện chi tiết... (${done}/${total || '?'} phần)</p>
+                        <div class="w-full bg-gray-200 rounded-full h-3 mb-4"><div class="bg-teal-500 h-3 rounded-full transition-all" style="width:${pct}%"></div></div>
+                        ${summaryData.clusters && summaryData.clusters.length ? renderClustersList(summaryData.clusters) : ''}
+                    </div>`;
+                 return;
+             }
+
+             if (status === 'consolidating') {
+                 el.innerHTML = `
+                    <div class="py-4">
+                        <p class="text-gray-700 mb-2">🧩 Đang gom nhóm thành các cụm thông tin chính...</p>
+                        <div class="w-full bg-gray-200 rounded-full h-3 mb-4 overflow-hidden"><div class="bg-teal-500 h-3 animate-pulse" style="width:100%"></div></div>
+                    </div>`;
+                 return;
+             }
+
+             if (status === 'failed') {
+                 el.innerHTML = `
+                    <div class="p-4 bg-red-50 border border-red-300 rounded-lg text-red-700 mb-4">❌ ${escapeHtml(summaryData.error_message || 'Có lỗi xảy ra')}</div>
+                    <button onclick="startSummaryGeneration()" class="bg-teal-600 hover:bg-teal-700 text-white font-semibold py-2 px-6 rounded-lg">🔁 Thử lại</button>`;
+                 return;
+             }
+
+             const clusters = summaryData.clusters || [];
+             el.innerHTML = `
+                <div class="flex justify-between items-center mb-4">
+                    <p class="text-sm text-gray-600">✅ Đã gom thành <strong>${clusters.length}</strong> cụm thông tin chính.</p>
+                    <button onclick="resetSummary()" class="text-sm text-red-600 hover:underline">↺ Tóm tắt lại từ đầu</button>
+                </div>
+                ${renderClustersList(clusters)}`;
+         }
+
+         async function startSummaryGeneration() {
+             const el = document.getElementById('summaryTab-step1');
+             el.innerHTML = '<div class="text-center py-10 text-gray-500">⏳ Đang khởi tạo...</div>';
+             try {
+                 const resp = await fetch(summaryUrls.start, {
+                     method: 'POST',
+                     headers: { 'Accept': 'application/json', 'X-CSRF-TOKEN': getCsrfToken() }
+                 });
+                 await safeJson(resp);
+                 await loadSummaryStatus();
+             } catch (e) {
+                 alert('Lỗi: ' + e.message);
+                 await loadSummaryStatus();
+             }
+         }
+
+         async function resetSummary() {
+             if (!confirm('Xóa toàn bộ kết quả tóm tắt hiện tại (cả 3 bước) và bắt đầu lại từ đầu?')) return;
+             try {
+                 const resp = await fetch(summaryUrls.reset, {
+                     method: 'DELETE',
+                     headers: { 'Accept': 'application/json', 'X-CSRF-TOKEN': getCsrfToken() }
+                 });
+                 await safeJson(resp);
+                 summaryData = null;
+                 renderSummaryAll();
+             } catch (e) {
+                 alert('Lỗi: ' + e.message);
+             }
+         }
+
+         async function resetRetells() {
+             if (!confirm('Xóa nội dung Bước 3 (kể lại chuyện + outro) hiện tại và làm lại từ cụm đầu tiên? Bước 1 (cụm) và Bước 2 (timeline) sẽ được giữ nguyên.')) return;
+             try {
+                 const resp = await fetch(summaryUrls.retellsReset, {
+                     method: 'DELETE',
+                     headers: { 'Accept': 'application/json', 'X-CSRF-TOKEN': getCsrfToken() }
+                 });
+                 await safeJson(resp);
+                 await loadSummaryStatus();
+                 switchSummaryTab('step3');
+             } catch (e) {
+                 alert('Lỗi: ' + e.message);
+             }
+         }
+
+         function importanceBadgeClass(level) {
+             if (level === 'Bắt buộc giữ') return 'bg-red-100 text-red-700';
+             if (level === 'Có thể rút gọn') return 'bg-amber-100 text-amber-700';
+             return 'bg-gray-100 text-gray-600';
+         }
+
+         function renderTimelineCard(cluster, rows) {
+             const rowsHtml = rows.map(r => `
+                <tr class="border-b border-gray-100 align-top">
+                    <td class="px-3 py-2 text-sm text-gray-600">${r.stt}</td>
+                    <td class="px-3 py-2 text-sm text-gray-800">${escapeHtml(r.characters)}</td>
+                    <td class="px-3 py-2 text-sm text-gray-800">${escapeHtml(r.event)}</td>
+                    <td class="px-3 py-2 text-sm text-gray-800">${escapeHtml(r.incident)}</td>
+                    <td class="px-3 py-2 text-sm text-gray-800">${escapeHtml(r.consequence)}</td>
+                    <td class="px-3 py-2 text-sm"><span class="px-2 py-0.5 rounded-full text-xs font-medium whitespace-nowrap ${importanceBadgeClass(r.importance)}">${escapeHtml(r.importance)}</span></td>
+                </tr>`).join('');
+
+             return `
+                <div class="border border-gray-200 rounded-lg mb-4 overflow-hidden">
+                    <div class="px-4 py-3 bg-gray-50 font-medium text-gray-800">Cụm ${cluster.index}: ${escapeHtml(cluster.title)}</div>
+                    <div class="overflow-x-auto">
+                        <table class="w-full text-left border-collapse">
+                            <thead class="bg-gray-50 text-xs text-gray-500 uppercase">
+                                <tr>
+                                    <th class="px-3 py-2">STT</th>
+                                    <th class="px-3 py-2">Nhân vật</th>
+                                    <th class="px-3 py-2">Sự kiện</th>
+                                    <th class="px-3 py-2">Biến cố</th>
+                                    <th class="px-3 py-2">Hệ quả</th>
+                                    <th class="px-3 py-2">Mức độ</th>
+                                </tr>
+                            </thead>
+                            <tbody>${rowsHtml}</tbody>
+                        </table>
+                    </div>
+                </div>`;
+         }
+
+         function renderSummaryStep2() {
+             const el = document.getElementById('summaryTab-step2');
+             const clusters = (summaryData && summaryData.clusters) || [];
+
+             if (!clusters.length) {
+                 el.innerHTML = '<div class="text-center py-10 text-gray-500">Hãy hoàn thành Bước 1 (chia cụm sự kiện) trước.</div>';
+                 return;
+             }
+
+             const timelines = (summaryData && summaryData.timelines) || {};
+             let html = '';
+             let nextIndex = null;
+
+             clusters.forEach(c => {
+                 const rows = timelines[String(c.index)];
+                 if (rows) {
+                     html += renderTimelineCard(c, rows);
+                 } else if (nextIndex === null) {
+                     nextIndex = c.index;
+                 }
+             });
+
+             if (nextIndex !== null) {
+                 if (autoRunState.step2) {
+                     html += `
+                        <div class="text-center py-6">
+                            <p class="text-sm text-gray-500 mb-2">⏳ Đang tự động tạo timeline cho cụm ${nextIndex}...</p>
+                            <button onclick="stopAutoRunTimelines()" class="bg-red-100 hover:bg-red-200 text-red-700 font-semibold py-2 px-6 rounded-lg text-sm">⏹ Dừng lại</button>
+                        </div>`;
+                 } else {
+                     html += `
+                        <div class="text-center py-6 flex justify-center gap-3">
+                            <button onclick="generateClusterTimeline(${nextIndex})" id="genTimelineBtn"
+                                class="bg-teal-600 hover:bg-teal-700 text-white font-semibold py-2 px-6 rounded-lg">
+                                ▶️ Tạo timeline cho cụm ${nextIndex}
+                            </button>
+                            <button onclick="autoRunTimelines()" id="autoTimelineBtn"
+                                class="bg-gray-100 hover:bg-gray-200 text-gray-700 font-semibold py-2 px-6 rounded-lg">
+                                ⏩ Chạy tự động đến hết
+                            </button>
+                        </div>`;
+                 }
+             } else {
+                 html += '<div class="text-center py-4 text-green-700 text-sm">✅ Đã tạo timeline cho toàn bộ các cụm.</div>';
+             }
+
+             el.innerHTML = html;
+         }
+
+         async function callTimelineApi(index) {
+             const resp = await fetch(summaryUrls.timeline(index), {
+                 method: 'POST',
+                 headers: { 'Accept': 'application/json', 'X-CSRF-TOKEN': getCsrfToken() }
+             });
+             return safeJson(resp);
+         }
+
+         async function generateClusterTimeline(index) {
+             const btn = document.getElementById('genTimelineBtn');
+             const autoBtn = document.getElementById('autoTimelineBtn');
+             if (btn) { btn.disabled = true; btn.textContent = '⏳ Đang tạo timeline...'; }
+             if (autoBtn) { autoBtn.disabled = true; }
+             try {
+                 await callTimelineApi(index);
+                 await loadSummaryStatus();
+             } catch (e) {
+                 alert('Lỗi: ' + e.message);
+                 if (btn) { btn.disabled = false; btn.textContent = `▶️ Tạo timeline cho cụm ${index}`; }
+                 if (autoBtn) { autoBtn.disabled = false; }
+             }
+         }
+
+         async function autoRunTimelines() {
+             autoRunState.step2 = true;
+             renderSummaryStep2();
+
+             while (autoRunState.step2) {
+                 const clusters = (summaryData && summaryData.clusters) || [];
+                 const timelines = (summaryData && summaryData.timelines) || {};
+                 const next = clusters.find(c => !timelines[String(c.index)]);
+                 if (!next) break;
+
+                 try {
+                     await callTimelineApi(next.index);
+                     await loadSummaryStatus();
+                 } catch (e) {
+                     alert('Lỗi khi tạo timeline cho cụm ' + next.index + ': ' + e.message);
+                     break;
+                 }
+             }
+
+             autoRunState.step2 = false;
+             renderSummaryStep2();
+         }
+
+         function stopAutoRunTimelines() {
+             autoRunState.step2 = false;
+         }
+
+         function renderLevelPicker(originalChars) {
+             const currentLevel = summaryData ? summaryData.target_level : null;
+             const keys = Object.keys(summaryLevels);
+             if (!keys.length) return '';
+
+             const cards = keys.map(key => {
+                 const lv = summaryLevels[key];
+                 const minChars = Math.round(originalChars * lv.min);
+                 const maxChars = Math.round(originalChars * lv.max);
+                 const minMinutes = minChars / SUMMARY_CHARS_PER_MINUTE;
+                 const maxMinutes = maxChars / SUMMARY_CHARS_PER_MINUTE;
+                 const isActive = currentLevel === key;
+                 return `
+                    <button type="button" onclick="chooseSummaryLevel('${key}')"
+                        class="text-left border rounded-lg p-3 transition ${isActive ? 'border-teal-500 bg-teal-50 ring-2 ring-teal-200' : 'border-gray-200 hover:border-teal-300 hover:bg-gray-50'}">
+                        <div class="font-medium text-gray-800 text-sm">${escapeHtml(lv.label)}${isActive ? ' ✓' : ''}</div>
+                        <div class="text-xs text-gray-500 mt-1">Tỷ lệ: ${Math.round(lv.min * 100)}-${Math.round(lv.max * 100)}% bản gốc</div>
+                        <div class="text-xs text-gray-500">~ ${minChars.toLocaleString('vi-VN')}-${maxChars.toLocaleString('vi-VN')} ký tự</div>
+                        <div class="text-xs text-teal-600 font-medium mt-1">⏱ ${formatSummaryMinutes(minMinutes)} - ${formatSummaryMinutes(maxMinutes)}</div>
+                    </button>`;
+             }).join('');
+
+             return `
+                <div class="mb-6">
+                    <p class="text-sm text-gray-700 mb-3">Chọn mức độ rút gọn cho Bước 3 (ước tính dựa trên ${originalChars.toLocaleString('vi-VN')} ký tự tài liệu gốc):</p>
+                    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">${cards}</div>
+                </div>`;
+         }
+
+         async function chooseSummaryLevel(key) {
+             const hasProgress = summaryData && summaryData.retells && Object.keys(summaryData.retells).length > 0;
+             if (hasProgress && summaryData.target_level !== key) {
+                 if (!confirm('Đổi mức tóm tắt sẽ xóa nội dung Bước 3 hiện tại (nếu chưa lưu thành phiên bản sẽ mất). Tiếp tục?')) return;
+             }
+             try {
+                 const resp = await fetch(summaryUrls.level, {
+                     method: 'POST',
+                     headers: { 'Accept': 'application/json', 'Content-Type': 'application/json', 'X-CSRF-TOKEN': getCsrfToken() },
+                     body: JSON.stringify({ level: key })
+                 });
+                 await safeJson(resp);
+                 showLevelPicker = false;
+                 await loadSummaryStatus();
+             } catch (e) {
+                 alert('Lỗi: ' + e.message);
+             }
+         }
+
+         function toggleLevelPicker() {
+             showLevelPicker = !showLevelPicker;
+             renderSummaryStep3();
+         }
+
+         function renderVersionsList() {
+             const versions = (summaryData && summaryData.versions) || [];
+             if (!versions.length) return '';
+
+             const rows = versions.map(v => {
+                 const totalLen = Object.values(v.retells || {}).reduce((s, t) => s + (t ? t.length : 0), 0) + ((v.outro || '').length);
+                 const created = v.created_at ? new Date(v.created_at).toLocaleString('vi-VN') : '';
+                 return `
+                    <div class="flex justify-between items-center border border-gray-200 rounded-lg px-4 py-3 mb-2">
+                        <div>
+                            <div class="font-medium text-gray-800 text-sm">${escapeHtml(v.label)}</div>
+                            <div class="text-xs text-gray-500">${totalLen.toLocaleString('vi-VN')} ký tự · ${created}</div>
+                        </div>
+                        <div class="flex gap-2 flex-shrink-0">
+                            <button type="button" onclick="copySummaryVersion('${v.id}', this)"
+                                class="text-xs bg-white border border-gray-300 hover:bg-gray-100 text-gray-600 font-medium py-1.5 px-3 rounded-lg">
+                                📋 Copy
+                            </button>
+                            <button type="button" onclick="deleteSummaryVersion('${v.id}')"
+                                class="text-xs bg-white border border-red-300 hover:bg-red-50 text-red-600 font-medium py-1.5 px-3 rounded-lg">
+                                🗑️ Xóa
+                            </button>
+                        </div>
+                    </div>`;
+             }).join('');
+
+             return `
+                <div class="mt-8 pt-6 border-t border-gray-200">
+                    <h4 class="text-sm font-semibold text-gray-700 mb-3">📚 Các phiên bản đã lưu (${versions.length})</h4>
+                    ${rows}
+                    <a href="${videoPipelineUrl}" class="mt-3 inline-block text-sm bg-purple-600 hover:bg-purple-700 text-white font-medium py-2 px-4 rounded-lg">
+                        🎬 Dùng kịch bản này cho Video Pipeline (AI) →
+                    </a>
+                </div>`;
+         }
+
+         async function saveCurrentVersion() {
+             const defaultLabel = (summaryData && summaryLevels[summaryData.target_level]) ? summaryLevels[summaryData.target_level].label : 'Phiên bản';
+             const label = prompt('Đặt tên cho phiên bản này:', defaultLabel);
+             if (label === null) return;
+             try {
+                 const resp = await fetch(summaryUrls.versionsSave, {
+                     method: 'POST',
+                     headers: { 'Accept': 'application/json', 'Content-Type': 'application/json', 'X-CSRF-TOKEN': getCsrfToken() },
+                     body: JSON.stringify({ label })
+                 });
+                 await safeJson(resp);
+                 await loadSummaryStatus();
+             } catch (e) {
+                 alert('Lỗi: ' + e.message);
+             }
+         }
+
+         function copySummaryVersion(id, btn) {
+             const versions = (summaryData && summaryData.versions) || [];
+             const v = versions.find(x => x.id === id);
+             if (!v) return;
+             const clusters = (summaryData && summaryData.clusters) || [];
+             const parts = [];
+             clusters.forEach(c => {
+                 const t = v.retells && v.retells[String(c.index)];
+                 if (t) parts.push(t);
+             });
+             if (v.outro) parts.push(v.outro);
+             if (!parts.length) return;
+             copyTextToClipboard(parts.join('\n\n'), btn);
+         }
+
+         async function deleteSummaryVersion(id) {
+             if (!confirm('Xóa phiên bản này?')) return;
+             try {
+                 const resp = await fetch(summaryUrls.versionDelete(id), {
+                     method: 'DELETE',
+                     headers: { 'Accept': 'application/json', 'X-CSRF-TOKEN': getCsrfToken() }
+                 });
+                 await safeJson(resp);
+                 await loadSummaryStatus();
+             } catch (e) {
+                 alert('Lỗi: ' + e.message);
+             }
+         }
+
+         function renderSummaryStep3() {
+             const el = document.getElementById('summaryTab-step3');
+             const clusters = (summaryData && summaryData.clusters) || [];
+
+             if (!clusters.length) {
+                 el.innerHTML = '<div class="text-center py-10 text-gray-500">Hãy hoàn thành Bước 1 và Bước 2 trước.</div>';
+                 return;
+             }
+
+             const totalOriginalCharsAll = clusters.reduce((s, c) => s + (c.content || '').length, 0);
+
+             if (!summaryData.target_level || showLevelPicker) {
+                 el.innerHTML = renderLevelPicker(totalOriginalCharsAll);
+                 return;
+             }
+
+             const timelines = (summaryData && summaryData.timelines) || {};
+             const retells = (summaryData && summaryData.retells) || {};
+             const currentLevelInfo = summaryLevels[summaryData.target_level];
+             let html = currentLevelInfo
+                ? `<div class="mb-4 flex justify-between items-center gap-3 text-sm">
+                        <span class="text-gray-600">🎚 Mức: <strong>${escapeHtml(currentLevelInfo.label)}</strong> (${Math.round(currentLevelInfo.min * 100)}-${Math.round(currentLevelInfo.max * 100)}% gốc)</span>
+                        <button type="button" onclick="toggleLevelPicker()" class="text-xs text-teal-600 hover:underline flex-shrink-0">Đổi mức</button>
+                   </div>`
+                : '';
+             let nextIndex = null;
+             let totalChars = 0;
+             let totalOriginalChars = 0;
+
+             clusters.forEach(c => {
+                 const originalLen = (c.content || '').length;
+                 totalOriginalChars += originalLen;
+                 const text = retells[String(c.index)];
+                 if (text) {
+                     totalChars += text.length;
+                     const clusterPct = originalLen > 0 ? ((text.length / originalLen) * 100).toFixed(0) : null;
+                     html += `
+                        <div class="border border-gray-200 rounded-lg mb-4 overflow-hidden">
+                            <div class="px-4 py-3 bg-gray-50 font-medium text-gray-800 flex justify-between items-center gap-3">
+                                <span>Cụm ${c.index}: ${escapeHtml(c.title)}</span>
+                                <span class="flex items-center gap-2 flex-shrink-0">
+                                    <span class="text-xs text-gray-400">${text.length.toLocaleString('vi-VN')} ký tự${clusterPct !== null ? ` (${clusterPct}% gốc)` : ''}</span>
+                                    <button type="button" onclick="copyClusterRetell(${c.index}, this)"
+                                        class="text-xs bg-white border border-gray-300 hover:bg-gray-100 text-gray-600 font-medium py-1 px-2 rounded">
+                                        📋 Copy
+                                    </button>
+                                </span>
+                            </div>
+                            <div class="px-4 py-3 text-sm text-gray-800 whitespace-pre-line leading-relaxed">${escapeHtml(text)}</div>
+                        </div>`;
+                 } else if (nextIndex === null) {
+                     nextIndex = c.index;
+                 }
+             });
+
+             if (summaryData.outro) {
+                 totalChars += summaryData.outro.length;
+             }
+
+             if (totalChars > 0) {
+                 const overallPct = totalOriginalChars > 0 ? ((totalChars / totalOriginalChars) * 100).toFixed(1) : null;
+                 html = `<div class="mb-4 px-4 py-2 bg-teal-50 border border-teal-200 rounded-lg text-sm text-teal-800 flex justify-between items-center gap-3">
+                            <span>📝 Tổng số ký tự toàn bài viết: <strong>${totalChars.toLocaleString('vi-VN')}</strong>${overallPct !== null ? ` <span class="text-teal-600">(${overallPct}% so với tài liệu gốc: ${totalOriginalChars.toLocaleString('vi-VN')} ký tự)</span>` : ''}</span>
+                            <span class="flex items-center gap-2 flex-shrink-0">
+                                <button type="button" onclick="saveCurrentVersion()"
+                                    class="text-xs bg-white border border-teal-300 hover:bg-teal-100 text-teal-700 font-medium py-1.5 px-3 rounded-lg">
+                                    💾 Lưu phiên bản
+                                </button>
+                                <button type="button" onclick="copyAllRetells(this)"
+                                    class="text-xs bg-teal-600 hover:bg-teal-700 text-white font-medium py-1.5 px-3 rounded-lg">
+                                    📋 Copy toàn bộ
+                                </button>
+                                <button type="button" onclick="resetRetells()"
+                                    class="text-xs bg-white border border-red-300 hover:bg-red-50 text-red-600 font-medium py-1.5 px-3 rounded-lg">
+                                    ↺ Làm lại Bước 3
+                                </button>
+                            </span>
+                        </div>` + html;
+             }
+
+             if (nextIndex !== null) {
+                 const hasTimeline = !!timelines[String(nextIndex)];
+                 if (autoRunState.step3) {
+                     html += `
+                        <div class="text-center py-6">
+                            <p class="text-sm text-gray-500 mb-2">⏳ Đang tự động kể chuyện cho cụm ${nextIndex}...</p>
+                            <button onclick="stopAutoRunRetells()" class="bg-red-100 hover:bg-red-200 text-red-700 font-semibold py-2 px-6 rounded-lg text-sm">⏹ Dừng lại</button>
+                        </div>`;
+                 } else if (hasTimeline) {
+                     html += `
+                        <div class="text-center py-6 flex justify-center gap-3">
+                            <button onclick="generateClusterRetell(${nextIndex})" id="genRetellBtn"
+                                class="bg-teal-600 hover:bg-teal-700 text-white font-semibold py-2 px-6 rounded-lg">
+                                ▶️ Kể tiếp cho cụm ${nextIndex}
+                            </button>
+                            <button onclick="autoRunRetells()" id="autoRetellBtn"
+                                class="bg-gray-100 hover:bg-gray-200 text-gray-700 font-semibold py-2 px-6 rounded-lg">
+                                ⏩ Chạy tự động đến hết
+                            </button>
+                        </div>`;
+                 } else {
+                     html += `<div class="text-center py-6 text-gray-500 text-sm">Cần tạo timeline cho cụm ${nextIndex} ở Bước 2 trước khi kể chuyện.</div>`;
+                 }
+             } else {
+                 if (summaryData.outro) {
+                     html += `
+                        <div class="border border-teal-200 rounded-lg mb-4 overflow-hidden">
+                            <div class="px-4 py-3 bg-teal-50 font-medium text-teal-800 flex justify-between items-center gap-3">
+                                <span>🎬 Outro</span>
+                                <span class="flex items-center gap-2 flex-shrink-0">
+                                    <span class="text-xs text-teal-600">${summaryData.outro.length.toLocaleString('vi-VN')} ký tự</span>
+                                    <button type="button" onclick="copyOutro(this)"
+                                        class="text-xs bg-white border border-teal-300 hover:bg-teal-100 text-teal-700 font-medium py-1 px-2 rounded">
+                                        📋 Copy
+                                    </button>
+                                </span>
+                            </div>
+                            <div class="px-4 py-3 text-sm text-gray-800 whitespace-pre-line leading-relaxed">${escapeHtml(summaryData.outro)}</div>
+                        </div>`;
+                 } else {
+                     html += `
+                        <div class="text-center py-6">
+                            <p class="text-sm text-gray-600 mb-3">✅ Đã kể xong toàn bộ các cụm sự kiện.</p>
+                            <button onclick="generateSummaryOutro()" id="genOutroBtn" class="bg-teal-600 hover:bg-teal-700 text-white font-semibold py-2 px-6 rounded-lg">🎬 Tạo Outro cho phim</button>
+                        </div>`;
+                 }
+             }
+
+             html += renderVersionsList();
+
+             el.innerHTML = html;
+         }
+
+         async function callRetellApi(index) {
+             const resp = await fetch(summaryUrls.retell(index), {
+                 method: 'POST',
+                 headers: { 'Accept': 'application/json', 'X-CSRF-TOKEN': getCsrfToken() }
+             });
+             return safeJson(resp);
+         }
+
+         async function generateClusterRetell(index) {
+             const btn = document.getElementById('genRetellBtn');
+             const autoBtn = document.getElementById('autoRetellBtn');
+             if (btn) { btn.disabled = true; btn.textContent = '⏳ Đang kể chuyện...'; }
+             if (autoBtn) { autoBtn.disabled = true; }
+             try {
+                 await callRetellApi(index);
+                 await loadSummaryStatus();
+             } catch (e) {
+                 alert('Lỗi: ' + e.message);
+                 if (btn) { btn.disabled = false; btn.textContent = `▶️ Kể tiếp cho cụm ${index}`; }
+                 if (autoBtn) { autoBtn.disabled = false; }
+             }
+         }
+
+         async function autoRunRetells() {
+             autoRunState.step3 = true;
+             renderSummaryStep3();
+
+             while (autoRunState.step3) {
+                 const clusters = (summaryData && summaryData.clusters) || [];
+                 const timelines = (summaryData && summaryData.timelines) || {};
+                 const retells = (summaryData && summaryData.retells) || {};
+                 const next = clusters.find(c => !retells[String(c.index)]);
+                 if (!next) break;
+                 if (!timelines[String(next.index)]) break; // needs Bước 2 first — stop quietly
+
+                 try {
+                     await callRetellApi(next.index);
+                     await loadSummaryStatus();
+                 } catch (e) {
+                     alert('Lỗi khi kể chuyện cho cụm ' + next.index + ': ' + e.message);
+                     break;
+                 }
+             }
+
+             autoRunState.step3 = false;
+             renderSummaryStep3();
+         }
+
+         function stopAutoRunRetells() {
+             autoRunState.step3 = false;
+         }
+
+         async function copyTextToClipboard(text, btn) {
+             const originalHtml = btn ? btn.innerHTML : null;
+             try {
+                 await navigator.clipboard.writeText(text);
+             } catch (e) {
+                 const tmp = document.createElement('textarea');
+                 tmp.value = text;
+                 tmp.style.position = 'fixed';
+                 tmp.style.opacity = '0';
+                 document.body.appendChild(tmp);
+                 tmp.select();
+                 document.execCommand('copy');
+                 document.body.removeChild(tmp);
+             }
+             if (btn) {
+                 btn.innerHTML = '✅ Đã copy';
+                 setTimeout(() => { btn.innerHTML = originalHtml; }, 1500);
+             }
+         }
+
+         function copyClusterRetell(index, btn) {
+             const text = (summaryData && summaryData.retells && summaryData.retells[String(index)]) || '';
+             if (!text) return;
+             copyTextToClipboard(text, btn);
+         }
+
+         function copyOutro(btn) {
+             const text = (summaryData && summaryData.outro) || '';
+             if (!text) return;
+             copyTextToClipboard(text, btn);
+         }
+
+         function copyAllRetells(btn) {
+             const clusters = (summaryData && summaryData.clusters) || [];
+             const retells = (summaryData && summaryData.retells) || {};
+             const parts = [];
+
+             clusters.forEach(c => {
+                 const text = retells[String(c.index)];
+                 if (text) parts.push(text);
+             });
+
+             if (summaryData && summaryData.outro) {
+                 parts.push(summaryData.outro);
+             }
+
+             const fullText = parts.join('\n\n');
+             if (!fullText) return;
+             copyTextToClipboard(fullText, btn);
+         }
+
+         async function generateSummaryOutro() {
+             const btn = document.getElementById('genOutroBtn');
+             if (btn) { btn.disabled = true; btn.textContent = '⏳ Đang tạo outro...'; }
+             try {
+                 const resp = await fetch(summaryUrls.outro, {
+                     method: 'POST',
+                     headers: { 'Accept': 'application/json', 'X-CSRF-TOKEN': getCsrfToken() }
+                 });
+                 await safeJson(resp);
+                 await loadSummaryStatus();
+             } catch (e) {
+                 alert('Lỗi: ' + e.message);
+                 if (btn) { btn.disabled = false; btn.textContent = '🎬 Tạo Outro cho phim'; }
+             }
+         }
+
+         document.getElementById('summaryModal').addEventListener('click', function(e) {
+             if (e.target === this) closeSummaryModal();
          });
      </script>
 

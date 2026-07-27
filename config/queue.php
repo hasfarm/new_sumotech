@@ -38,7 +38,12 @@ return [
             'driver' => 'database',
             'table' => 'jobs',
             'queue' => 'default',
-            'retry_after' => 90,
+            // Was 90s — far shorter than several real jobs in this app (AI video-pipeline
+            // analysis has run 500s+). Laravel considers a job "lost" and lets a SECOND
+            // worker grab it once retry_after elapses, even while the first worker is still
+            // legitimately processing it — this caused a real duplicate-processing incident.
+            // Must stay comfortably above every job's own $timeout.
+            'retry_after' => (int) env('QUEUE_RETRY_AFTER', 3700),
             'after_commit' => false,
         ],
 

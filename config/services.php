@@ -41,6 +41,7 @@ return [
     'openai' => [
         'api_key' => env('OPENAI_API_KEY'),
         'base_url' => env('OPENAI_BASE_URL', 'https://api.openai.com/v1'),
+        'chat_model' => env('OPENAI_CHAT_MODEL', 'gpt-4o-mini'),
         'embedding_model' => env('OPENAI_EMBEDDING_MODEL', 'text-embedding-3-small'),
     ],
 
@@ -48,6 +49,7 @@ return [
         'url' => env('QDRANT_URL', 'http://127.0.0.1:6333'),
         'api_key' => env('QDRANT_API_KEY'),
         'collection' => env('QDRANT_COLLECTION', 'audiobook_chapter_chunks'),
+        'asset_collection' => env('QDRANT_ASSET_COLLECTION', 'video_asset_library'),
         'distance' => env('QDRANT_DISTANCE', 'Cosine'),
         'timeout' => (int) env('QDRANT_TIMEOUT', 30),
         'openai_timeout' => (int) env('QDRANT_OPENAI_TIMEOUT', 60),
@@ -65,6 +67,44 @@ return [
     'gemini' => [
         'api_key' => env('GEMINI_API_KEY'),
         'tts_api_key' => env('GEMINI_TTS_API_KEY'),
+        // gemini-2.5-flash-lite (what the user originally asked about) returns 404 "no longer
+        // available to new users" on this API key — 3.5 is the current accessible lite tier.
+        'transcription_model' => env('GEMINI_TRANSCRIPTION_MODEL', 'gemini-3.5-flash-lite'),
+    ],
+
+    'transcription' => [
+        // 'whisper' (OpenAI) or 'gemini' — lets you A/B compare quality without code changes.
+        'provider' => env('TRANSCRIPTION_PROVIDER', 'whisper'),
+    ],
+
+    'claude' => [
+        'api_key' => env('CLAUDE_API_KEY'),
+        'model' => env('CLAUDE_MODEL', 'claude-sonnet-5'),
+    ],
+
+    'flux' => [
+        'api_key' => env('FLUX_API_KEY'),
+        'base_url' => env('FLUX_BASE_URL', 'https://api.bfl.ai'),
+        'model' => env('FLUX_MODEL', 'flux-2-klein-9b'),
+    ],
+
+    'stock_sources' => [
+        'pexels' => [
+            'api_key' => env('PEXELS_API_KEY'),
+        ],
+        'pixabay' => [
+            'api_key' => env('PIXABAY_API_KEY'),
+        ],
+        'smithsonian' => [
+            'api_key' => env('SMITHSONIAN_API_KEY'),
+        ],
+    ],
+
+    'grok' => [
+        'api_key' => env('GROK_API_KEY'),
+        'base_url' => env('GROK_BASE_URL', 'https://api.x.ai/v1'),
+        'model' => env('GROK_MODEL', ''),
+        'image_model' => env('GROK_IMAGE_MODEL', 'grok-imagine-image'),
     ],
 
     'aiml' => [

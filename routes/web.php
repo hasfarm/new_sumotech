@@ -10,6 +10,8 @@ use App\Http\Controllers\YoutubeChannelContentController;
 use App\Http\Controllers\ApiUsageController;
 use App\Http\Controllers\AudioBookController;
 use App\Http\Controllers\AudioBookChapterController;
+use App\Http\Controllers\AudioBookSummaryController;
+use App\Http\Controllers\AudioBookVideoPipelineController;
 use App\Http\Controllers\BookInsightStudioController;
 use App\Http\Controllers\MediaCenterController;
 use App\Http\Controllers\AutomationReportController;
@@ -136,6 +138,8 @@ Route::middleware('auth')->prefix('automation-reports')->name('automation-report
 
 Route::middleware('auth')->prefix('media-center')->name('media-center.')->group(function () {
     Route::get('/', [MediaCenterController::class, 'index'])->name('index');
+    Route::get('/create', [MediaCenterController::class, 'create'])->name('create');
+    Route::get('/{project}/edit', [MediaCenterController::class, 'edit'])->name('edit');
     Route::post('/projects', [MediaCenterController::class, 'store'])->name('projects.store');
     Route::put('/projects/{project}', [MediaCenterController::class, 'updateProject'])->name('projects.update');
     Route::delete('/projects/{project}', [MediaCenterController::class, 'destroy'])->name('projects.destroy');
@@ -166,6 +170,7 @@ Route::middleware('auth')->prefix('media-center')->name('media-center.')->group(
     Route::delete('/projects/{project}/sentences/{sentence}/animations', [MediaCenterController::class, 'deleteSentenceAnimation'])->name('projects.sentences.animations.delete');
     Route::post('/projects/{project}/download-all-assets', [MediaCenterController::class, 'downloadAllSentenceAssets'])->name('projects.download.all.assets');
     Route::post('/projects/{project}/generate-all', [MediaCenterController::class, 'generateAll'])->name('projects.generate.all');
+    Route::get('/{project}', [MediaCenterController::class, 'show'])->name('show');
 });
 
 // AudioBooks CRUD Routes
@@ -324,11 +329,43 @@ Route::middleware('auth')->prefix('audiobooks')->name('audiobooks.')->group(func
     Route::post('{audioBook}/chapters/boost-audio/batch', [AudioBookChapterController::class, 'boostAudioBatch'])->name('chapters.boost-audio.batch');
     Route::get('{audioBook}/chapters/boost-audio/progress', [AudioBookChapterController::class, 'getBoostAudioProgress'])->name('chapters.boost-audio.progress');
 
+    // AI Tóm tắt sách (Gemini) - 3 bước: chia cụm sự kiện, timeline, kể lại
+    Route::get('{audioBook}/summary', [AudioBookSummaryController::class, 'status'])->name('summary.status');
+    Route::post('{audioBook}/summary/start', [AudioBookSummaryController::class, 'start'])->name('summary.start');
+    Route::post('{audioBook}/summary/clusters/{clusterIndex}/timeline', [AudioBookSummaryController::class, 'generateTimeline'])->name('summary.timeline');
+    Route::post('{audioBook}/summary/clusters/{clusterIndex}/retell', [AudioBookSummaryController::class, 'generateRetell'])->name('summary.retell');
+    Route::post('{audioBook}/summary/outro', [AudioBookSummaryController::class, 'generateOutro'])->name('summary.outro');
+    Route::post('{audioBook}/summary/level', [AudioBookSummaryController::class, 'setLevel'])->name('summary.level');
+    Route::post('{audioBook}/summary/versions', [AudioBookSummaryController::class, 'saveVersion'])->name('summary.versions.save');
+    Route::delete('{audioBook}/summary/versions/{versionId}', [AudioBookSummaryController::class, 'deleteVersion'])->name('summary.versions.delete');
+    Route::delete('{audioBook}/summary', [AudioBookSummaryController::class, 'reset'])->name('summary.reset');
+    Route::delete('{audioBook}/summary/retells', [AudioBookSummaryController::class, 'resetRetells'])->name('summary.retells.reset');
+
+    // AI Video Production Pipeline
+    Route::get('{audioBook}/video-pipeline', [AudioBookVideoPipelineController::class, 'page'])->name('video.pipeline.page');
+    Route::get('{audioBook}/video-pipeline/status', [AudioBookVideoPipelineController::class, 'status'])->name('video.pipeline.status');
+    Route::post('{audioBook}/video-pipeline/start', [AudioBookVideoPipelineController::class, 'start'])->name('video.pipeline.start');
+    Route::post('{audioBook}/video-pipeline/retry-failed-chunks', [AudioBookVideoPipelineController::class, 'retryFailedChunks'])->name('video.pipeline.retry-failed-chunks');
+    Route::post('{audioBook}/video-pipeline/image-style', [AudioBookVideoPipelineController::class, 'updateImageStyle'])->name('video.pipeline.image-style');
+    Route::post('{audioBook}/video-pipeline/image-provider', [AudioBookVideoPipelineController::class, 'updateImageProvider'])->name('video.pipeline.image-provider');
+    Route::post('{audioBook}/video-pipeline/scenes/{scene}/shots/{shot}/active-target', [AudioBookVideoPipelineController::class, 'setActiveTarget'])->name('video.pipeline.shots.active-target');
+    Route::post('video-pipeline-extension-token', [AudioBookVideoPipelineController::class, 'issueExtensionToken'])->name('video-pipeline-extension-token');
+    Route::post('{audioBook}/video-pipeline/scenes/{scene}/shots/{shot}/search', [AudioBookVideoPipelineController::class, 'searchShot'])->name('video.pipeline.shots.search');
+    Route::post('{audioBook}/video-pipeline/scenes/{scene}/shots/{shot}/candidates/{candidate}/select', [AudioBookVideoPipelineController::class, 'selectCandidate'])->name('video.pipeline.shots.select');
+    Route::post('{audioBook}/video-pipeline/scenes/{scene}/shots/{shot}/resolve', [AudioBookVideoPipelineController::class, 'resolveShot'])->name('video.pipeline.shots.resolve');
+    Route::post('{audioBook}/video-pipeline/scenes/{scene}/shots/{shot}/animate', [AudioBookVideoPipelineController::class, 'animateShot'])->name('video.pipeline.shots.animate');
+    Route::post('{audioBook}/video-pipeline/scenes/{scene}/shots/{shot}/avatar', [AudioBookVideoPipelineController::class, 'generateAvatar'])->name('video.pipeline.shots.avatar');
+    Route::get('{audioBook}/video-pipeline/download', [AudioBookVideoPipelineController::class, 'downloadResources'])->name('video.pipeline.download');
+
     // Scrape chapters from book URL
     Route::post('scrape-chapters', [AudioBookController::class, 'scrapeChapters'])->name('scrape.chapters');
 
     // Fetch book metadata from URL (for create page auto-fill)
     Route::post('fetch-book-metadata', [AudioBookController::class, 'fetchBookMetadata'])->name('fetch.book.metadata');
+
+    // Fetch a YouTube video's transcript (captions, or Gemini AI fallback) for create page
+    Route::post('fetch-youtube-transcript', [AudioBookController::class, 'fetchYoutubeTranscript'])->name('fetch.youtube.transcript');
+    Route::get('fetch-youtube-transcript/{token}/status', [AudioBookController::class, 'fetchYoutubeTranscriptStatus'])->name('fetch.youtube.transcript.status');
 
     // Bulk create audiobooks from multiple URLs
     Route::post('bulk-create', [AudioBookController::class, 'bulkCreate'])->name('bulk.create');

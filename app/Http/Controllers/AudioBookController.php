@@ -149,7 +149,8 @@ class AudioBookController extends Controller
             'cover_image_url' => 'nullable|url',
             'language' => 'required|string|in:vi,en,es,fr,de,ja,ko',
             'book_url' => 'nullable|url',
-            'book_source' => 'nullable|string'
+            'book_source' => 'nullable|string',
+            'youtube_transcript_content' => 'nullable|string',
         ]);
 
         if (($data['book_type'] ?? '') === 'custom') {
@@ -189,7 +190,8 @@ class AudioBookController extends Controller
         // Remove temporary fields from data before creating audiobook
         $bookUrl = $data['book_url'] ?? null;
         $bookSource = $data['book_source'] ?? null;
-        unset($data['book_url'], $data['book_source'], $data['cover_image_url']);
+        $youtubeTranscriptContent = trim((string) ($data['youtube_transcript_content'] ?? ''));
+        unset($data['book_url'], $data['book_source'], $data['cover_image_url'], $data['youtube_transcript_content']);
 
         $audioBook = AudioBook::create($data);
 
@@ -240,6 +242,20 @@ class AudioBookController extends Controller
                 return redirect()->route('audiobooks.show', $audioBook)
                     ->with('warning', 'Đã tạo sách thành công nhưng không thể tự động import chương. Lỗi: ' . $e->getMessage());
             }
+        } elseif ($youtubeTranscriptContent !== '') {
+            AudioBookChapter::create([
+                'audio_book_id' => $audioBook->id,
+                'chapter_number' => 1,
+                'title' => 'Chương 1',
+                'content' => $youtubeTranscriptContent,
+                'tts_voice' => $audioBook->language == 'vi' ? 'vi-VN-HoaiMyNeural' : 'en-US-AriaNeural',
+                'tts_speed' => 1.0,
+                'status' => 'pending',
+            ]);
+            $audioBook->update(['total_chapters' => 1]);
+
+            return redirect()->route('audiobooks.show', $audioBook)
+                ->with('success', 'Đã tạo sách thành công và thêm Chương 1 từ transcript YouTube!');
         }
 
         return redirect()->route('audiobooks.show', $audioBook)->with('success', 'Sách âm thanh đã được tạo');
@@ -652,6 +668,43 @@ class AudioBookController extends Controller
         } catch (\Exception $e) {
             return response()->json(['error' => 'Lỗi khi lấy thông tin sách: ' . $e->getMessage()], 400);
         }
+    }
+
+    /**
+     * Fetch a transcript for one YouTube video to seed a new book's first chapter.
+     * Priority: (1) YouTube's own captions via YouTubeTranscriptService, (2) if unavailable,
+     * download the audio and transcribe it with Gemini (TranscriptionService).
+     */
+    public function fetchYoutubeTranscript(Request $request)
+    {
+        $request->validate(['youtube_url' => 'required|url']);
+
+        $videoId = app(\App\Services\YoutubeTranscriptImportService::class)
+            ->extractVideoId((string) $request->input('youtube_url'));
+        if (!$videoId) {
+            return response()->json(['success' => false, 'error' => 'Không nhận diện được video ID từ URL YouTube này.'], 400);
+        }
+
+        $token = (string) \Illuminate\Support\Str::uuid();
+        \App\Jobs\FetchYoutubeTranscriptJob::dispatch($token, $videoId);
+
+        return response()->json(['success' => true, 'token' => $token]);
+    }
+
+    /**
+     * Polled by the create page while FetchYoutubeTranscriptJob runs in the background —
+     * lets the UI show which stage it's in (fetching captions / downloading audio /
+     * transcribing / translating) instead of one opaque "please wait".
+     */
+    public function fetchYoutubeTranscriptStatus(string $token)
+    {
+        $state = \Illuminate\Support\Facades\Cache::get(\App\Jobs\FetchYoutubeTranscriptJob::cacheKey($token));
+
+        if (!$state) {
+            return response()->json(['stage' => 'unknown']);
+        }
+
+        return response()->json($state);
     }
 
     public function bulkCreate(Request $request)
@@ -11506,84 +11559,13 @@ class AudioBookController extends Controller
     }
 
     /**
-     * Transcribe audio using OpenAI Whisper API.
+     * Transcribe audio — provider (Whisper/Gemini) controlled by
+     * config('services.transcription.provider'), see App\Services\TranscriptionService.
      * Returns array of segments: [{start, end, text}, ...]
      */
     private function transcribeClipAudio(string $audioFilePath, float $maxDuration = 0): array
     {
-        $apiKey = config('services.openai.api_key');
-        if (!$apiKey) {
-            Log::warning('Clipping transcription: OpenAI API key not configured');
-            return [];
-        }
-
-        if (!file_exists($audioFilePath) || !is_readable($audioFilePath)) {
-            return [];
-        }
-
-        // Extract audio from video to a small mp3 for Whisper
-        $ffmpegPath = config('services.ffmpeg.path', env('FFMPEG_PATH', 'ffmpeg'));
-        $tmpAudio = sys_get_temp_dir() . '/clip_whisper_' . md5($audioFilePath) . '_' . time() . '.mp3';
-
-        $extractCmd = sprintf(
-            '%s -y -i %s -vn -ar 16000 -ac 1 -b:a 64k %s %s 2>/dev/null',
-            escapeshellarg($ffmpegPath),
-            escapeshellarg($audioFilePath),
-            $maxDuration > 0 ? sprintf('-t %.3f', $maxDuration) : '',
-            escapeshellarg($tmpAudio)
-        );
-        exec($extractCmd, $_, $extractCode);
-
-        if ($extractCode !== 0 || !file_exists($tmpAudio) || filesize($tmpAudio) < 100) {
-            @unlink($tmpAudio);
-            return [];
-        }
-
-        try {
-            $client = new \GuzzleHttp\Client();
-            $response = $client->post('https://api.openai.com/v1/audio/transcriptions', [
-                'headers' => [
-                    'Authorization' => 'Bearer ' . $apiKey,
-                ],
-                'multipart' => [
-                    ['name' => 'file', 'contents' => fopen($tmpAudio, 'r'), 'filename' => 'clip.mp3'],
-                    ['name' => 'model', 'contents' => 'whisper-1'],
-                    ['name' => 'language', 'contents' => 'vi'],
-                    ['name' => 'response_format', 'contents' => 'verbose_json'],
-                    ['name' => 'timestamp_granularities[]', 'contents' => 'segment'],
-                ],
-                'timeout' => 120,
-            ]);
-
-            $result = json_decode($response->getBody()->getContents(), true);
-            $segments = $result['segments'] ?? [];
-
-            Log::info('Clipping Whisper transcription done', [
-                'file' => basename($audioFilePath),
-                'segments' => count($segments),
-                'duration' => $result['duration'] ?? null,
-            ]);
-
-            // Map to simple format
-            $mapped = [];
-            foreach ($segments as $seg) {
-                $text = trim((string)($seg['text'] ?? ''));
-                if ($text === '') continue;
-
-                $mapped[] = [
-                    'start' => (float)($seg['start'] ?? 0),
-                    'end'   => (float)($seg['end'] ?? 0),
-                    'text'  => $text,
-                ];
-            }
-
-            return $mapped;
-        } catch (\Throwable $e) {
-            Log::warning('Clipping Whisper transcription failed', ['error' => $e->getMessage()]);
-            return [];
-        } finally {
-            @unlink($tmpAudio);
-        }
+        return app(\App\Services\TranscriptionService::class)->transcribe($audioFilePath, $maxDuration);
     }
 
     /**

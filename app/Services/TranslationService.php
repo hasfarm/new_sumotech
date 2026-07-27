@@ -300,7 +300,9 @@ class TranslationService
             throw new Exception('GEMINI_API_KEY chưa được cấu hình');
         }
 
-        $configuredModel = trim((string) env('GEMINI_MODEL', 'gemini-2.0-flash'));
+        // gemini-2.0-flash returns 404 "no longer available" on this account — 3.6-flash is
+        // the currently-working model used elsewhere in this app.
+        $configuredModel = trim((string) env('GEMINI_MODEL', 'gemini-3.6-flash'));
 
         // Build numbered segment list for the prompt
         $segmentTexts = [];
@@ -535,7 +537,7 @@ PROMPT;
         return $cleaned;
     }
 
-    private function isLikelyVietnamese(string $text): bool
+    public function isLikelyVietnamese(string $text): bool
     {
         $text = trim($text);
         if ($text === '') {

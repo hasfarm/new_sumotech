@@ -56,6 +56,19 @@ return [
             'throw' => false,
         ],
 
+        // Cloudflare R2 (S3-compatible) — used only as the long-term reusable asset
+        // library archive for the video pipeline; never read directly by the browser.
+        'r2' => [
+            'driver' => 's3',
+            'key' => env('R2_ACCESS_KEY'),
+            'secret' => env('R2_SECRET_KEY'),
+            'region' => 'auto',
+            'bucket' => env('R2_BUCKET'),
+            'endpoint' => env('R2_ENDPOINT'),
+            'use_path_style_endpoint' => true,
+            'throw' => true,
+        ],
+
     ],
 
     /*

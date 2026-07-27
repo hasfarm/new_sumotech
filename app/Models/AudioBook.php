@@ -86,4 +86,19 @@ class AudioBook extends Model
     {
         return $this->hasMany(AudioBookVideoSegment::class)->orderBy('sort_order');
     }
+
+    public function summary()
+    {
+        return $this->hasOne(AudiobookSummary::class);
+    }
+
+    public function videoScenes()
+    {
+        return $this->hasMany(AudiobookVideoScene::class)->orderBy('scene_index');
+    }
+
+    public function videoPipeline()
+    {
+        return $this->hasOne(AudiobookVideoPipeline::class);
+    }
 }

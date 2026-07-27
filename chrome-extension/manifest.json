@@ -1,0 +1,12 @@
+{
+  "manifest_version": 3,
+  "name": "SumoTech Video Pipeline - Storyblocks Importer",
+  "version": "1.0.0",
+  "description": "Gửi video vừa tải từ Storyblocks thẳng vào shot đang làm trong AI Video Production Pipeline.",
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "options_page": "options.html",
+  "permissions": ["storage"],
+  "host_permissions": ["http://sumotech.test/*"]
+}

@@ -30,6 +30,16 @@ class AnalyzeMediaCenterProjectJob implements ShouldQueue
         }
 
         $total = max(1, $project->sentences->count());
+        $settings = is_array($project->settings_json) ? $project->settings_json : [];
+        $analyzeConfig = is_array($settings['analyze'] ?? null) ? $settings['analyze'] : [];
+        $mode = trim((string) ($analyzeConfig['mode'] ?? 'legacy'));
+        $commonInstruction = trim((string) ($analyzeConfig['common_instruction'] ?? ''));
+
+        if ($mode === 'grok_image_prompt_all' || $mode === 'openai_image_prompt_all') {
+            $this->runGrokImagePromptAllMode($project, $analyzeService, $commonInstruction, $total);
+            return;
+        }
+
         $this->updateProgress($project, 'running', 5, 'Bắt đầu phân tích nội dung...', 0, $total);
 
         try {
@@ -126,6 +136,65 @@ class AnalyzeMediaCenterProjectJob implements ShouldQueue
         }
     }
 
+    private function runGrokImagePromptAllMode(
+        MediaCenterProject $project,
+        MediaCenterAnalyzeService $analyzeService,
+        string $commonInstruction,
+        int $total
+    ): void {
+        $this->updateProgress($project, 'running', 5, 'Bắt đầu tạo image prompt bằng Grok...', 0, $total);
+
+        try {
+            $result = $analyzeService->buildImagePromptPlanWithGrok($project, $commonInstruction);
+            $plans = is_array($result['sentences'] ?? null) ? $result['sentences'] : [];
+            $processed = 0;
+
+            foreach ($project->sentences as $sentence) {
+                $index = (int) $sentence->sentence_index;
+                $plan = is_array($plans[$index] ?? null) ? $plans[$index] : [];
+                $prompt = trim((string) ($plan['image_prompt'] ?? ''));
+
+                if ($prompt === '') {
+                    $defaultPlan = $analyzeService->buildDefaultSentencePlan(
+                        (string) ($sentence->tts_text ?: $sentence->sentence_text),
+                        []
+                    );
+                    $prompt = trim((string) ($defaultPlan['image_prompt'] ?? ''));
+                }
+
+                if ($prompt !== '') {
+                    $sentence->forceFill([
+                        'image_prompt' => $prompt,
+                    ])->save();
+                }
+
+                $processed++;
+                $progress = 10 + (int) floor(($processed / $total) * 85);
+                $this->updateProgress(
+                    $project,
+                    'running',
+                    min(95, $progress),
+                    "Đã tạo prompt ảnh {$processed}/{$total} câu...",
+                    $processed,
+                    $total
+                );
+            }
+
+            $this->addProjectUsageCost(
+                $project,
+                'ai_generation',
+                $this->estimateGrokPromptCostUsd($project->sentences->count())
+            );
+
+            $project->forceFill(['status' => 'analyzed'])->save();
+            $this->updateProgress($project, 'completed', 100, 'Đã tạo image prompt cho tất cả câu bằng Grok.', $total, $total);
+        } catch (\Throwable $e) {
+            $project->forceFill(['status' => 'analyze_failed'])->save();
+            $this->updateProgress($project, 'failed', 100, 'Lỗi tạo image prompt: ' . $e->getMessage(), 0, $total, $e->getMessage());
+            throw $e;
+        }
+    }
+
     private function storeMainCharacterData(MediaCenterProject $project, array $mainCharacter): void
     {
         if (empty($mainCharacter)) {
@@ -207,8 +276,11 @@ class AnalyzeMediaCenterProjectJob implements ShouldQueue
         ?string $error = null
     ): void {
         $settings = is_array($project->settings_json) ? $project->settings_json : [];
+        $currentAnalyze = is_array($settings['analyze'] ?? null) ? $settings['analyze'] : [];
 
         $settings['analyze'] = [
+            'mode' => trim((string) ($currentAnalyze['mode'] ?? '')),
+            'common_instruction' => trim((string) ($currentAnalyze['common_instruction'] ?? '')),
             'status' => $status,
             'progress' => max(0, min(100, $progress)),
             'message' => $message,
@@ -261,5 +333,11 @@ class AnalyzeMediaCenterProjectJob implements ShouldQueue
     {
         $count = max(1, $sentenceCount);
         return round(0.01 + ($count * 0.0015), 6);
+    }
+
+    private function estimateGrokPromptCostUsd(int $sentenceCount): float
+    {
+        $count = max(1, $sentenceCount);
+        return round(0.005 + ($count * 0.0012), 6);
     }
 }
