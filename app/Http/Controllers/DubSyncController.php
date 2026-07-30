@@ -2016,6 +2016,48 @@ class DubSyncController extends Controller
     }
 
     /**
+     * Spawns `php artisan queue:work --stop-when-empty` as a detached background process so
+     * queued jobs (Story Bible regeneration, continuity validation, video pipeline stages...)
+     * get processed without opening a terminal — this app has no persistent queue worker
+     * service configured (QUEUE_CONNECTION=database, no supervisor/Windows service). Drains
+     * whatever's currently queued then exits on its own; no persistent process to track or
+     * stop, and no "already running" guard is needed — Laravel's queue worker already handles
+     * multiple concurrent workers safely via row-level locking on the jobs table, so clicking
+     * this twice in a row is harmless (just briefly wasteful), not a correctness risk.
+     *
+     * `--timeout=900` matters: the worker's OWN default (60s) would kill and fail any job
+     * still running past that regardless of the job's own logic — several jobs here
+     * (Story Bible generation, scene reassignment) make real OpenAI calls that can legitimately
+     * take several minutes.
+     */
+    public function queueProcessNow()
+    {
+        try {
+            $pendingCount = \DB::table('jobs')->count();
+            if ($pendingCount === 0) {
+                return response()->json(['success' => true, 'started' => false, 'message' => 'Queue đang trống — không có job nào để xử lý.']);
+            }
+
+            $logFile = storage_path('logs/queue-worker-manual.log');
+            $cmd = sprintf(
+                'start /B "" %s %s queue:work --stop-when-empty --tries=1 --timeout=900 >> %s 2>&1',
+                escapeshellarg(PHP_BINARY),
+                escapeshellarg(base_path('artisan')),
+                escapeshellarg($logFile)
+            );
+            pclose(popen($cmd, 'r'));
+
+            return response()->json([
+                'success' => true,
+                'started' => true,
+                'message' => "Đã khởi động worker để xử lý {$pendingCount} job đang chờ (log: storage/logs/queue-worker-manual.log).",
+            ]);
+        } catch (\Exception $e) {
+            return response()->json(['success' => false, 'error' => $e->getMessage()], 500);
+        }
+    }
+
+    /**
      * Show project details
      */
     public function show($projectId)

@@ -12,7 +12,8 @@ class SceneAssetResolverService
         private readonly BflFluxImageService $fluxImageService,
         private readonly GrokImageService $grokImageService,
         private readonly KlingAIService $klingService,
-        private readonly SeedanceAIService $seedanceService
+        private readonly SeedanceAIService $seedanceService,
+        private readonly VideoSceneAnalysisService $sceneAnalysisService
     ) {}
 
     /**
@@ -109,12 +110,17 @@ class SceneAssetResolverService
      * Style is chosen per-book (via the pipeline's `image_style` setting, picked in the UI)
      * so every AI-generated image across the whole book stays visually consistent — never
      * mixed mid-book. Defaults to 'illustration' if unset.
+     *
+     * Draws from the SAME resolved Story Bible data as VideoSceneAnalysisService's shot-
+     * enrichment prompt (identity anchor / current phase traits / location cultural context /
+     * director treatment — see buildStableContextBlock()), so a shot's illustration and its
+     * enrichment prompt describe the same character/setting instead of drifting independently.
      */
     private function buildImagePrompt(AudiobookVideoShot $shot): string
     {
-        $keywords = implode(', ', $shot->keywords ?? []);
-        $sceneTitle = $shot->scene->title ?? '';
-        $style = (string) ($shot->scene->audioBook->videoPipeline->image_style ?? 'illustration');
+        $scene = $shot->scene;
+        $sceneTitle = $scene->title ?? '';
+        $style = (string) ($scene->audioBook->videoPipeline->image_style ?? 'illustration');
 
         $styleLine = $style === 'cinematic_realistic'
             ? 'Style: photorealistic cinematic still (like a real film frame), realistic lighting and textures, shot on cinema camera, shallow depth of field, 16:9, no people looking at camera.'
@@ -124,10 +130,23 @@ class SceneAssetResolverService
             ? 'Cinematic photorealistic B-roll still image for a documentary-style narration video.'
             : 'Digital painting illustration, B-roll still image for a documentary-style narration video.';
 
+        // image_request is a richer, purpose-written visual description than the bare
+        // keyword list — fall back to keywords only for shots enriched before this field
+        // existed.
+        $subject = trim((string) $shot->image_request) !== ''
+            ? $shot->image_request
+            : implode(', ', $shot->keywords ?? []);
+
+        $stableContext = $scene->story_bible_id ? $this->sceneAnalysisService->buildStableContextBlock($scene, $shot) : '';
+        $continuityLine = trim($stableContext) !== ''
+            ? ' Character/setting continuity: ' . str_replace("\n", '; ', $stableContext) . '.'
+            : '';
+
         // "No text" is repeated/emphasized because Flux frequently renders garbled, misspelled
         // text into images when a prompt doesn't explicitly forbid it.
         return "{$intro} "
-            . "Scene context: {$sceneTitle}. Visual keywords: {$keywords}. "
+            . "Scene context: {$sceneTitle}. Subject: {$subject}."
+            . $continuityLine . ' '
             . "{$styleLine} "
             . 'STRICTLY NO TEXT ANYWHERE IN THE IMAGE: no letters, no words, no writing, no captions, no watermark, no logos. '
             . 'This also means flags, banners, scrolls, signs, clothing and armor must be PLAIN and blank/unmarked — no calligraphy, no symbols, no characters, no glyphs, no engraved text of any kind, even decorative ones.';

@@ -8,12 +8,13 @@ use Tests\TestCase;
 class ExampleTest extends TestCase
 {
     /**
-     * A basic test example.
+     * The root route always redirects to the dashboard (see routes/web.php) — it never
+     * renders a 200 page directly, so that's the actual correct behavior to assert here.
      */
-    public function test_the_application_returns_a_successful_response(): void
+    public function test_the_root_route_redirects_to_the_dashboard(): void
     {
         $response = $this->get('/');
 
-        $response->assertStatus(200);
+        $response->assertRedirect(route('dashboard'));
     }
 }

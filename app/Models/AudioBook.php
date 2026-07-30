@@ -101,4 +101,16 @@ class AudioBook extends Model
     {
         return $this->hasOne(AudiobookVideoPipeline::class);
     }
+
+    /** All versions (draft/active/superseded/failed) — mostly useful for admin/debug views. */
+    public function storyBibles()
+    {
+        return $this->hasMany(AudiobookStoryBible::class);
+    }
+
+    /** The one version Phase 3+ should ever read from. */
+    public function activeStoryBible()
+    {
+        return $this->hasOne(AudiobookStoryBible::class)->where('is_active', true);
+    }
 }

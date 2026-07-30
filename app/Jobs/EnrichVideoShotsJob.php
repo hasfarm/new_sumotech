@@ -57,6 +57,26 @@ class EnrichVideoShotsJob implements ShouldQueue
         $pipeline->update(['current_stage' => 'shot_enrichment', 'last_heartbeat_at' => now()]);
         $contextHint = (string) ($pipeline->context_hint ?? '');
 
+        // Computed once per scene (not once per chunk) and reused across that scene's
+        // chunks — Story Bible/Character Bible data resolved into a fixed, value-only text
+        // block (see VideoSceneAnalysisService::buildStableContextBlock()).
+        $stableContextByScene = [];
+        $stableContextFor = function (AudiobookVideoScene $scene) use ($service, &$stableContextByScene): string {
+            if (!array_key_exists($scene->id, $stableContextByScene)) {
+                $stableContextByScene[$scene->id] = $scene->story_bible_id
+                    ? $service->buildStableContextBlock($scene)
+                    : '';
+            }
+            return $stableContextByScene[$scene->id];
+        };
+        $bibleByScene = [];
+        $bibleFor = function (AudiobookVideoScene $scene) use (&$bibleByScene): ?\App\Models\AudiobookStoryBible {
+            if (!array_key_exists($scene->id, $bibleByScene)) {
+                $bibleByScene[$scene->id] = $scene->story_bible_id ? $scene->storyBible : null;
+            }
+            return $bibleByScene[$scene->id];
+        };
+
         $isRetryOnly = $this->onlyChunkIndices !== null;
 
         [$chunkPlan, $chunkShots] = $isRetryOnly
@@ -74,8 +94,14 @@ class EnrichVideoShotsJob implements ShouldQueue
             if ($isRetryOnly && !in_array($globalIndex, $this->onlyChunkIndices, true)) {
                 continue;
             }
-            if ($chunkMeta['status'] === 'done') {
-                continue; // idempotent resume: already succeeded, don't redo
+            // Idempotent resume for a FRESH pass: a chunk already 'done' is skipped so a
+            // naive re-dispatch doesn't redo work. This does NOT apply in retry-only mode —
+            // there, the caller (e.g. "retry failed chunks", or story-direction:regenerate-
+            // stale forcing a re-run of a chunk made stale by a Story Bible version change)
+            // has already decided exactly which chunks need reprocessing; a chunk explicitly
+            // named in $onlyChunkIndices is reprocessed regardless of its current status.
+            if (!$isRetryOnly && $chunkMeta['status'] === 'done') {
+                continue;
             }
 
             $items = $chunkShots[$globalIndex] ?? [];
@@ -84,6 +110,15 @@ class EnrichVideoShotsJob implements ShouldQueue
             }
             $scene = $items[0]['scene'];
             $shotChunkInput = array_map(fn($it) => ['index' => $it['local_index'], 'text' => $it['text']], $items);
+            $bible = $bibleFor($scene);
+
+            // Without this, a continuous event split across a chunk boundary (this chunk
+            // starting mid-event) has zero visibility into what the previous chunk already
+            // established — the model then invents a brand-new setting/character wardrobe
+            // from nothing instead of continuing it. Read from the DB (not an in-run map) so
+            // this works identically whether the previous chunk ran in this job execution or
+            // a prior one.
+            $previousContext = $bible ? $this->buildCarryOverContext($service, $chunkPlan, $globalIndex, $scene->id) : '';
 
             $lastError = null;
             $success = false;
@@ -96,7 +131,13 @@ class EnrichVideoShotsJob implements ShouldQueue
                 $attempts++;
 
                 try {
-                    $enriched = $service->enrichShotsChunk($shotChunkInput, $audioBook, $scene->title, $scene->scene_type, $contextHint);
+                    $enrichResult = $service->enrichShotsChunk($shotChunkInput, $audioBook, $scene->title, $scene->scene_type, $contextHint, [
+                        'book_id' => $this->audioBookId,
+                        'scene_id' => $scene->id,
+                        'chunk_index' => $globalIndex,
+                        'job_attempt' => $attempts,
+                    ], $stableContextFor($scene), $bible, $previousContext);
+                    $enriched = $enrichResult['shots'];
 
                     foreach ($items as $it) {
                         $data = $enriched[$it['local_index']] ?? null;
@@ -104,7 +145,21 @@ class EnrichVideoShotsJob implements ShouldQueue
                             'keywords' => $data['keywords'] ?? [$scene->scene_type],
                             'image_request' => $data['image_request'] ?? null,
                             'is_real_world' => $data['is_real_world'] ?? true,
+                            'enrichment_status' => 'enriched',
+                            'prompt_version' => VideoSceneAnalysisService::PROMPT_VERSION,
+                            'story_bible_version_used' => $scene->story_bible_version_used,
+                            'enriched_at' => now(),
                         ]);
+                    }
+
+                    if ($bible) {
+                        $chunkShotModels = [];
+                        $enrichmentByShotIndex = [];
+                        foreach ($items as $it) {
+                            $chunkShotModels[] = $it['shot'];
+                            $enrichmentByShotIndex[$it['shot']->shot_index] = $enriched[$it['local_index']] ?? [];
+                        }
+                        $service->persistChunkContext($chunkShotModels, $bible, $enrichResult['chunk_context'], $enrichmentByShotIndex);
                     }
 
                     $success = true;
@@ -113,10 +168,18 @@ class EnrichVideoShotsJob implements ShouldQueue
                     $lastError = $e->getMessage();
                     Log::warning('EnrichVideoShotsJob: chunk attempt failed', [
                         'audio_book_id' => $this->audioBookId,
+                        'scene_id' => $scene->id,
                         'chunk' => $globalIndex,
                         'attempt' => $attempts,
+                        'error_type' => get_class($e),
                         'error' => $lastError,
                     ]);
+                }
+            }
+
+            if (!$success) {
+                foreach ($items as $it) {
+                    $it['shot']->update(['enrichment_status' => 'failed']);
                 }
             }
 
@@ -181,16 +244,24 @@ class EnrichVideoShotsJob implements ShouldQueue
                         'local_index' => $localI + 1,
                         'text' => $shotModel->sentence_text,
                     ];
-                    if (empty($shotModel->keywords) || empty($shotModel->image_request)) {
+                    $isCurrent = $shotModel->enrichment_status === 'enriched'
+                        && $shotModel->prompt_version === VideoSceneAnalysisService::PROMPT_VERSION
+                        // A shot enriched under an older Story Bible version is stale too,
+                        // even if prompt_version itself hasn't changed — its stable-context
+                        // block was built from data that's since been superseded.
+                        && $shotModel->story_bible_version_used === $scene->story_bible_version_used;
+                    if (!$isCurrent) {
                         $alreadyEnriched = false;
                     }
                 }
 
-                // A chunk whose shots ALL already carry keywords + image_request from a
-                // prior successful run is skipped entirely on re-run — updateOrCreate()
-                // above never touches these two columns, so they survive re-splitting.
-                // This is what makes a naive re-dispatch (stale worker, manual retry) cost
-                // zero extra OpenAI calls instead of silently redoing already-done work.
+                // A chunk whose shots ALL already carry an 'enriched' status at the CURRENT
+                // prompt_version AND the scene's CURRENT story_bible_version_used is skipped
+                // entirely on re-run — updateOrCreate() above never touches these columns, so
+                // they survive re-splitting. This is what makes a naive re-dispatch (stale
+                // worker, manual retry) cost zero extra OpenAI calls, while a PROMPT_VERSION
+                // bump or a Story Bible regenerate correctly forces re-enrichment of stale
+                // shots instead of relying on keywords/image_request non-emptiness as a proxy.
                 $chunkPlan[] = [
                     'index' => $globalIndex,
                     'scene_id' => $scene->id,
@@ -242,6 +313,35 @@ class EnrichVideoShotsJob implements ShouldQueue
         }
 
         return [$chunkPlan, $chunkShots];
+    }
+
+    /**
+     * Finds the chunk immediately preceding $globalIndex WITHIN THE SAME SCENE (chunks never
+     * span a scene boundary) and summarizes its last shot's already-persisted local context
+     * for carry-over — reads from the DB, not an in-run cache, so this works identically
+     * whether that previous chunk was processed in this job execution or a prior one (e.g.
+     * a "retry failed chunks" run that only reprocesses one chunk).
+     */
+    private function buildCarryOverContext(VideoSceneAnalysisService $service, array $chunkPlan, int $globalIndex, int $sceneId): string
+    {
+        $previousChunkMeta = null;
+        foreach ($chunkPlan as $chunkMeta) {
+            if ($chunkMeta['index'] === $globalIndex - 1 && $chunkMeta['scene_id'] === $sceneId) {
+                $previousChunkMeta = $chunkMeta;
+                break;
+            }
+        }
+        if (!$previousChunkMeta || empty($previousChunkMeta['shot_ids'])) {
+            return '';
+        }
+
+        $lastShotId = end($previousChunkMeta['shot_ids']);
+        $lastShot = AudiobookVideoShot::find($lastShotId);
+        if (!$lastShot || $lastShot->narrative_mode === null) {
+            return ''; // previous chunk was never enriched with local context — nothing to carry over
+        }
+
+        return $service->summarizeChunkContextForCarryOver($lastShot);
     }
 
     private function updateChunkStatus(AudiobookVideoPipeline $pipeline, int $globalIndex, string $status, int $attempts, ?string $error): void

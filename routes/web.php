@@ -12,6 +12,7 @@ use App\Http\Controllers\AudioBookController;
 use App\Http\Controllers\AudioBookChapterController;
 use App\Http\Controllers\AudioBookSummaryController;
 use App\Http\Controllers\AudioBookVideoPipelineController;
+use App\Http\Controllers\ContinuityValidationController;
 use App\Http\Controllers\BookInsightStudioController;
 use App\Http\Controllers\MediaCenterController;
 use App\Http\Controllers\AutomationReportController;
@@ -111,6 +112,7 @@ Route::prefix('dubsync')->name('dubsync.')->group(function () {
     Route::delete('/projects/{projectId}', [DubSyncController::class, 'destroy'])->name('destroy');
     Route::get('/queue-status', [DubSyncController::class, 'queueStatus'])->name('queue.status');
     Route::post('/queue-clear', [DubSyncController::class, 'queueClear'])->name('queue.clear');
+    Route::post('/queue-process-now', [DubSyncController::class, 'queueProcessNow'])->name('queue.process-now');
 });
 
 // API Usage Tracking Routes
@@ -356,6 +358,15 @@ Route::middleware('auth')->prefix('audiobooks')->name('audiobooks.')->group(func
     Route::post('{audioBook}/video-pipeline/scenes/{scene}/shots/{shot}/animate', [AudioBookVideoPipelineController::class, 'animateShot'])->name('video.pipeline.shots.animate');
     Route::post('{audioBook}/video-pipeline/scenes/{scene}/shots/{shot}/avatar', [AudioBookVideoPipelineController::class, 'generateAvatar'])->name('video.pipeline.shots.avatar');
     Route::get('{audioBook}/video-pipeline/download', [AudioBookVideoPipelineController::class, 'downloadResources'])->name('video.pipeline.download');
+
+    // Phase 4: continuity validation report + actions
+    Route::get('{audioBook}/video-pipeline/continuity', [ContinuityValidationController::class, 'status'])->name('video.pipeline.continuity.status');
+    Route::post('{audioBook}/video-pipeline/continuity/validate', [ContinuityValidationController::class, 'runValidation'])->name('video.pipeline.continuity.validate');
+    Route::post('{audioBook}/video-pipeline/continuity/revalidate-stale', [ContinuityValidationController::class, 'revalidateStale'])->name('video.pipeline.continuity.revalidate-stale');
+    Route::post('{audioBook}/video-pipeline/continuity/regenerate-selected', [ContinuityValidationController::class, 'regenerateSelected'])->name('video.pipeline.continuity.regenerate-selected');
+    Route::post('{audioBook}/video-pipeline/continuity/issues/{issue}/accept', [ContinuityValidationController::class, 'accept'])->name('video.pipeline.continuity.accept');
+    Route::post('{audioBook}/video-pipeline/story-bible/regenerate-stale', [ContinuityValidationController::class, 'regenerateStale'])->name('video.pipeline.story-bible.regenerate-stale');
+    Route::get('{audioBook}/video-pipeline/story-bible/details', [ContinuityValidationController::class, 'storyBibleDetails'])->name('video.pipeline.story-bible.details');
 
     // Scrape chapters from book URL
     Route::post('scrape-chapters', [AudioBookController::class, 'scrapeChapters'])->name('scrape.chapters');

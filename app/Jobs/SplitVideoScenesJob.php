@@ -3,6 +3,7 @@
 namespace App\Jobs;
 
 use App\Models\AudioBook;
+use App\Models\AudiobookStoryBible;
 use App\Models\AudiobookSummary;
 use App\Models\AudiobookVideoPipeline;
 use App\Models\AudiobookVideoScene;
@@ -81,6 +82,11 @@ class SplitVideoScenesJob implements ShouldQueue
             $contextHint = $service->determineContext($audioBook);
             $pipeline->update(['context_hint' => $contextHint, 'last_heartbeat_at' => now()]);
 
+            // Backward-compatible: a book with no active Story Bible (Phase 2 never run, or
+            // not yet built for this book) skips scene-context assignment entirely — every
+            // new column stays null and the pipeline behaves exactly as before Phase 3.
+            $activeBible = AudiobookStoryBible::where('audio_book_id', $this->audioBookId)->where('is_active', true)->first();
+
             // Scene-meta calls are tiny now (~2s each measured live) — sequential with a
             // heartbeat per batch is simple and already fast; pooling isn't needed here.
             $processed = 0;
@@ -88,7 +94,7 @@ class SplitVideoScenesJob implements ShouldQueue
                 $meta = $service->analyzeSceneMeta($batch['text'], $audioBook);
                 $duration = $service->estimateDurationSeconds($batch['text'], 60);
 
-                AudiobookVideoScene::updateOrCreate(
+                $scene = AudiobookVideoScene::updateOrCreate(
                     ['audio_book_id' => $this->audioBookId, 'scene_index' => $i + 1],
                     [
                         'audiobook_summary_id' => $summary->id,
@@ -103,6 +109,14 @@ class SplitVideoScenesJob implements ShouldQueue
                         'status' => 'analyzed',
                     ]
                 );
+
+                if ($activeBible) {
+                    $assignment = $service->assignSceneContext($scene, $activeBible, [
+                        'book_id' => $this->audioBookId,
+                        'scene_id' => $scene->id,
+                    ]);
+                    $service->persistSceneContext($scene, $activeBible, $assignment);
+                }
 
                 $processed++;
                 $pipeline->update(['processed_batches' => $processed, 'last_heartbeat_at' => now()]);

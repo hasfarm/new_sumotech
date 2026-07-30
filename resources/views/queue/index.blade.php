@@ -8,11 +8,15 @@
             <button onclick="refreshQueue()" class="inline-flex items-center px-4 py-2 bg-blue-600 text-white text-sm font-medium rounded-md hover:bg-blue-700">
                 🔄 Refresh
             </button>
+            <button onclick="processQueueNow()" id="btn-process-queue" class="inline-flex items-center px-4 py-2 bg-green-600 text-white text-sm font-medium rounded-md hover:bg-green-700 disabled:opacity-50">
+                ▶️ Process queue now
+            </button>
             <button onclick="clearAllJobs()" class="inline-flex items-center px-4 py-2 bg-red-600 text-white text-sm font-medium rounded-md hover:bg-red-700">
                 🗑 Clear All Jobs
             </button>
         </div>
     </div>
+    <p class="text-xs text-gray-400 -mt-4 mb-6">"Process queue now" khởi động một worker chạy nền để xử lý toàn bộ job đang chờ, rồi tự thoát khi hết việc — không cần mở terminal. Bấm lại bất cứ khi nào có job mới cần chạy.</p>
 
     {{-- Summary Cards --}}
     <div class="grid grid-cols-4 gap-4 mb-6" id="summary-cards">
@@ -230,6 +234,30 @@
                 </tr>`;
             }).join('')}</tbody>
         </table>`;
+    }
+
+    async function processQueueNow() {
+        const btn = document.getElementById('btn-process-queue');
+        btn.disabled = true;
+        const originalText = btn.textContent;
+        btn.textContent = '⏳ Đang khởi động worker...';
+        try {
+            const resp = await fetch('{{ route("dubsync.queue.process-now") }}', {
+                method: 'POST',
+                headers: { 'X-CSRF-TOKEN': '{{ csrf_token() }}', 'Content-Type': 'application/json' }
+            });
+            const data = await resp.json();
+            if (data.success) {
+                alert(data.message);
+                refreshQueue();
+            } else {
+                alert('Lỗi: ' + (data.error || 'không rõ nguyên nhân'));
+            }
+        } catch (e) {
+            alert('Lỗi: ' + e.message);
+        }
+        btn.disabled = false;
+        btn.textContent = originalText;
     }
 
     async function clearAllJobs() {

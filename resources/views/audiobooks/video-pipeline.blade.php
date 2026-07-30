@@ -34,6 +34,16 @@
         </div>
     </div>
 
+    <div id="vp-detail-modal" class="fixed inset-0 bg-black bg-opacity-60 z-50 items-center justify-center p-4"
+        style="display:none !important;" onclick="if (event.target === this) vpCloseDetailModal()">
+        <div class="bg-white rounded-lg max-w-2xl w-full max-h-[85vh] overflow-y-auto p-5 relative">
+            <button type="button" onclick="vpCloseDetailModal()"
+                class="absolute top-3 right-4 text-gray-400 hover:text-gray-700 text-2xl leading-none">&times;</button>
+            <h3 id="vp-detail-modal-title" class="text-lg font-bold text-gray-800 mb-3 pr-8"></h3>
+            <div id="vp-detail-modal-body" class="space-y-3"></div>
+        </div>
+    </div>
+
     @php
         $vpSearchUrlTemplate = route('audiobooks.video.pipeline.shots.search', [$audioBook, '__SCENE__', '__SHOT__']);
         $vpResolveUrlTemplate = route('audiobooks.video.pipeline.shots.resolve', [$audioBook, '__SCENE__', '__SHOT__']);
@@ -51,6 +61,14 @@
             imageProvider: @json(route('audiobooks.video.pipeline.image-provider', $audioBook)),
             download: @json(route('audiobooks.video.pipeline.download', $audioBook)),
             summaryStatus: @json(route('audiobooks.summary.status', $audioBook)),
+            continuityStatus: @json(route('audiobooks.video.pipeline.continuity.status', $audioBook)),
+            continuityValidate: @json(route('audiobooks.video.pipeline.continuity.validate', $audioBook)),
+            continuityRevalidateStale: @json(route('audiobooks.video.pipeline.continuity.revalidate-stale', $audioBook)),
+            continuityRegenerateSelected: @json(route('audiobooks.video.pipeline.continuity.regenerate-selected', $audioBook)),
+            continuityAcceptTemplate: @json(route('audiobooks.video.pipeline.continuity.accept', [$audioBook, '__ISSUE__'])),
+            continuityAccept(issueId) { return this.continuityAcceptTemplate.replace('__ISSUE__', issueId); },
+            storyBibleRegenerateStale: @json(route('audiobooks.video.pipeline.story-bible.regenerate-stale', $audioBook)),
+            storyBibleDetails: @json(route('audiobooks.video.pipeline.story-bible.details', $audioBook)),
             searchTemplate: @json($vpSearchUrlTemplate),
             resolveTemplate: @json($vpResolveUrlTemplate),
             animateTemplate: @json($vpAnimateUrlTemplate),
@@ -155,10 +173,310 @@
         let vpExpandedScenes = {};
         let vpExpandedShots = {};
         let vpBusyShots = {};
+        let vpContinuity = null; // { shot_counts, unresolved_bindings, issues_by_scene, story_bible }
+        let vpContinuitySelected = {};
+        let vpRegeneratingStale = false;
 
         async function vpInit() {
             await vpLoadSummary();
             await vpLoad();
+            await vpLoadContinuity();
+        }
+
+        async function vpLoadContinuity() {
+            try {
+                const resp = await fetch(vpUrls.continuityStatus, { headers: { Accept: 'application/json' } });
+                vpContinuity = await vpJson(resp);
+                vpRenderContinuityPanel();
+                vpRenderStoryBiblePanel();
+            } catch (e) {
+                // Continuity panel is best-effort — never break the main pipeline UI over it.
+            }
+        }
+
+        const STORY_BIBLE_STATUS_LABELS = {
+            active: ['bg-green-100 text-green-700', '✅ Đã kích hoạt'],
+            draft: ['bg-blue-100 text-blue-700', '⏳ Đang tạo (draft)'],
+            extracting: ['bg-blue-100 text-blue-700', '⏳ Đang trích xuất'],
+            consolidating: ['bg-blue-100 text-blue-700', '⏳ Đang tổng hợp'],
+            validating: ['bg-blue-100 text-blue-700', '⏳ Đang kiểm tra'],
+            failed: ['bg-red-100 text-red-700', '❌ Thất bại'],
+            superseded: ['bg-gray-100 text-gray-500', '— Đã thay thế'],
+        };
+
+        function vpRenderStoryBiblePanel() {
+            const el = document.getElementById('vp-story-bible-panel');
+            if (!el) return;
+
+            const sb = (vpContinuity || {}).story_bible;
+            if (!sb) {
+                el.innerHTML = '<p class="text-sm text-gray-400">Chưa có dữ liệu.</p>';
+                return;
+            }
+
+            if (!sb.active_version) {
+                const [cls, label] = STORY_BIBLE_STATUS_LABELS[sb.latest_status] || STORY_BIBLE_STATUS_LABELS.failed;
+                el.innerHTML = `
+                    <p class="text-sm text-gray-600 mb-2">Chưa có Story Bible nào được kích hoạt cho sách này — các cảnh/shot hiện tại KHÔNG có context AI Director (character phase, văn hóa địa điểm, director treatment).</p>
+                    <div class="flex flex-wrap items-center gap-2">
+                        ${sb.latest_version ? `<span class="px-2 py-1 rounded-lg text-xs font-semibold ${cls}">${label} — v${sb.latest_version}</span>` : ''}
+                    </div>
+                    ${sb.latest_error ? `<p class="text-xs text-red-600 mt-2">${vpEscape(sb.latest_error)}</p>` : ''}
+                `;
+                return;
+            }
+
+            const [cls, label] = STORY_BIBLE_STATUS_LABELS[sb.active_status] || STORY_BIBLE_STATUS_LABELS.active;
+            el.innerHTML = `
+                <div class="flex flex-wrap items-center gap-2 mb-2">
+                    <span class="px-2 py-1 rounded-lg text-xs font-semibold ${cls}">${label} — v${sb.active_version}</span>
+                    <button type="button" onclick="vpShowStoryBibleDetail('timelines')" class="px-2 py-1 rounded-lg text-xs font-semibold bg-gray-100 text-gray-600 hover:bg-gray-200 cursor-pointer">🕐 Timelines: ${sb.timelines_count}</button>
+                    <button type="button" onclick="vpShowStoryBibleDetail('locations')" class="px-2 py-1 rounded-lg text-xs font-semibold bg-gray-100 text-gray-600 hover:bg-gray-200 cursor-pointer">📍 Locations: ${sb.locations_count}</button>
+                    <button type="button" onclick="vpShowStoryBibleDetail('characters')" class="px-2 py-1 rounded-lg text-xs font-semibold bg-gray-100 text-gray-600 hover:bg-gray-200 cursor-pointer">🧑 Characters: ${sb.characters_count}</button>
+                </div>
+                <div class="flex flex-wrap items-center gap-2">
+                    <span class="px-2 py-1 rounded-lg text-xs font-semibold bg-indigo-100 text-indigo-700">🔗 Scene đã bind: ${sb.scenes_bound}/${sb.scenes_total}</span>
+                    <span class="px-2 py-1 rounded-lg text-xs font-semibold ${sb.scenes_stale > 0 ? 'bg-amber-100 text-amber-700' : 'bg-green-100 text-green-700'}">${sb.scenes_stale > 0 ? '⚠️' : '✅'} Stale (cần regenerate-stale): ${sb.scenes_stale}</span>
+                    ${sb.scenes_stale > 0 ? `
+                        <button onclick="vpRegenerateStaleScenes()" id="vp-regenerate-stale-btn" ${vpRegeneratingStale ? 'disabled' : ''}
+                            class="text-xs bg-amber-600 hover:bg-amber-700 disabled:opacity-50 text-white font-semibold py-1.5 px-3 rounded-lg">
+                            ${vpRegeneratingStale ? '⏳ Đang regenerate...' : '♻️ Regenerate stale scenes'}
+                        </button>` : ''}
+                </div>
+            `;
+        }
+
+        async function vpContinuityValidateAll() {
+            await vpPost(vpUrls.continuityValidate);
+            await vpLoadContinuity();
+        }
+
+        async function vpContinuityRevalidateStale() {
+            await vpPost(vpUrls.continuityRevalidateStale);
+            await vpLoadContinuity();
+        }
+
+        // Dispatches a queued job (RegenerateStaleSceneDirectionJob) — this only submits the
+        // request, it does NOT wait for the re-bind/re-enrich work to finish. Progress shows
+        // up over subsequent polls as the queue worker processes it.
+        async function vpRegenerateStaleScenes() {
+            vpRegeneratingStale = true;
+            vpRenderStoryBiblePanel();
+            try {
+                await vpPost(vpUrls.storyBibleRegenerateStale);
+            } catch (e) {
+                alert('Lỗi khi regenerate stale scenes: ' + e.message);
+            }
+            vpRegeneratingStale = false;
+            await vpLoadContinuity();
+        }
+
+        function vpOpenDetailModal(title, bodyHtml) {
+            document.getElementById('vp-detail-modal-title').textContent = title;
+            document.getElementById('vp-detail-modal-body').innerHTML = bodyHtml;
+            document.getElementById('vp-detail-modal').style.cssText = 'display:flex !important;';
+        }
+
+        function vpCloseDetailModal() {
+            document.getElementById('vp-detail-modal').style.cssText = 'display:none !important;';
+        }
+
+        // Extracts a claim's .value, treating null/empty-string/empty-array as "nothing to
+        // show" — claims with confidence:"unknown" are skipped entirely here rather than
+        // rendered as a hollow placeholder, same convention as the shot-prompt builder.
+        function vpClaimValue(claim) {
+            if (!claim || claim.value === null || claim.value === undefined) return null;
+            if (typeof claim.value === 'string' && claim.value.trim() === '') return null;
+            if (Array.isArray(claim.value) && claim.value.length === 0) return null;
+            return claim.value;
+        }
+
+        function vpClaimLine(label, claim) {
+            const v = vpClaimValue(claim);
+            if (v === null) return '';
+            const text = Array.isArray(v) ? v.join(', ') : String(v);
+            return `<div class="text-sm"><span class="font-medium text-gray-700">${label}:</span> <span class="text-gray-600">${vpEscape(text)}</span></div>`;
+        }
+
+        async function vpShowStoryBibleDetail(kind) {
+            let data;
+            try {
+                const resp = await fetch(vpUrls.storyBibleDetails, { headers: { Accept: 'application/json' } });
+                data = await vpJson(resp);
+            } catch (e) {
+                alert('Lỗi khi tải chi tiết Story Bible: ' + e.message);
+                return;
+            }
+            if (!data.success) {
+                alert(data.message || 'Không tải được dữ liệu.');
+                return;
+            }
+
+            if (kind === 'timelines') {
+                vpOpenDetailModal('🕐 Timelines', vpRenderTimelinesDetail(data.timelines));
+            } else if (kind === 'locations') {
+                vpOpenDetailModal('📍 Locations', vpRenderLocationsDetail(data.locations));
+            } else if (kind === 'characters') {
+                vpOpenDetailModal('🧑 Characters', vpRenderCharactersDetail(data.characters));
+            }
+        }
+
+        function vpRenderTimelinesDetail(timelines) {
+            if (!timelines || timelines.length === 0) return '<p class="text-sm text-gray-400">Không có timeline nào.</p>';
+            return timelines.map(t => {
+                const profile = (t.profile || {}).value || {};
+                return `
+                <div class="border rounded-lg p-3">
+                    <div class="font-semibold text-gray-800">${vpEscape(t.label)} <span class="text-xs text-gray-400 font-normal">(${vpEscape(t.timeline_type)}, thứ tự ${t.chronological_order})</span></div>
+                    ${profile.story_time_marker ? `<div class="text-sm"><span class="font-medium text-gray-700">Mốc thời gian:</span> <span class="text-gray-600">${vpEscape(profile.story_time_marker)}</span></div>` : ''}
+                    ${profile.description ? `<div class="text-sm"><span class="font-medium text-gray-700">Mô tả:</span> <span class="text-gray-600">${vpEscape(profile.description)}</span></div>` : ''}
+                </div>`;
+            }).join('');
+        }
+
+        function vpRenderLocationsDetail(locations) {
+            if (!locations || locations.length === 0) return '<p class="text-sm text-gray-400">Không có location nào.</p>';
+            return locations.map(l => {
+                const cc = l.cultural_context || {};
+                const groups = (cc.cultural_groups_present || [])
+                    .map(g => vpClaimValue(g))
+                    .filter(Boolean)
+                    .map(v => `${v.name || ''}${v.presence ? ' (' + v.presence + ')' : ''}`)
+                    .join(', ');
+                return `
+                <div class="border rounded-lg p-3">
+                    <div class="font-semibold text-gray-800">${vpEscape(l.canonical_name)}</div>
+                    ${l.aliases && l.aliases.length ? `<div class="text-xs text-gray-400 mb-1">aka: ${vpEscape(l.aliases.join(', '))}</div>` : ''}
+                    ${vpClaimLine('Vùng', cc.region)}
+                    ${vpClaimLine('Thời kỳ/chính thể', cc.historical_polity)}
+                    ${groups ? `<div class="text-sm"><span class="font-medium text-gray-700">Nhóm văn hóa:</span> <span class="text-gray-600">${vpEscape(groups)}</span></div>` : ''}
+                    ${vpClaimLine('Kiến trúc', cc.architecture)}
+                    ${vpClaimLine('Trang phục', cc.clothing)}
+                    ${vpClaimLine('Giao thông', cc.transportation)}
+                    ${vpClaimLine('Tôn giáo', cc.religion)}
+                    ${vpClaimLine('Vật dụng', cc.material_culture)}
+                    ${vpClaimLine('Môi trường', cc.environment)}
+                    ${vpClaimLine('Giới hạn tránh sai thời đại', cc.anachronism_constraints)}
+                    ${vpClaimLine('Ghi chú hình ảnh', l.visual_notes)}
+                </div>`;
+            }).join('');
+        }
+
+        function vpRenderCharactersDetail(characters) {
+            if (!characters || characters.length === 0) return '<p class="text-sm text-gray-400">Không có nhân vật nào.</p>';
+            return characters.map(c => {
+                const identity = (c.identity_anchor || {}).value || {};
+                const baseline = (c.baseline_traits || {}).value || {};
+                const phases = (c.phases || []).map(p => {
+                    const mt = (p.mutable_traits || {}).value || {};
+                    const profile = (p.profile || {}).value || {};
+                    const parts = [mt.physique, mt.wardrobe, mt.emotional_state, mt.social_status, mt.injuries].filter(Boolean).join(', ');
+                    return `<div class="ml-3 text-xs text-gray-600 border-l-2 border-gray-200 pl-2 mt-1">
+                        <span class="font-medium">${vpEscape(p.label)}</span>${profile.story_time_marker ? ' (' + vpEscape(profile.story_time_marker) + ')' : ''}${parts ? ': ' + vpEscape(parts) : ''}
+                    </div>`;
+                }).join('');
+
+                const identityText = [identity.ethnicity_notes, identity.base_face, identity.defining_marks].filter(Boolean).join(', ');
+                const baselineText = [baseline.physique, baseline.wardrobe, baseline.occupation, baseline.social_status].filter(Boolean).join(', ');
+
+                return `
+                <div class="border rounded-lg p-3">
+                    <div class="font-semibold text-gray-800">${vpEscape(c.canonical_name)}</div>
+                    ${c.aliases && c.aliases.length ? `<div class="text-xs text-gray-400 mb-1">aka: ${vpEscape(c.aliases.join(', '))}</div>` : ''}
+                    ${vpClaimLine('Vai trò', c.role)}
+                    ${identityText ? `<div class="text-sm"><span class="font-medium text-gray-700">Nhận diện:</span> <span class="text-gray-600">${vpEscape(identityText)}</span></div>` : ''}
+                    ${baselineText ? `<div class="text-sm"><span class="font-medium text-gray-700">Đặc điểm mặc định:</span> <span class="text-gray-600">${vpEscape(baselineText)}</span></div>` : ''}
+                    ${phases ? `<div class="mt-1"><span class="text-xs font-medium text-gray-500">Phases:</span>${phases}</div>` : '<div class="text-xs text-gray-400 mt-1">Không có phase (không đổi theo thời gian)</div>'}
+                </div>`;
+            }).join('');
+        }
+
+        async function vpContinuityAcceptIssue(issueId) {
+            await vpPost(vpUrls.continuityAccept(issueId));
+            await vpLoadContinuity();
+        }
+
+        async function vpContinuityRegenerateSelected() {
+            const issueIds = Object.keys(vpContinuitySelected).filter(id => vpContinuitySelected[id]).map(Number);
+            if (issueIds.length === 0) {
+                alert('Chưa chọn issue nào để regenerate.');
+                return;
+            }
+            await vpPost(vpUrls.continuityRegenerateSelected, { issue_ids: issueIds });
+            vpContinuitySelected = {};
+            await vpLoadContinuity();
+            await vpLoad();
+        }
+
+        function vpContinuityToggleIssue(issueId, checked) {
+            vpContinuitySelected[issueId] = checked;
+        }
+
+        const CONTINUITY_SEVERITY_LABELS = {
+            error: ['bg-red-100 text-red-700', '❌ Error'],
+            warning: ['bg-amber-100 text-amber-700', '⚠️ Warning'],
+            needs_review: ['bg-blue-100 text-blue-700', '🔎 Needs review'],
+        };
+
+        function vpRenderContinuityPanel() {
+            const el = document.getElementById('vp-continuity-panel');
+            if (!el) return;
+
+            if (!vpContinuity) {
+                el.innerHTML = '<p class="text-sm text-gray-400">Đang tải continuity report...</p>';
+                return;
+            }
+
+            const counts = vpContinuity.shot_counts || {};
+            const issuesByScene = vpContinuity.issues_by_scene || {};
+            const sceneIds = Object.keys(issuesByScene);
+            const autoRegenerateCount = sceneIds.reduce((sum, sid) => sum + issuesByScene[sid].filter(i => i.recommended_action === 'auto_regenerate' && i.status === 'open').length, 0);
+
+            let html = `
+                <div class="flex flex-wrap items-center gap-2 mb-3">
+                    <span class="px-2 py-1 rounded-lg text-xs font-semibold bg-green-100 text-green-700">✅ Valid: ${counts.valid || 0}</span>
+                    <span class="px-2 py-1 rounded-lg text-xs font-semibold bg-amber-100 text-amber-700">⚠️ Warning: ${counts.warning || 0}</span>
+                    <span class="px-2 py-1 rounded-lg text-xs font-semibold bg-red-100 text-red-700">❌ Invalid: ${counts.invalid || 0}</span>
+                    <span class="px-2 py-1 rounded-lg text-xs font-semibold bg-gray-100 text-gray-600">— Chưa validate: ${counts.unvalidated || 0}</span>
+                    <span class="px-2 py-1 rounded-lg text-xs font-semibold bg-purple-100 text-purple-700">🔗 Unresolved binding: ${vpContinuity.unresolved_bindings || 0}</span>
+                </div>
+                <div class="flex flex-wrap gap-2 mb-3">
+                    <button onclick="vpContinuityValidateAll()" class="text-sm bg-slate-700 hover:bg-slate-800 text-white font-semibold py-2 px-4 rounded-lg">🔍 Validate toàn bộ</button>
+                    <button onclick="vpContinuityRevalidateStale()" class="text-sm bg-gray-600 hover:bg-gray-700 text-white font-semibold py-2 px-4 rounded-lg">🔄 Validate lại phần stale</button>
+                    <button onclick="vpContinuityRegenerateSelected()" class="text-sm bg-orange-600 hover:bg-orange-700 text-white font-semibold py-2 px-4 rounded-lg" ${autoRegenerateCount === 0 ? 'disabled' : ''}>
+                        ♻️ Regenerate selected
+                    </button>
+                </div>`;
+
+            if (sceneIds.length === 0) {
+                html += '<p class="text-sm text-gray-400">Không có issue nào đang mở.</p>';
+            } else {
+                sceneIds.forEach(sceneId => {
+                    const issues = issuesByScene[sceneId];
+                    const sceneLabel = issues[0].scene ? `#${issues[0].scene.scene_index} — ${vpEscape(issues[0].scene.title)}` : `Scene #${sceneId}`;
+                    html += `<div class="border rounded-lg p-3 mb-2">
+                        <p class="text-sm font-semibold text-gray-700 mb-2">${sceneLabel}</p>`;
+                    issues.forEach(issue => {
+                        const [cls, label] = CONTINUITY_SEVERITY_LABELS[issue.severity] || CONTINUITY_SEVERITY_LABELS.warning;
+                        const shotLabel = issue.shot ? `Shot #${issue.shot.shot_index}` : 'Scene-level';
+                        const canRegenerate = issue.recommended_action === 'auto_regenerate' && issue.status === 'open';
+                        const canAccept = issue.status === 'open' && issue.severity !== 'error';
+
+                        html += `<div class="flex items-start gap-2 py-1.5 border-t first:border-t-0">
+                            ${canRegenerate ? `<input type="checkbox" onchange="vpContinuityToggleIssue(${issue.id}, this.checked)" class="mt-1">` : '<span class="w-4"></span>'}
+                            <div class="flex-1 text-sm">
+                                <span class="px-2 py-0.5 rounded-full text-xs font-medium ${cls}">${label}</span>
+                                <span class="text-xs text-gray-500 ml-1">${shotLabel} · ${vpEscape(issue.issue_type)} · ${vpEscape(issue.recommended_action)} · ${vpEscape(issue.status)}</span>
+                                <p class="text-gray-700">${vpEscape(issue.message)}</p>
+                            </div>
+                            ${canAccept ? `<button onclick="vpContinuityAcceptIssue(${issue.id})" class="text-xs bg-gray-200 hover:bg-gray-300 text-gray-700 font-semibold py-1 px-2 rounded">Accept</button>` : ''}
+                        </div>`;
+                    });
+                    html += '</div>';
+                });
+            }
+
+            el.innerHTML = html;
         }
 
         async function vpLoadSummary() {
@@ -171,24 +489,93 @@
             }
         }
 
+        // Compares old vs new scene/shot trees to decide whether the background poll can
+        // patch just the shots that actually changed instead of rebuilding the whole page.
+        // Any structural difference (scene added/removed/reordered, shot count changed) bails
+        // out to `canPatch: false` so the caller falls back to a full vpRender() — patching
+        // only ever touches shots we can prove are unchanged siblings of a changed one.
+        function vpDiffScenes(oldScenes, newScenes) {
+            if (!oldScenes || oldScenes.length !== newScenes.length) return { canPatch: false, changedShots: [] };
+            for (let i = 0; i < newScenes.length; i++) {
+                if (oldScenes[i].id !== newScenes[i].id) return { canPatch: false, changedShots: [] };
+            }
+
+            const changedShots = [];
+            for (const newScene of newScenes) {
+                const oldScene = oldScenes.find(s => s.id === newScene.id);
+                const oldShots = (oldScene && oldScene.shots) || [];
+                const newShots = newScene.shots || [];
+                if (oldShots.length !== newShots.length) return { canPatch: false, changedShots: [] };
+
+                for (const newShot of newShots) {
+                    const oldShot = oldShots.find(s => s.id === newShot.id);
+                    if (!oldShot || JSON.stringify(oldShot) !== JSON.stringify(newShot)) {
+                        changedShots.push({ sceneId: newScene.id, shotId: newShot.id });
+                    }
+                }
+            }
+            return { canPatch: true, changedShots };
+        }
+
         async function vpLoad() {
+            let data = null;
             try {
                 const resp = await fetch(vpUrls.status, { headers: { Accept: 'application/json' } });
-                const data = await vpJson(resp);
-                vpData.pipeline = data.pipeline;
-                vpData.scenes = data.scenes || [];
+                data = await vpJson(resp);
             } catch (e) {
                 vpData.pipeline = null;
                 vpData.scenes = [];
+                vpRender();
+                vpSchedulePoll();
+                return;
             }
 
-            vpRender();
+            const prevPipeline = vpData.pipeline;
+            const prevScenes = vpData.scenes;
+            const newPipeline = data.pipeline;
+            const newScenes = data.scenes || [];
 
+            // Only attempt a quiet patch when we're already showing the scene list, the
+            // pipeline status hasn't changed (a status change can switch the whole view —
+            // start screen / progress bar / scene list — so it always needs a full render),
+            // and it's not the error-banner view (that banner's failed-chunk count isn't
+            // covered by per-shot diffing, so just re-render it in full — rare anyway).
+            const inSceneView = prevPipeline && ['analyzed', 'analyzed_with_errors'].includes(prevPipeline.status);
+            const sameStatus = prevPipeline && newPipeline && prevPipeline.status === newPipeline.status;
+
+            let patched = false;
+            if (inSceneView && sameStatus && newPipeline.status !== 'analyzed_with_errors') {
+                const diff = vpDiffScenes(prevScenes, newScenes);
+                vpData.pipeline = newPipeline;
+                vpData.scenes = newScenes;
+                if (diff.canPatch) {
+                    diff.changedShots.forEach(({ sceneId, shotId }) => vpPatchShotCard(sceneId, shotId));
+                    patched = true;
+                }
+            }
+
+            if (!patched) {
+                vpData.pipeline = newPipeline;
+                vpData.scenes = newScenes;
+                vpRender();
+            }
+
+            // Continuity/story-bible panels do their own surgical innerHTML replacement (not
+            // a full-page render), so refreshing them every cycle doesn't cause the flicker
+            // vpRender() would — safe to always do, on both the patch and full-render paths.
+            if (document.getElementById('vp-continuity-panel') || document.getElementById('vp-story-bible-panel')) {
+                vpLoadContinuity();
+            }
+
+            vpSchedulePoll();
+        }
+
+        function vpSchedulePoll() {
             // Keep polling in the background even after analysis finishes, at a slower pace —
             // this is what catches shots resolved from OUTSIDE this open tab (the Chrome
             // extension sending a Storyblocks clip straight to the API), which otherwise never
-            // shows up until the user manually reloads the page and loses their scroll/expand
-            // state. Faster interval while the analysis progress bar itself needs to move.
+            // shows up until the user manually reloads the page. Faster interval while the
+            // analysis progress bar itself needs to move.
             const analyzing = vpData.pipeline && ['queued', 'analyzing'].includes(vpData.pipeline.status);
             const hasScenes = vpData.scenes && vpData.scenes.length > 0;
             const desiredInterval = analyzing ? 3000 : (hasScenes ? 8000 : null);
@@ -228,6 +615,7 @@
             }
 
             root.innerHTML = vpRenderScenes();
+            vpRenderContinuityPanel(); // re-populate with the last-loaded data (cheap, no fetch)
         }
 
         function vpHeartbeatLabel() {
@@ -442,6 +830,76 @@
             return chunks.filter(c => c.status === 'failed').length;
         }
 
+        // Targeted DOM patches — used instead of vpRender() (which replaces the whole
+        // #vp-root, losing scroll position and flickering) whenever we already know exactly
+        // which shot changed: single shot actions, the auto-run loops, and the background
+        // poll's diff-based patch path all funnel through these.
+        function vpPatchShotCard(sceneId, shotId) {
+            const scene = (vpData.scenes || []).find(s => s.id === sceneId);
+            if (!scene) return;
+            const shot = (scene.shots || []).find(sh => sh.id === shotId);
+            if (!shot) return;
+
+            const el = document.getElementById('vp-shot-' + shotId);
+            if (el) {
+                el.outerHTML = vpRenderShotCard(scene, shot);
+            }
+            vpPatchSceneBadge(scene);
+            vpPatchSummaryCounts();
+        }
+
+        function vpPatchSceneBadge(scene) {
+            const el = document.getElementById('vp-scene-badge-' + scene.id);
+            if (!el) return;
+            const shots = scene.shots || [];
+            const readyCount = shots.filter(s => s.status === 'ready').length;
+            el.textContent = `${readyCount}/${shots.length}`;
+            el.className = `px-2 py-0.5 rounded-full font-medium ${readyCount === shots.length && shots.length ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-600'}`;
+        }
+
+        function vpPatchSummaryCounts() {
+            const el = document.getElementById('vp-summary-counts');
+            if (!el) return;
+            const allShots = vpAllShots();
+            const readyCount = allShots.filter(({ shot }) => shot.status === 'ready').length;
+            el.innerHTML = `📋 <strong>${vpData.scenes.length}</strong> cảnh · <strong>${allShots.length}</strong> shot · <strong>${readyCount}</strong> đã sẵn sàng`;
+        }
+
+        function vpPatchAutoRunButtons() {
+            const libBtn = document.getElementById('vp-autorun-library-btn');
+            if (libBtn) {
+                libBtn.disabled = vpAutoRunningLibrary || vpAutoRunningAI;
+                libBtn.textContent = vpAutoRunningLibrary ? '⏳ Đang lấy từ Library...' : '📚 Tự động lấy từ Library';
+            }
+            const aiBtn = document.getElementById('vp-autorun-ai-btn');
+            if (aiBtn) {
+                aiBtn.disabled = vpAutoRunningLibrary || vpAutoRunningAI;
+                aiBtn.textContent = vpAutoRunningAI ? '⏳ Đang tạo bằng AI...' : '🎨 Tự động tạo bằng AI';
+            }
+        }
+
+        // Refetches full pipeline status into vpData WITHOUT calling vpRender() — the caller
+        // then patches only the one shot card it knows changed, instead of paying for (and
+        // visually disrupting the page with) a full re-render for a single-shot action.
+        async function vpRefreshDataQuietly() {
+            try {
+                const resp = await fetch(vpUrls.status, { headers: { Accept: 'application/json' } });
+                const data = await vpJson(resp);
+                vpData.pipeline = data.pipeline;
+                vpData.scenes = data.scenes || [];
+                return true;
+            } catch (e) {
+                return false;
+            }
+        }
+
+        async function vpRefreshAndPatchShot(sceneId, shotId) {
+            const ok = await vpRefreshDataQuietly();
+            if (ok) {
+                vpPatchShotCard(sceneId, shotId);
+            }
+        }
+
         function vpRenderScenes() {
             const scenes = vpData.scenes;
             const allShots = vpAllShots();
@@ -462,7 +920,7 @@
 
             html += `
                 <div class="flex flex-col sm:flex-row sm:justify-between sm:items-center gap-3 mb-3">
-                    <p class="text-sm text-gray-600">📋 <strong>${scenes.length}</strong> cảnh · <strong>${allShots.length}</strong> shot · <strong>${readyCount}</strong> đã sẵn sàng</p>
+                    <p id="vp-summary-counts" class="text-sm text-gray-600">📋 <strong>${scenes.length}</strong> cảnh · <strong>${allShots.length}</strong> shot · <strong>${readyCount}</strong> đã sẵn sàng</p>
                     <div class="flex gap-2 flex-wrap">
                         <button onclick="vpAutoRunLibrary()" id="vp-autorun-library-btn" class="text-sm bg-purple-600 hover:bg-purple-700 text-white font-semibold py-2 px-4 rounded-lg" ${vpAutoRunningLibrary || vpAutoRunningAI ? 'disabled' : ''}>
                             ${vpAutoRunningLibrary ? '⏳ Đang lấy từ Library...' : '📚 Tự động lấy từ Library'}
@@ -475,7 +933,15 @@
                         </a>
                     </div>
                 </div>
-                ${vpImageSettingsControls()}`;
+                ${vpImageSettingsControls()}
+                <div class="mb-4 p-4 rounded-lg border bg-white">
+                    <h3 class="text-sm font-bold text-gray-700 mb-2">🧠 AI Director / Story Bible</h3>
+                    <div id="vp-story-bible-panel"><p class="text-sm text-gray-400">Đang tải trạng thái Story Bible...</p></div>
+                </div>
+                <div class="mb-4 p-4 rounded-lg border bg-white">
+                    <h3 class="text-sm font-bold text-gray-700 mb-2">🧭 Continuity Report</h3>
+                    <div id="vp-continuity-panel"><p class="text-sm text-gray-400">Đang tải continuity report...</p></div>
+                </div>`;
 
             scenes.forEach(scene => {
                 html += vpRenderSceneCard(scene);
@@ -511,8 +977,12 @@
             return `<span class="px-2 py-0.5 rounded-full text-xs font-medium ${cls}">${label}</span>`;
         }
 
-        function vpPreviewThumb(path, sizeClass) {
-            const url = '/storage/' + path;
+        function vpPreviewThumb(path, sizeClass, cacheBust) {
+            // The resolved file path is fixed per shot (same filename every regeneration —
+            // see SceneAssetResolverService::generateAiImage), so without a cache-busting
+            // query param the browser keeps serving the stale cached image/video after
+            // "Tạo ảnh khác" overwrites the file with new bytes at the same URL.
+            const url = '/storage/' + path + (cacheBust ? '?v=' + encodeURIComponent(cacheBust) : '');
             const isVideo = /\.(mp4|mov|webm)$/i.test(path);
             sizeClass = sizeClass || 'w-full max-w-sm';
             return `<button type="button" onclick="vpOpenImageModal('${vpEscape(url)}', ${isVideo})" class="block ${sizeClass}">
@@ -546,7 +1016,7 @@
             }
 
             return `
-                <div class="border border-gray-200 rounded-lg mb-3 overflow-hidden">
+                <div id="vp-scene-${scene.id}" class="border border-gray-200 rounded-lg mb-3 overflow-hidden">
                     <button type="button" onclick="vpToggleScene(${scene.id})" class="w-full text-left px-4 py-3 bg-gray-50 hover:bg-gray-100 flex justify-between items-center gap-3">
                         <div class="flex items-center gap-3 min-w-0">
                             <span class="text-xs text-gray-400 flex-shrink-0">#${scene.scene_index}</span>
@@ -555,7 +1025,7 @@
                         <div class="flex items-center gap-2 flex-shrink-0 text-xs text-gray-500">
                             <span>${typeLabel}</span>
                             <span>~${minutes} phút · ${shots.length} shot${avatarCount ? ' · 🎙️' + avatarCount : ''}</span>
-                            <span class="px-2 py-0.5 rounded-full font-medium ${readyCount === shots.length && shots.length ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-600'}">${readyCount}/${shots.length}</span>
+                            <span id="vp-scene-badge-${scene.id}" class="px-2 py-0.5 rounded-full font-medium ${readyCount === shots.length && shots.length ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-600'}">${readyCount}/${shots.length}</span>
                         </div>
                     </button>
                     ${body}
@@ -589,14 +1059,14 @@
 
                 const path = shot.avatar_video_path || (shot.status !== 'image_ready' ? shot.resolved_asset_path : null);
                 if (path) {
-                    body += `<div class="mt-1">${vpPreviewThumb(path)}</div>`;
+                    body += `<div class="mt-1">${vpPreviewThumb(path, null, shot.updated_at)}</div>`;
                 }
 
                 body += `</div>`;
             }
 
             return `
-                <div class="border border-gray-100 rounded-lg overflow-hidden">
+                <div id="vp-shot-${shot.id}" class="border border-gray-100 rounded-lg overflow-hidden">
                     <button type="button" onclick="vpToggleShot(${shot.id})" class="w-full text-left px-3 py-2 bg-white hover:bg-gray-50 flex justify-between items-center gap-3">
                         <div class="flex items-center gap-2 min-w-0">
                             <span class="text-xs text-gray-400 flex-shrink-0">#${shot.shot_index}</span>
@@ -634,7 +1104,7 @@
             // trước khi tốn phí chuyển thành video (Kling/Seedance), theo đúng yêu cầu
             // "không mặc định tạo video".
             if (shot.status === 'image_ready' && shot.resolved_asset_path) {
-                html += `<div class="max-w-xs">${vpPreviewThumb(shot.resolved_asset_path, 'w-full')}</div>`;
+                html += `<div class="max-w-xs">${vpPreviewThumb(shot.resolved_asset_path, 'w-full', shot.updated_at)}</div>`;
                 html += `<div class="flex gap-2 pt-2">
                     <button onclick="vpAnimateShot(${scene.id}, ${shot.id})" ${busy === 'animate' ? 'disabled' : ''}
                         class="text-xs bg-teal-600 hover:bg-teal-700 disabled:opacity-50 text-white font-semibold py-1.5 px-3 rounded-lg">
@@ -713,62 +1183,62 @@
 
         async function vpSearchShot(sceneId, shotId) {
             vpBusyShots[shotId] = 'search';
-            vpRender();
+            vpPatchShotCard(sceneId, shotId);
             try {
                 await vpPost(vpUrls.search(sceneId, shotId));
             } catch (e) {
                 alert('Lỗi tìm nguồn: ' + e.message);
             }
             delete vpBusyShots[shotId];
-            await vpLoad();
+            await vpRefreshAndPatchShot(sceneId, shotId);
         }
 
         async function vpResolveShot(sceneId, shotId, forceAi) {
             vpBusyShots[shotId] = 'resolve';
-            vpRender();
+            vpPatchShotCard(sceneId, shotId);
             try {
                 await vpPost(vpUrls.resolve(sceneId, shotId), forceAi ? { force_ai: true } : null);
             } catch (e) {
                 alert('Lỗi resolve: ' + e.message);
             }
             delete vpBusyShots[shotId];
-            await vpLoad();
+            await vpRefreshAndPatchShot(sceneId, shotId);
         }
 
         async function vpAnimateShot(sceneId, shotId) {
             vpBusyShots[shotId] = 'animate';
-            vpRender();
+            vpPatchShotCard(sceneId, shotId);
             try {
                 await vpPost(vpUrls.animate(sceneId, shotId));
             } catch (e) {
                 alert('Lỗi chuyển thành video: ' + e.message);
             }
             delete vpBusyShots[shotId];
-            await vpLoad();
+            await vpRefreshAndPatchShot(sceneId, shotId);
         }
 
         async function vpGenerateAvatar(sceneId, shotId) {
             vpBusyShots[shotId] = 'avatar';
-            vpRender();
+            vpPatchShotCard(sceneId, shotId);
             try {
                 await vpPost(vpUrls.avatar(sceneId, shotId));
             } catch (e) {
                 alert('Lỗi tạo avatar: ' + e.message);
             }
             delete vpBusyShots[shotId];
-            await vpLoad();
+            await vpRefreshAndPatchShot(sceneId, shotId);
         }
 
         async function vpSelectCandidate(sceneId, shotId, candidateId) {
             vpBusyShots[shotId] = 'select';
-            vpRender();
+            vpPatchShotCard(sceneId, shotId);
             try {
                 await vpPost(vpUrls.select(sceneId, shotId, candidateId));
             } catch (e) {
                 alert('Lỗi: ' + e.message);
             }
             delete vpBusyShots[shotId];
-            await vpLoad();
+            await vpRefreshAndPatchShot(sceneId, shotId);
         }
 
         // Lấy từ Library — với từng shot có thật ngoài đời (bỏ qua avatar): tìm thư viện/stock
@@ -777,7 +1247,7 @@
         // ở đây, việc đó dành cho nút "Tự động tạo bằng AI" riêng.
         async function vpAutoRunLibrary() {
             vpAutoRunningLibrary = true;
-            vpRender();
+            vpPatchAutoRunButtons();
 
             while (vpAutoRunningLibrary) {
                 const next = vpAllShots().find(({ shot }) =>
@@ -786,13 +1256,13 @@
 
                 const { scene, shot } = next;
                 vpBusyShots[shot.id] = 'search';
-                vpRender();
+                vpPatchShotCard(scene.id, shot.id);
 
                 try {
                     const result = await vpPost(vpUrls.search(scene.id, shot.id));
                     if (result.mode !== 'library' && result.meets_threshold) {
                         vpBusyShots[shot.id] = 'resolve';
-                        vpRender();
+                        vpPatchShotCard(scene.id, shot.id);
                         await vpPost(vpUrls.resolve(scene.id, shot.id));
                     }
                 } catch (e) {
@@ -802,11 +1272,11 @@
                 }
 
                 delete vpBusyShots[shot.id];
-                await vpLoad();
+                await vpRefreshAndPatchShot(scene.id, shot.id);
             }
 
             vpAutoRunningLibrary = false;
-            vpRender();
+            vpPatchAutoRunButtons();
         }
 
         // Tạo bằng AI — quét mọi shot chưa có kết quả (bỏ qua avatar), kể cả shot hư cấu chưa
@@ -814,7 +1284,7 @@
         // (force_ai) bất kể điểm candidate hiện có, không đụng vào shot đã 'ready'/'image_ready'.
         async function vpAutoRunAI() {
             vpAutoRunningAI = true;
-            vpRender();
+            vpPatchAutoRunButtons();
 
             while (vpAutoRunningAI) {
                 const next = vpAllShots().find(({ shot }) =>
@@ -823,7 +1293,7 @@
 
                 const { scene, shot } = next;
                 vpBusyShots[shot.id] = 'resolve';
-                vpRender();
+                vpPatchShotCard(scene.id, shot.id);
 
                 try {
                     await vpPost(vpUrls.resolve(scene.id, shot.id), { force_ai: true });
@@ -834,11 +1304,11 @@
                 }
 
                 delete vpBusyShots[shot.id];
-                await vpLoad();
+                await vpRefreshAndPatchShot(scene.id, shot.id);
             }
 
             vpAutoRunningAI = false;
-            vpRender();
+            vpPatchAutoRunButtons();
         }
 
         vpInit();
