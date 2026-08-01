@@ -26,4 +26,10 @@ Route::middleware('auth:sanctum')->prefix('extension')->group(function () {
     Route::get('books', [VideoPipelineExtensionController::class, 'books']);
     Route::get('books/{audioBook}/shots', [VideoPipelineExtensionController::class, 'shots']);
     Route::post('shots/{shot}/ingest', [VideoPipelineExtensionController::class, 'ingest']);
+
+    // Same manual hand-off pattern, for audio (SFX/ambience/music) candidates instead of video
+    // clips — see AudioDirectionController::setActiveAudioTargetForScene()/ForShot() for how
+    // the target gets cached before the user opens a Storyblocks search tab.
+    Route::get('active-audio-target', [VideoPipelineExtensionController::class, 'activeAudioTarget']);
+    Route::post('audio/ingest', [VideoPipelineExtensionController::class, 'ingestAudio']);
 });

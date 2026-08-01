@@ -77,7 +77,10 @@
       "Bash(curl -s -H 'Authorization: Bearer 1|kLH7pkVQjyogx8p4SRdmZrkfwavrABcOt3TZSrus600b71f7' -H 'Accept: application/json' http://sumotech.test/api/extension/active-target)",
       "Bash(curl -s -H 'Authorization: Bearer 1|kLH7pkVQjyogx8p4SRdmZrkfwavrABcOt3TZSrus600b71f7' -H 'Accept: application/json' http://sumotech.test/api/extension/books)",
       "Bash(curl -s -H 'Authorization: Bearer 1|kLH7pkVQjyogx8p4SRdmZrkfwavrABcOt3TZSrus600b71f7' -H 'Accept: application/json' http://sumotech.test/api/extension/books/64/shots)",
-      "Bash(php -l /c/laragon/www/sumotech/config/queue.php)"
+      "Bash(php -l /c/laragon/www/sumotech/config/queue.php)",
+      "Bash(php -l app/Jobs/SplitVideoScenesJob.php)",
+      "Bash(php -l app/Jobs/EnrichVideoShotsJob.php)",
+      "Bash(php -l app/Models/AudiobookVideoShot.php)"
     ]
   }
 }

@@ -19,6 +19,12 @@ return new class extends Migration
             return;
         }
 
+        if (DB::connection()->getDriverName() === 'pgsql') {
+            DB::statement('ALTER TABLE api_usages ALTER COLUMN estimated_cost DROP NOT NULL');
+            DB::statement('ALTER TABLE api_usages ALTER COLUMN estimated_cost DROP DEFAULT');
+            return;
+        }
+
         DB::statement('ALTER TABLE api_usages MODIFY estimated_cost DECIMAL(10,6) NULL DEFAULT NULL');
     }
 
@@ -29,6 +35,13 @@ return new class extends Migration
         }
 
         DB::statement('UPDATE api_usages SET estimated_cost = 0 WHERE estimated_cost IS NULL');
+
+        if (DB::connection()->getDriverName() === 'pgsql') {
+            DB::statement('ALTER TABLE api_usages ALTER COLUMN estimated_cost SET DEFAULT 0');
+            DB::statement('ALTER TABLE api_usages ALTER COLUMN estimated_cost SET NOT NULL');
+            return;
+        }
+
         DB::statement('ALTER TABLE api_usages MODIFY estimated_cost DECIMAL(10,6) NOT NULL DEFAULT 0');
     }
 };

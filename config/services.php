@@ -38,6 +38,13 @@ return [
         'redirect_uri' => env('YOUTUBE_REDIRECT_URI', '/youtube-channels/oauth/callback'),
     ],
 
+    'elevenlabs' => [
+        // Env var name is ELEVENLAB_API_KEY (no trailing S) — matches what's already in .env,
+        // intentionally not "corrected" here since that would just break the real key.
+        'api_key' => env('ELEVENLAB_API_KEY'),
+        'base_url' => env('ELEVENLABS_BASE_URL', 'https://api.elevenlabs.io'),
+    ],
+
     'openai' => [
         'api_key' => env('OPENAI_API_KEY'),
         'base_url' => env('OPENAI_BASE_URL', 'https://api.openai.com/v1'),
@@ -50,6 +57,7 @@ return [
         'api_key' => env('QDRANT_API_KEY'),
         'collection' => env('QDRANT_COLLECTION', 'audiobook_chapter_chunks'),
         'asset_collection' => env('QDRANT_ASSET_COLLECTION', 'video_asset_library'),
+        'audio_asset_collection' => env('QDRANT_AUDIO_ASSET_COLLECTION', 'audio_asset_library'),
         'distance' => env('QDRANT_DISTANCE', 'Cosine'),
         'timeout' => (int) env('QDRANT_TIMEOUT', 30),
         'openai_timeout' => (int) env('QDRANT_OPENAI_TIMEOUT', 60),

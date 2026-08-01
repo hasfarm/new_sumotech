@@ -12,6 +12,13 @@ return new class extends Migration
      */
     public function up(): void
     {
+        // This migration exists to normalize a column type that only ever drifted on MySQL —
+        // a fresh Postgres database never has this problem in the first place (its bigint
+        // has no signed/unsigned distinction to normalize), so it's a no-op there.
+        if (DB::connection()->getDriverName() !== 'mysql') {
+            return;
+        }
+
         // Just rename column if it has old name
         if (Schema::hasColumn('audiobook_chapter_chunks', 'audiobook_chapter_id')) {
             Schema::table('audiobook_chapter_chunks', function (Blueprint $table) {

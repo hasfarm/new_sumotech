@@ -18,7 +18,13 @@ class R2StorageService
         return Storage::disk('r2');
     }
 
-    public function putFile(string $localAbsolutePath, string $r2Key): void
+    /**
+     * @param array<string,string> $metadata Custom S3 object metadata (x-amz-meta-* headers)
+     *   — string values only. Lets the object itself be identifiable/searchable from any S3
+     *   tool/console, not just via the app's own MySQL row + Qdrant index (which are the only
+     *   place this context lived before — the R2 object itself was an opaque blob).
+     */
+    public function putFile(string $localAbsolutePath, string $r2Key, array $metadata = []): void
     {
         $stream = fopen($localAbsolutePath, 'r');
         if ($stream === false) {
@@ -26,7 +32,11 @@ class R2StorageService
         }
 
         try {
-            $this->disk()->put($r2Key, $stream);
+            $options = [];
+            if (!empty($metadata)) {
+                $options['Metadata'] = $metadata;
+            }
+            $this->disk()->put($r2Key, $stream, $options);
         } finally {
             if (is_resource($stream)) {
                 fclose($stream);
@@ -73,6 +83,16 @@ class R2StorageService
     public function exists(string $r2Key): bool
     {
         return $this->disk()->exists($r2Key);
+    }
+
+    /**
+     * A presigned, time-limited public URL for an object — lets an external API (e.g. HeyGen)
+     * fetch a file directly from R2 without making the bucket itself public. R2 is
+     * S3-compatible and supports presigned URLs the same way Laravel's S3 driver does.
+     */
+    public function temporaryUrl(string $r2Key, int $minutes = 30): string
+    {
+        return $this->disk()->temporaryUrl($r2Key, now()->addMinutes($minutes));
     }
 
     public function delete(string $r2Key): void

@@ -149,6 +149,16 @@ class EnrichVideoShotsJob implements ShouldQueue
                             'prompt_version' => VideoSceneAnalysisService::PROMPT_VERSION,
                             'story_bible_version_used' => $scene->story_bible_version_used,
                             'enriched_at' => now(),
+                            'needs_sfx' => $data['needs_sfx'] ?? false,
+                            'sfx_keywords' => $data['sfx_keywords'] ?? [],
+                            'sfx_prompt' => $data['sfx_prompt'] ?? null,
+                            'ambience_override' => $data['ambience_override'] ?? false,
+                            'ambience_keywords' => $data['ambience_keywords'] ?? [],
+                            'ambience_prompt' => $data['ambience_prompt'] ?? null,
+                            'music_override' => $data['music_override'] ?? false,
+                            'music_keywords' => $data['music_keywords'] ?? [],
+                            'music_prompt' => $data['music_prompt'] ?? null,
+                            'audio_prompt_version' => VideoSceneAnalysisService::AUDIO_PROMPT_VERSION,
                         ]);
                     }
 

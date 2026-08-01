@@ -20,23 +20,40 @@
     #msg.err { color: #dc2626; }
     #noconfig { color: #dc2626; font-size: 12px; }
     #openOptions { margin-top: 8px; font-size: 12px; color: #2563eb; cursor: pointer; text-decoration: underline; }
+    .modeTab { border: 1px solid #d1d5db; background: #f9fafb; padding: 5px 10px; border-radius: 6px; cursor: pointer; font-size: 12px; margin-right: 6px; }
+    .modeTab.active { background: #0d9488; color: #fff; border-color: #0d9488; }
+    #sendAudioBtn { margin-top: 12px; width: 100%; padding: 9px; background: #7c3aed; color: #fff; border: none; border-radius: 6px; cursor: pointer; font-weight: 600; font-size: 13px; }
+    #sendAudioBtn:hover { background: #6d28d9; }
+    #sendAudioBtn:disabled { opacity: .5; cursor: default; }
 </style>
 </head>
 <body>
-<h3>📤 Gửi video về Video Pipeline</h3>
+<div id="modeTabs" style="display:none; margin-bottom:10px;">
+    <button type="button" class="modeTab" id="modeVideo" data-mode="video">🎬 Video</button>
+    <button type="button" class="modeTab" id="modeAudio" data-mode="audio">🎵 Audio</button>
+</div>
+<h3 id="modeTitle">📤 Gửi video về Video Pipeline</h3>
 <div id="noconfig" style="display:none">
     Chưa cấu hình App URL / Token.
     <div id="openOptions">Mở trang cấu hình</div>
 </div>
 <div id="main" style="display:none">
-    <div class="target-box" id="targetBox">Đang tải...</div>
-    <button type="button" id="toggle">🔄 Chọn shot khác</button>
-    <div id="manual">
-        <select id="bookSelect"><option value="">-- Chọn sách --</option></select>
-        <select id="shotSelect"><option value="">-- Chọn sách trước --</option></select>
+    <div id="videoPanel">
+        <div class="target-box" id="targetBox">Đang tải...</div>
+        <button type="button" id="toggle">🔄 Chọn shot khác</button>
+        <div id="manual">
+            <select id="bookSelect"><option value="">-- Chọn sách --</option></select>
+            <select id="shotSelect"><option value="">-- Chọn sách trước --</option></select>
+        </div>
+        <input type="file" id="fileInput" accept="video/*">
+        <button type="button" id="sendBtn">📤 Gửi video về dự án</button>
     </div>
-    <input type="file" id="fileInput" accept="video/*">
-    <button type="button" id="sendBtn">📤 Gửi video về dự án</button>
+    <div id="audioPanel" style="display:none">
+        <div class="target-box" id="audioTargetBox">Đang tải...</div>
+        <div style="font-size:11px; color:#888; margin-top:2px;">Không có chế độ chọn thủ công cho audio — bấm "🔍 Tìm trên Storyblocks" đúng slot (ambience/music/sfx) trong app trước khi mở tab này.</div>
+        <input type="file" id="audioFileInput" accept="audio/*">
+        <button type="button" id="sendAudioBtn">📤 Gửi audio về dự án</button>
+    </div>
     <div id="msg"></div>
 </div>
 <script src="popup.js"></script>

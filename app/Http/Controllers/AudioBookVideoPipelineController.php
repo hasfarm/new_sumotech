@@ -2,7 +2,9 @@
 
 namespace App\Http\Controllers;
 
-use App\Jobs\ArchiveAssetToLibraryJob;
+use App\Jobs\BulkGenerateAvatarTtsJob;
+use App\Jobs\BulkGenerateNarrationTtsJob;
+use App\Jobs\BulkGenerateShotImagesJob;
 use App\Jobs\EnrichVideoShotsJob;
 use App\Jobs\GenerateAvatarSegmentJob;
 use App\Jobs\ResolveSceneAssetJob;
@@ -14,6 +16,7 @@ use App\Models\AudiobookVideoShot;
 use App\Models\AudiobookVideoShotCandidate;
 use App\Services\AssetLibrary\AssetLibraryService;
 use App\Services\AssetLibrary\R2StorageService;
+use App\Services\AvatarSegmentService;
 use App\Services\ClipScoringService;
 use App\Services\SceneAssetResolverService;
 use App\Services\StockFootageAggregatorService;
@@ -29,7 +32,8 @@ class AudioBookVideoPipelineController extends Controller
         private readonly ClipScoringService $scoringService,
         private readonly SceneAssetResolverService $resolverService,
         private readonly AssetLibraryService $assetLibraryService,
-        private readonly R2StorageService $r2Storage
+        private readonly R2StorageService $r2Storage,
+        private readonly AvatarSegmentService $avatarService
     ) {}
 
     /**
@@ -49,7 +53,17 @@ class AudioBookVideoPipelineController extends Controller
         return response()->json([
             'success' => true,
             'pipeline' => $audioBook->videoPipeline,
-            'scenes' => $audioBook->videoScenes()->with('shots.candidates')->get(),
+            'scenes' => $audioBook->videoScenes()
+                ->with([
+                    'shots.candidates',
+                    'shots.sfxAsset',
+                    'shots.ambienceAsset',
+                    'shots.musicAsset',
+                    'ambienceAsset',
+                    'musicAsset',
+                ])
+                ->get(),
+            'speaker_avatar_url' => optional($audioBook->speaker)->avatar_url,
         ]);
     }
 
@@ -167,6 +181,79 @@ class AudioBookVideoPipelineController extends Controller
     }
 
     /**
+     * Main narration voice for the whole work — same per-pipeline scope as image_style.
+     * Deliberately separate from the avatar/lipsync voice below (updateAvatarTtsSettings())
+     * so pairing a specific voice with the speaker's avatar image never forces that same
+     * voice onto anything else.
+     */
+    public function updateTtsSettings(Request $request, AudioBook $audioBook)
+    {
+        $data = $this->validateTtsInput($request);
+        if ($data instanceof \Illuminate\Http\JsonResponse) {
+            return $data;
+        }
+
+        $pipeline = AudiobookVideoPipeline::updateOrCreate(
+            ['audio_book_id' => $audioBook->id],
+            [
+                'tts_provider' => $data['provider'],
+                'tts_voice_gender' => $data['gender'],
+                'tts_voice_name' => $data['voice_name'],
+            ]
+        );
+
+        return response()->json(['success' => true, 'pipeline' => $pipeline]);
+    }
+
+    /**
+     * Avatar/lipsync voice — consumed by AvatarSegmentService::generateTts() to TTS an
+     * avatar shot's narration before handing it to HeyGen. Falls back to the main pipeline
+     * voice, then to the book's own regular tts_* settings, if left unset here.
+     */
+    public function updateAvatarTtsSettings(Request $request, AudioBook $audioBook)
+    {
+        $data = $this->validateTtsInput($request);
+        if ($data instanceof \Illuminate\Http\JsonResponse) {
+            return $data;
+        }
+
+        $pipeline = AudiobookVideoPipeline::updateOrCreate(
+            ['audio_book_id' => $audioBook->id],
+            [
+                'avatar_tts_provider' => $data['provider'],
+                'avatar_tts_voice_gender' => $data['gender'],
+                'avatar_tts_voice_name' => $data['voice_name'],
+            ]
+        );
+
+        return response()->json(['success' => true, 'pipeline' => $pipeline]);
+    }
+
+    /**
+     * @return array{provider:?string,gender:?string,voice_name:?string}|\Illuminate\Http\JsonResponse
+     */
+    private function validateTtsInput(Request $request)
+    {
+        $provider = (string) $request->input('provider', '');
+        if ($provider !== '' && !in_array($provider, ['openai', 'gemini', 'microsoft', 'vbee'], true)) {
+            return response()->json(['success' => false, 'message' => 'Nhà cung cấp TTS không hợp lệ.'], 422);
+        }
+
+        $gender = (string) $request->input('voice_gender', 'female');
+        if (!in_array($gender, ['male', 'female'], true)) {
+            return response()->json(['success' => false, 'message' => 'Giới tính giọng đọc không hợp lệ.'], 422);
+        }
+
+        $voiceName = trim((string) $request->input('voice_name', ''));
+
+        return [
+            'provider' => $provider !== '' ? $provider : null,
+            'gender' => $gender,
+            'voice_name' => $voiceName !== '' ? $voiceName : null,
+        ];
+    }
+
+    /**
      * Cache key shared with Api\VideoPipelineExtensionController::activeTarget() — records
      * "which shot was the user just browsing for" when they click a keyword to open a
      * Storyblocks search tab, so the Chrome extension popup can prefill the right target
@@ -194,6 +281,10 @@ class AudioBookVideoPipelineController extends Controller
             'shot_id' => $shot->id,
             'shot_text' => $shot->sentence_text,
             'keyword' => (string) $request->input('keyword', ''),
+            // Lets the extension compare this against active-audio-target's own set_at and
+            // auto-pick whichever tab (Video/Audio) was actually just requested, instead of
+            // always defaulting to Video and looking like it "doesn't know" the audio target.
+            'set_at' => now()->toIso8601String(),
         ], now()->addMinutes(15));
 
         return response()->json(['success' => true]);
@@ -397,48 +488,101 @@ class AudioBookVideoPipelineController extends Controller
         // "Scene này có thật ngoài đời không?" — nếu AI đã đánh giá là hư cấu/kỳ ảo,
         // bỏ qua hẳn bước tìm thư viện và đi thẳng vào AI generate, không cần candidate nào.
         $forceAi = $request->boolean('force_ai');
-        $selected = (!$forceAi && $shot->is_real_world) ? $shot->candidates()->where('is_selected', true)->first() : null;
-
-        if ($selected && $selected->score_final >= ClipScoringService::SCORE_THRESHOLD) {
-            try {
-                $path = $this->resolverService->downloadStockAsset($shot, $selected->toArray());
-            } catch (\Throwable $e) {
-                $shot->update(['status' => 'failed', 'error_message' => $e->getMessage()]);
-                return response()->json(['success' => false, 'message' => $e->getMessage()], 500);
-            }
-
-            $shot->update([
-                'status' => 'ready',
-                'resolved_source' => $selected->source,
-                'resolved_asset_path' => $path,
-                'resolved_score' => $selected->score_final,
-                'error_message' => null,
-            ]);
-
-            ArchiveAssetToLibraryJob::dispatch($shot->id, $selected->source, $selected->external_id, $selected->license_label);
-
-            return response()->json(['success' => true, 'mode' => 'stock', 'shot' => $shot->fresh()]);
-        }
-
-        $shot->update(['status' => 'resolving', 'error_message' => null]);
 
         try {
-            $path = $this->resolverService->generateAiImage($shot);
+            $result = $this->resolverService->resolveShotOrThrow($shot, $forceAi);
         } catch (\Throwable $e) {
-            $shot->update(['status' => 'failed', 'error_message' => $e->getMessage()]);
+            $status = $e instanceof \App\Exceptions\ContentModerationException ? 'content_blocked' : 'failed';
+            $shot->update(['status' => $status, 'error_message' => $e->getMessage()]);
             return response()->json(['success' => false, 'message' => $e->getMessage()], 500);
         }
 
+        return response()->json(['success' => true, 'mode' => $result['mode'], 'shot' => $result['shot']]);
+    }
+
+    /**
+     * Lets the user directly edit the AI image prompt for a shot — the general fix for a
+     * shot whose image_request gets rejected by the AI provider's content-moderation policy
+     * (status 'content_blocked'): retrying with the exact same text just fails the same way
+     * again, so the fix is changing the wording, not re-clicking "retry". Also usable any time
+     * a user simply wants to steer the illustration differently, not only for blocked shots.
+     */
+    public function updateImageRequest(Request $request, AudioBook $audioBook, AudiobookVideoScene $scene, AudiobookVideoShot $shot)
+    {
+        if ($scene->audio_book_id !== $audioBook->id || $shot->video_scene_id !== $scene->id) {
+            abort(404);
+        }
+
+        $data = $request->validate(['image_request' => 'required|string|max:2000']);
+
         $shot->update([
-            'status' => 'image_ready',
-            'resolved_source' => 'ai_image',
-            'resolved_asset_path' => $path,
-            'error_message' => null,
+            'image_request' => $data['image_request'],
+            // Clears the "blocked" state so the shot goes back to looking like any other
+            // not-yet-generated shot — the existing "Tạo ảnh khác"/"Resolve" buttons already
+            // know how to retry from there, no separate "retry" endpoint needed.
+            'status' => $shot->status === 'content_blocked' ? 'pending' : $shot->status,
+            'error_message' => $shot->status === 'content_blocked' ? null : $shot->error_message,
         ]);
 
-        ArchiveAssetToLibraryJob::dispatch($shot->id, 'ai_image', null);
+        return response()->json(['success' => true, 'shot' => $shot->fresh()]);
+    }
 
-        return response()->json(['success' => true, 'mode' => 'ai_image', 'shot' => $shot->fresh()]);
+    /**
+     * "Tự động tạo bằng AI": dispatches a background job that force-generates AI images for
+     * every non-avatar shot not yet 'ready'/'image_ready', instead of the old client-side
+     * while-loop — that loop silently died the instant the tab was closed/refreshed/the
+     * machine slept, with zero server-side memory that a run was ever in progress. The job
+     * persists live progress on the pipeline (bulk_ai_generate_status) so the page can just
+     * poll status() like every other pipeline stage, and survives page reloads.
+     */
+    public function bulkGenerateAi(AudioBook $audioBook)
+    {
+        $pipeline = AudiobookVideoPipeline::firstOrCreate(['audio_book_id' => $audioBook->id]);
+        $current = $pipeline->bulk_ai_generate_status;
+
+        if ($current && ($current['status'] ?? null) === 'running') {
+            return response()->json(['success' => true, 'already_running' => true, 'pipeline' => $pipeline]);
+        }
+
+        BulkGenerateShotImagesJob::dispatch($audioBook->id);
+
+        return response()->json(['success' => true, 'already_running' => false]);
+    }
+
+    /**
+     * "Create All" next to the main narration voice picker — bulk-generates TTS for every
+     * non-avatar shot missing narration_audio_path, using the pipeline's main voice.
+     */
+    public function bulkGenerateNarrationTts(AudioBook $audioBook)
+    {
+        $pipeline = AudiobookVideoPipeline::firstOrCreate(['audio_book_id' => $audioBook->id]);
+        $current = $pipeline->bulk_narration_tts_status;
+
+        if ($current && ($current['status'] ?? null) === 'running') {
+            return response()->json(['success' => true, 'already_running' => true, 'pipeline' => $pipeline]);
+        }
+
+        BulkGenerateNarrationTtsJob::dispatch($audioBook->id);
+
+        return response()->json(['success' => true, 'already_running' => false]);
+    }
+
+    /**
+     * "Create All" next to the avatar voice picker — bulk-generates TTS for every avatar shot
+     * missing avatar_audio_path, using the pipeline's avatar voice.
+     */
+    public function bulkGenerateAvatarTts(AudioBook $audioBook)
+    {
+        $pipeline = AudiobookVideoPipeline::firstOrCreate(['audio_book_id' => $audioBook->id]);
+        $current = $pipeline->bulk_avatar_tts_status;
+
+        if ($current && ($current['status'] ?? null) === 'running') {
+            return response()->json(['success' => true, 'already_running' => true, 'pipeline' => $pipeline]);
+        }
+
+        BulkGenerateAvatarTtsJob::dispatch($audioBook->id);
+
+        return response()->json(['success' => true, 'already_running' => false]);
     }
 
     /**
@@ -462,6 +606,27 @@ class AudioBookVideoPipelineController extends Controller
     }
 
     /**
+     * Duyệt một shot 'image_ready' (ảnh AI tĩnh) làm kết quả cuối cùng LUÔN, không chuyển
+     * thành video — khác với animateShot() (chuyển ảnh -> video qua Kling/Seedance, tốn phí
+     * thêm). Nhiều shot dùng ảnh tĩnh là đủ, không cần chuyển động; trước đây không có cách
+     * nào thoát khỏi trạng thái "chờ duyệt" mà không tốn phí video.
+     */
+    public function approveShot(AudioBook $audioBook, AudiobookVideoScene $scene, AudiobookVideoShot $shot)
+    {
+        if ($scene->audio_book_id !== $audioBook->id || $shot->video_scene_id !== $scene->id) {
+            abort(404);
+        }
+
+        if ($shot->status !== 'image_ready' || !$shot->resolved_asset_path) {
+            return response()->json(['success' => false, 'message' => 'Shot này chưa có ảnh để duyệt.'], 422);
+        }
+
+        $shot->update(['status' => 'ready', 'error_message' => null]);
+
+        return response()->json(['success' => true, 'shot' => $shot->fresh()]);
+    }
+
+    /**
      * Step D: generate a real HeyGen talking-avatar clip for an avatar-flagged shot.
      */
     public function generateAvatar(AudioBook $audioBook, AudiobookVideoScene $scene, AudiobookVideoShot $shot)
@@ -474,10 +639,189 @@ class AudioBookVideoPipelineController extends Controller
             return response()->json(['success' => false, 'message' => 'Shot này không được đánh dấu là đoạn avatar.'], 422);
         }
 
+        // Fail fast with a clear, actionable message instead of dispatching a job that would
+        // only discover the same problem later (AvatarSegmentService::generateLipsync() throws
+        // the same two checks, but by then the shot already flashed 'resolving' for nothing).
+        if (!$this->avatarService->resolveAvatarImageUrl($shot)) {
+            return response()->json(['success' => false, 'message' => 'Chưa có ảnh avatar — hãy chọn hoặc upload ảnh trước.'], 422);
+        }
+        if (!AvatarSegmentService::avatarAudioExists($shot->avatar_audio_path)) {
+            return response()->json(['success' => false, 'message' => 'Chưa có audio TTS cho đoạn này — hãy tạo TTS trước.'], 422);
+        }
+
         $shot->update(['status' => 'resolving', 'error_message' => null]);
         GenerateAvatarSegmentJob::dispatch($shot->id);
 
         return response()->json(['success' => true, 'shot' => $shot->fresh()]);
+    }
+
+    /**
+     * TTS-only step for one avatar shot — separate from generateAvatar() (the HeyGen lipsync
+     * call) so the user can generate/regenerate the narration audio on its own, review it,
+     * before ever spending a HeyGen call. Runs synchronously (same convention as
+     * SceneAssetResolverService::resolveShotOrThrow()'s AI image generation) since a single
+     * short TTS call is fast enough not to need a queued job.
+     */
+    public function generateAvatarTts(AudioBook $audioBook, AudiobookVideoScene $scene, AudiobookVideoShot $shot)
+    {
+        if ($scene->audio_book_id !== $audioBook->id || $shot->video_scene_id !== $scene->id) {
+            abort(404);
+        }
+        if (!$shot->is_avatar_segment) {
+            return response()->json(['success' => false, 'message' => 'Shot này không được đánh dấu là đoạn avatar.'], 422);
+        }
+
+        try {
+            $this->avatarService->generateTts($shot);
+        } catch (\Throwable $e) {
+            return response()->json(['success' => false, 'message' => $e->getMessage()], 500);
+        }
+
+        return response()->json(['success' => true, 'shot' => $shot->fresh()]);
+    }
+
+    /**
+     * The avatar "library" a shot can pick from: the book's assigned Speaker's primary avatar
+     * + all of its additional_images (the same pool built for the YouTube channel MC/avatar
+     * management UI — see ChannelSpeaker/YouTubeChannelController's speaker endpoints).
+     */
+    /**
+     * The avatar library a shot can pick from: EVERY speaker/MC's avatar + additional_images
+     * on the book's own YouTube channel — managed once per channel (see the "MC / Avatar
+     * kênh" section on the channel edit page), never created separately per book. If the book
+     * happens to have an explicit speaker_id assigned, that speaker's photos are still just
+     * part of this same channel-wide pool, not a separate scope.
+     */
+    public function avatarLibrary(AudioBook $audioBook)
+    {
+        $channel = $audioBook->youtubeChannel;
+        if (!$channel) {
+            return response()->json(['success' => true, 'has_channel' => false, 'speakers' => [], 'images' => []]);
+        }
+
+        $speakers = $channel->speakers()->orderBy('name')->get();
+        $images = [];
+        foreach ($speakers as $speaker) {
+            if ($speaker->avatar) {
+                $images[] = [
+                    'path' => $speaker->avatar,
+                    'url' => $speaker->avatar_url,
+                    'is_primary' => true,
+                    'speaker_id' => $speaker->id,
+                    'speaker_name' => $speaker->name,
+                ];
+            }
+            foreach ($speaker->additional_images ?? [] as $imagePath) {
+                $images[] = [
+                    'path' => $imagePath,
+                    'url' => asset('storage/' . $imagePath),
+                    'is_primary' => false,
+                    'speaker_id' => $speaker->id,
+                    'speaker_name' => $speaker->name,
+                ];
+            }
+        }
+
+        return response()->json([
+            'success' => true,
+            'has_channel' => true,
+            'speakers' => $speakers->map(fn($s) => ['id' => $s->id, 'name' => $s->name])->values(),
+            'images' => $images,
+        ]);
+    }
+
+    /**
+     * Pick one of the channel's existing avatar library images for this specific shot —
+     * validated against that same channel-wide library (every speaker's photos, not just the
+     * book's own assigned speaker) so an arbitrary path can't be injected.
+     * image_path = null reverts the shot to the channel's default avatar.
+     */
+    public function selectAvatarImage(Request $request, AudioBook $audioBook, AudiobookVideoScene $scene, AudiobookVideoShot $shot)
+    {
+        if ($scene->audio_book_id !== $audioBook->id || $shot->video_scene_id !== $scene->id) {
+            abort(404);
+        }
+        if (!$shot->is_avatar_segment) {
+            return response()->json(['success' => false, 'message' => 'Shot này không được đánh dấu là đoạn avatar.'], 422);
+        }
+
+        $path = $request->input('image_path');
+        $validPaths = $this->channelAvatarImagePaths($audioBook);
+
+        if ($path !== null && !in_array($path, $validPaths, true)) {
+            return response()->json(['success' => false, 'message' => 'Ảnh không hợp lệ.'], 422);
+        }
+
+        $shot->update(['avatar_image_path' => $path]);
+
+        return response()->json(['success' => true, 'shot' => $shot->fresh()]);
+    }
+
+    /**
+     * Upload a brand-new avatar image straight from the video-pipeline shot UI: added to one
+     * of the CHANNEL's speakers' reusable additional_images library (same storage convention
+     * as YouTubeChannelController::storeSpeaker()) AND immediately selected for this shot —
+     * this is still channel-wide, shared with every other book on the same channel, not
+     * something created separately per book.
+     */
+    public function uploadAvatarImage(Request $request, AudioBook $audioBook, AudiobookVideoScene $scene, AudiobookVideoShot $shot)
+    {
+        if ($scene->audio_book_id !== $audioBook->id || $shot->video_scene_id !== $scene->id) {
+            abort(404);
+        }
+        if (!$shot->is_avatar_segment) {
+            return response()->json(['success' => false, 'message' => 'Shot này không được đánh dấu là đoạn avatar.'], 422);
+        }
+
+        $channel = $audioBook->youtubeChannel;
+        if (!$channel) {
+            return response()->json(['success' => false, 'message' => 'Sách chưa gán kênh YouTube — hãy gán kênh trước khi upload ảnh avatar.'], 422);
+        }
+
+        $speakers = $channel->speakers()->orderBy('name')->get();
+        $speaker = $audioBook->speaker
+            ?: ($speakers->count() === 1 ? $speakers->first() : $speakers->firstWhere('id', (int) $request->input('speaker_id')));
+
+        if (!$speaker) {
+            if ($speakers->isEmpty()) {
+                return response()->json(['success' => false, 'message' => 'Kênh chưa có MC (Speaker) nào — hãy tạo MC ở trang quản lý kênh YouTube trước.'], 422);
+            }
+            return response()->json(['success' => false, 'message' => 'Kênh có nhiều MC — vui lòng chọn MC để thêm ảnh vào.'], 422);
+        }
+
+        $request->validate(['image' => 'required|image|max:5120']);
+
+        $path = $request->file('image')->store('speakers/' . $channel->id . '/additional', 'public');
+
+        $additionalImages = $speaker->additional_images ?? [];
+        $additionalImages[] = $path;
+        $speaker->additional_images = $additionalImages;
+        $speaker->save();
+
+        $shot->update(['avatar_image_path' => $path]);
+
+        return response()->json(['success' => true, 'path' => $path, 'shot' => $shot->fresh()]);
+    }
+
+    /** @return array<int,string> every avatar/additional image path across all of the book's channel's speakers */
+    private function channelAvatarImagePaths(AudioBook $audioBook): array
+    {
+        $channel = $audioBook->youtubeChannel;
+        if (!$channel) {
+            return [];
+        }
+
+        $paths = [];
+        foreach ($channel->speakers()->get() as $speaker) {
+            if ($speaker->avatar) {
+                $paths[] = $speaker->avatar;
+            }
+            foreach ($speaker->additional_images ?? [] as $imagePath) {
+                $paths[] = $imagePath;
+            }
+        }
+
+        return $paths;
     }
 
     /**

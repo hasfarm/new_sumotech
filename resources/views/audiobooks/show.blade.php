@@ -14997,6 +14997,7 @@ Hệ thống sẽ:
          };
 
          const videoPipelineUrl = @json(route('audiobooks.video.pipeline.page', $audioBook));
+         const summaryBookTitle = @json($audioBook->title);
          let summaryData = null;
          let summaryLevels = {};
          let summaryPollTimer = null;
@@ -15348,10 +15349,8 @@ Hệ thống sẽ:
          }
 
          async function chooseSummaryLevel(key) {
-             const hasProgress = summaryData && summaryData.retells && Object.keys(summaryData.retells).length > 0;
-             if (hasProgress && summaryData.target_level !== key) {
-                 if (!confirm('Đổi mức tóm tắt sẽ xóa nội dung Bước 3 hiện tại (nếu chưa lưu thành phiên bản sẽ mất). Tiếp tục?')) return;
-             }
+             // Switching levels no longer wipes existing retells/outro — they stay as
+             // generated; only clusters retold/regenerated AFTER this picks up the new level.
              try {
                  const resp = await fetch(summaryUrls.level, {
                      method: 'POST',
@@ -15393,22 +15392,24 @@ Hệ thống sẽ:
                                 class="text-xs bg-white border border-red-300 hover:bg-red-50 text-red-600 font-medium py-1.5 px-3 rounded-lg">
                                 🗑️ Xóa
                             </button>
+                            <a href="${videoPipelineUrl}"
+                                class="text-xs bg-purple-600 hover:bg-purple-700 text-white font-medium py-1.5 px-3 rounded-lg">
+                                🎬 Tạo Video Pipeline
+                            </a>
                         </div>
                     </div>`;
              }).join('');
 
              return `
-                <div class="mt-8 pt-6 border-t border-gray-200">
+                <div class="mb-6 pb-6 border-b border-gray-200">
                     <h4 class="text-sm font-semibold text-gray-700 mb-3">📚 Các phiên bản đã lưu (${versions.length})</h4>
                     ${rows}
-                    <a href="${videoPipelineUrl}" class="mt-3 inline-block text-sm bg-purple-600 hover:bg-purple-700 text-white font-medium py-2 px-4 rounded-lg">
-                        🎬 Dùng kịch bản này cho Video Pipeline (AI) →
-                    </a>
                 </div>`;
          }
 
          async function saveCurrentVersion() {
-             const defaultLabel = (summaryData && summaryLevels[summaryData.target_level]) ? summaryLevels[summaryData.target_level].label : 'Phiên bản';
+             const versionNumber = ((summaryData && summaryData.versions) ? summaryData.versions.length : 0) + 1;
+             const defaultLabel = `${summaryBookTitle} - Phiên bản ${versionNumber}`;
              const label = prompt('Đặt tên cho phiên bản này:', defaultLabel);
              if (label === null) return;
              try {
@@ -15478,6 +15479,7 @@ Hệ thống sẽ:
                         <button type="button" onclick="toggleLevelPicker()" class="text-xs text-teal-600 hover:underline flex-shrink-0">Đổi mức</button>
                    </div>`
                 : '';
+             html += renderVersionsList();
              let nextIndex = null;
              let totalChars = 0;
              let totalOriginalChars = 0;
@@ -15581,8 +15583,6 @@ Hệ thống sẽ:
                  }
              }
 
-             html += renderVersionsList();
-
              el.innerHTML = html;
          }
 
@@ -15594,6 +15594,20 @@ Hệ thống sẽ:
              return safeJson(resp);
          }
 
+         // Once every cluster has a retell and no outro exists yet, generate it automatically
+         // instead of waiting for the user to click "🎬 Tạo Outro cho phim" — called after
+         // every retell completes (single-step and auto-run), a no-op unless this was the
+         // last cluster.
+         async function maybeAutoGenerateOutro() {
+             const clusters = (summaryData && summaryData.clusters) || [];
+             const retells = (summaryData && summaryData.retells) || {};
+             if (clusters.length === 0) return;
+             const allRetold = clusters.every(c => retells[String(c.index)]);
+             if (allRetold && !(summaryData && summaryData.outro)) {
+                 await generateSummaryOutro();
+             }
+         }
+
          async function generateClusterRetell(index) {
              const btn = document.getElementById('genRetellBtn');
              const autoBtn = document.getElementById('autoRetellBtn');
@@ -15602,6 +15616,7 @@ Hệ thống sẽ:
              try {
                  await callRetellApi(index);
                  await loadSummaryStatus();
+                 await maybeAutoGenerateOutro();
              } catch (e) {
                  alert('Lỗi: ' + e.message);
                  if (btn) { btn.disabled = false; btn.textContent = `▶️ Kể tiếp cho cụm ${index}`; }
@@ -15629,6 +15644,8 @@ Hệ thống sẽ:
                      break;
                  }
              }
+
+             await maybeAutoGenerateOutro();
 
              autoRunState.step3 = false;
              renderSummaryStep3();

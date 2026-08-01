@@ -52,6 +52,15 @@ class VideoSceneAnalysisService
     public const SCENE_DIRECTION_VERSION = 'v1';
 
     /**
+     * Bump whenever the audio-need analysis prompt (needs_sfx/ambience/music fields added to
+     * analyzeSceneMeta()'s and enrichShotsChunk()'s schemas) changes meaningfully — kept
+     * SEPARATE from PROMPT_VERSION/SCENE_DIRECTION_VERSION so a prompt change to image/keyword
+     * logic doesn't force an unrelated, unnecessary re-run of audio-need analysis, and vice
+     * versa. Compared against each shot's/scene's own `audio_prompt_version` column.
+     */
+    public const AUDIO_PROMPT_VERSION = 'v1';
+
+    /**
      * Resolve the finished narration script to build scenes from: a saved version
      * if $versionId is given, otherwise the summary's current (in-progress) retells.
      *
@@ -296,19 +305,23 @@ class VideoSceneAnalysisService
      * many shots the scene will eventually contain (that's Stage B's problem, chunked
      * separately in enrichShotsChunk()).
      *
-     * @return array{title:string,scene_type:string,is_emotional_climax:bool}
+     * @return array{title:string,scene_type:string,is_emotional_climax:bool,needs_ambience:bool,ambience_keywords:array,ambience_prompt:?string,needs_music:bool,music_keywords:array,music_prompt:?string}
      */
     public function analyzeSceneMeta(string $sceneText, AudioBook $audioBook): array
     {
         $bookLine = 'Sách: "' . $audioBook->title . '"' . ($audioBook->author ? ' - Tác giả: ' . $audioBook->author : '');
         $typesList = implode(', ', self::SCENE_TYPES);
 
-        $prompt = "Bạn là đạo diễn hình ảnh cho video kể chuyện. Dưới đây là kịch bản narration (lời đọc) của MỘT CẢNH (scene) trong video.\n"
+        $prompt = "Bạn là đạo diễn hình ảnh VÀ âm thanh cho video kể chuyện. Dưới đây là kịch bản narration (lời đọc) của MỘT CẢNH (scene) trong video.\n"
             . $bookLine . "\n\n"
-            . "Phân tích TỔNG QUAN cả cảnh: tiêu đề, loại cảnh, có phải cao trào cảm xúc không.\n"
+            . "Phân tích TỔNG QUAN cả cảnh: tiêu đề, loại cảnh, có phải cao trào cảm xúc không, và ÂM THANH NỀN (baseline) cho CẢ CẢNH.\n"
             . "- title: tiêu đề ngắn gọn tiếng Việt (dưới 12 từ) mô tả cảnh này.\n"
             . "- scene_type: CHỌN ĐÚNG 1 giá trị trong danh sách: {$typesList}. Ý nghĩa: nature=thiên nhiên/phong cảnh, city=thành phố/kiến trúc/nội thất hiện đại hoặc cổ, history=bối cảnh/sự kiện lịch sử, character=cận cảnh nhân vật/hành động con người, map=địa lý/bản đồ/di chuyển địa điểm, philosophy=suy ngẫm/triết lý/khái niệm trừu tượng.\n"
-            . "- is_emotional_climax: true nếu đây là cao trào cảm xúc mạnh (mất mát, phản bội, chiến thắng nghẹt thở, khoảnh khắc xúc động...) KHÔNG nên bị cắt ngang bởi cảnh người dẫn chương trình xuất hiện; false nếu là đoạn trần thuật/giải thích/chuyển cảnh bình thường.\n\n"
+            . "- is_emotional_climax: true nếu đây là cao trào cảm xúc mạnh (mất mát, phản bội, chiến thắng nghẹt thở, khoảnh khắc xúc động...) KHÔNG nên bị cắt ngang bởi cảnh người dẫn chương trình xuất hiện; false nếu là đoạn trần thuật/giải thích/chuyển cảnh bình thường.\n"
+            . "- needs_ambience: cảnh này có xảy ra ở MỘT KHÔNG GIAN VẬT LÝ có tiếng động nền đặc trưng không (gió sa mạc, chợ đông người, rừng có tiếng chim, sóng biển, tiếng bước chân trong hành lang đá...) — true nếu có, false nếu cảnh trừu tượng/triết lý/không có bối cảnh vật lý rõ ràng.\n"
+            . "- ambience_keywords/ambience_prompt: CHỈ điền khi needs_ambience=true (2-4 từ khóa tiếng Anh + 1 câu mô tả ngắn cho AI tạo âm thanh nền LẶP ĐƯỢC, vd \"desert wind loop, distant sand hiss\"); nếu false thì để [] và null.\n"
+            . "- needs_music: cảnh này có nên có nhạc nền cảm xúc đi kèm không (hầu hết cảnh tự sự/cao trào NÊN có, cảnh thuần thông tin/danh sách có thể KHÔNG cần) — true/false.\n"
+            . "- music_keywords/music_prompt: CHỈ điền khi needs_music=true (2-4 từ khóa tiếng Anh + 1 câu mô tả tông nhạc/nhạc cụ/cảm xúc, vd \"tense orchestral strings, slow build\"); nếu false thì để [] và null.\n\n"
             . "NỘI DUNG CẢNH:\n" . $sceneText;
 
         $schema = [
@@ -320,8 +333,18 @@ class VideoSceneAnalysisService
                     'title' => ['type' => 'string'],
                     'scene_type' => ['type' => 'string', 'enum' => self::SCENE_TYPES],
                     'is_emotional_climax' => ['type' => 'boolean'],
+                    'needs_ambience' => ['type' => 'boolean'],
+                    'ambience_keywords' => ['type' => 'array', 'items' => ['type' => 'string']],
+                    'ambience_prompt' => ['type' => ['string', 'null']],
+                    'needs_music' => ['type' => 'boolean'],
+                    'music_keywords' => ['type' => 'array', 'items' => ['type' => 'string']],
+                    'music_prompt' => ['type' => ['string', 'null']],
                 ],
-                'required' => ['title', 'scene_type', 'is_emotional_climax'],
+                'required' => [
+                    'title', 'scene_type', 'is_emotional_climax',
+                    'needs_ambience', 'ambience_keywords', 'ambience_prompt',
+                    'needs_music', 'music_keywords', 'music_prompt',
+                ],
                 'additionalProperties' => false,
             ],
         ];
@@ -338,10 +361,19 @@ class VideoSceneAnalysisService
             $sceneType = 'city';
         }
 
+        $needsAmbience = (bool) ($decoded['needs_ambience'] ?? false);
+        $needsMusic = (bool) ($decoded['needs_music'] ?? false);
+
         return [
             'title' => trim((string) ($decoded['title'] ?? 'Cảnh')) ?: 'Cảnh',
             'scene_type' => $sceneType,
             'is_emotional_climax' => (bool) ($decoded['is_emotional_climax'] ?? false),
+            'needs_ambience' => $needsAmbience,
+            'ambience_keywords' => $needsAmbience ? (array) ($decoded['ambience_keywords'] ?? []) : [],
+            'ambience_prompt' => $needsAmbience ? (($decoded['ambience_prompt'] ?? null) ?: null) : null,
+            'needs_music' => $needsMusic,
+            'music_keywords' => $needsMusic ? (array) ($decoded['music_keywords'] ?? []) : [],
+            'music_prompt' => $needsMusic ? (($decoded['music_prompt'] ?? null) ?: null) : null,
         ];
     }
 
@@ -845,7 +877,7 @@ class VideoSceneAnalysisService
      * @param array{book_id?:int,scene_id?:int,chunk_index?:int,job_attempt?:int} $logContext forwarded to OpenAiService for api_usages/log observability
      * @param ?AudiobookStoryBible $bible active bible to classify chunk_context against — omitted (null) skips chunk_context resolution entirely (legacy/no-bible books)
      * @param string $previousContext short text summary of the immediately preceding chunk's resolved local context, '' if this is the scene's first chunk
-     * @return array{shots:array<int,array{index:int,is_real_world:bool,keywords:array<int,string>,image_request:string,is_host_narration:bool}>,chunk_context:?array} shots keyed by global index
+     * @return array{shots:array<int,array{index:int,is_real_world:bool,keywords:array<int,string>,image_request:string,is_host_narration:bool,needs_sfx:bool,sfx_keywords:array,sfx_prompt:?string,ambience_override:bool,ambience_keywords:array,ambience_prompt:?string,music_override:bool,music_keywords:array,music_prompt:?string}>,chunk_context:?array} shots keyed by global index
      */
     public function enrichShotsChunk(array $shotChunk, AudioBook $audioBook, string $sceneTitle, string $sceneType, string $contextHint = '', array $logContext = [], string $stableContext = '', ?AudiobookStoryBible $bible = null, string $previousContext = ''): array
     {
@@ -920,6 +952,12 @@ class VideoSceneAnalysisService
             . "b) keywords: sinh từ khóa tiếng Anh để tìm ảnh/video minh họa CHO ĐÚNG nội dung câu của shot đó.\n"
             . "c) image_request: viết MỘT CÂU MÔ TẢ hình ảnh đầy đủ, chi tiết bằng tiếng Anh (như brief cho một art director/photographer), dùng để tìm kiếm ngữ nghĩa (semantic search) trong thư viện ảnh có sẵn — câu này cần giàu thông tin hơn nhiều so với keywords.\n"
             . "d) is_host_narration: shot này có phải là NGƯỜI DẪN CHƯƠNG TRÌNH/KÊNH nói TRỰC TIẾP với khán giả (chào mừng, giới thiệu sách/kênh, dẫn dắt, kêu gọi theo dõi...) hay không — TRUE nếu đúng vậy, FALSE nếu shot mô tả một cảnh/hành động TRONG câu chuyện của sách.\n"
+            . "e) needs_sfx: shot này có mô tả MỘT ÂM THANH RÕ RÀNG, CỤ THỂ, NỔI BẬT xảy ra đúng lúc đó không (tiếng gươm va chạm, tiếng cửa đóng sầm, tiếng sét đánh, tiếng ngựa hí, tiếng la hét...) — mặc định FALSE, KHÔNG áp dụng cho âm thanh nền chung chung (gió, chợ đông người, tiếng ồn xa) vì đó là ambience ở cấp CẢNH chứ không phải SFX riêng của shot.\n"
+            . "f) sfx_keywords/sfx_prompt: CHỈ điền khi needs_sfx=true (2-4 từ khóa tiếng Anh + 1 câu mô tả ngắn cho AI tạo âm thanh, vd \"sword clash metal ring\"); nếu needs_sfx=false thì sfx_keywords=[] và sfx_prompt=null.\n"
+            . "g) ambience_override: shot này có KHÔNG GIAN ÂM THANH NỀN khác hẳn các shot khác CÙNG cảnh không (vd cả cảnh đang ở ngoài sa mạc nhưng riêng shot này nhân vật bước vào trong lều) — mặc định FALSE, đa số shot dùng CHUNG ambience của cả cảnh (được xác định riêng ở cấp cảnh, không phải ở đây).\n"
+            . "h) ambience_keywords/ambience_prompt: CHỈ điền khi ambience_override=true; nếu false thì để [] và null.\n"
+            . "i) music_override: tương tự ambience_override nhưng cho nhạc nền — RẤT HIẾM khi cần (chỉ khi khoảnh khắc CỤ THỂ này cần đổi tông nhạc khác hẳn cảnh, vd đột ngột im lặng hoặc cao trào), mặc định FALSE.\n"
+            . "j) music_keywords/music_prompt: CHỈ điền khi music_override=true; nếu false thì để [] và null.\n"
             . "Yêu cầu:\n"
             . "- is_real_world: PHÉP THỬ BẮT BUỘC trước khi trả lời — hỏi: \"Nếu đưa câu này cho một người quay phim tài liệu, họ có xác định được MỘT cảnh/hành động/địa điểm CỤ THỂ, DUY NHẤT để quay không?\" Chỉ trả TRUE nếu câu MÔ TẢ trực tiếp một cảnh vật/con người/địa điểm/hành động CỤ THỂ có thật, có thể quay được ngoài đời (vd: núi rừng, thành quách, người đi bộ, chiến trường, quân đội hành quân, bản đồ, tài liệu lịch sử...). Trả FALSE trong CẢ HAI trường hợp sau: (1) nội dung HƯ CẤU/siêu nhiên/kỳ ảo (rồng, thần linh, phép thuật, linh hồn); (2) câu là lời BÌNH LUẬN/NHẬN ĐỊNH/KẾT LUẬN/KHÁI QUÁT TRỪU TƯỢNG của người kể chuyện — dù có nhắc tên địa danh/sự kiện/khái niệm lịch sử có thật, câu KHÔNG mô tả một cảnh cụ thể nào đang diễn ra thì vẫn là FALSE. Ví dụ PHẢI là FALSE: \"Những tư tưởng sắc bén trong cuốn sách này không chỉ định hình nghệ thuật chiến tranh thời cổ đại mà còn giữ nguyên giá trị triết lý\" (bình luận về giá trị tư tưởng, không phải cảnh cụ thể); \"liên quan trực tiếp đến sự sống chết của nhân dân và sự tồn vong của đất nước\" (câu khái quát hậu quả trừu tượng, không mô tả cảnh cụ thể nào).\n"
             . "- keywords: 3-5 từ khóa tiếng Anh NGẮN GỌN (1-3 từ/keyword) mô tả hình ảnh trực quan CỤ THỂ cho đúng nội dung của shot đó (ví dụ: \"ancient castle gate\", \"stormy ocean waves\"). Nếu is_real_world=false do câu TRỪU TƯỢNG/bình luận/khái quát (không phải hư cấu), KHÔNG suy diễn ra một cảnh lịch sử cụ thể không có trong câu — thay vào đó dùng từ khóa MANG TÍNH BIỂU TƯỢNG/ẩn dụ trung tính phù hợp để tạo ảnh AI minh họa khái niệm (vd: \"ancient Chinese scroll close-up\", \"calligraphy brush ink\", \"candlelight old book pages\", \"silhouette contemplating war map\"). Nếu is_real_world=false do hư cấu/siêu nhiên, keywords mô tả hình ảnh kỳ ảo mong muốn để làm prompt tạo ảnh AI.\n"
@@ -957,12 +995,26 @@ class VideoSceneAnalysisService
             $kw = is_array($row['keywords'] ?? null) ? $row['keywords'] : [];
             $kw = array_values(array_filter(array_map(fn($k) => trim((string) $k), $kw), fn($k) => $k !== ''));
 
+            $needsSfx = (bool) ($row['needs_sfx'] ?? false);
+            $ambienceOverride = (bool) ($row['ambience_override'] ?? false);
+            $musicOverride = (bool) ($row['music_override'] ?? false);
+            $cleanKw = fn($v) => is_array($v) ? array_values(array_filter(array_map(fn($k) => trim((string) $k), $v), fn($k) => $k !== '')) : [];
+
             $result[$idx] = [
                 'index' => $idx,
                 'is_real_world' => array_key_exists('is_real_world', $row) ? (bool) $row['is_real_world'] : true,
                 'keywords' => !empty($kw) ? array_slice($kw, 0, 5) : [$sceneType],
                 'image_request' => trim((string) ($row['image_request'] ?? '')) ?: implode(', ', $kw),
                 'is_host_narration' => (bool) ($row['is_host_narration'] ?? false),
+                'needs_sfx' => $needsSfx,
+                'sfx_keywords' => $needsSfx ? $cleanKw($row['sfx_keywords'] ?? []) : [],
+                'sfx_prompt' => $needsSfx ? ((trim((string) ($row['sfx_prompt'] ?? '')) ?: null)) : null,
+                'ambience_override' => $ambienceOverride,
+                'ambience_keywords' => $ambienceOverride ? $cleanKw($row['ambience_keywords'] ?? []) : [],
+                'ambience_prompt' => $ambienceOverride ? ((trim((string) ($row['ambience_prompt'] ?? '')) ?: null)) : null,
+                'music_override' => $musicOverride,
+                'music_keywords' => $musicOverride ? $cleanKw($row['music_keywords'] ?? []) : [],
+                'music_prompt' => $musicOverride ? ((trim((string) ($row['music_prompt'] ?? '')) ?: null)) : null,
             ];
         }
 
@@ -982,8 +1034,22 @@ class VideoSceneAnalysisService
                 'keywords' => ['type' => 'array', 'items' => ['type' => 'string']],
                 'image_request' => ['type' => 'string'],
                 'is_host_narration' => ['type' => 'boolean'],
+                'needs_sfx' => ['type' => 'boolean'],
+                'sfx_keywords' => ['type' => 'array', 'items' => ['type' => 'string']],
+                'sfx_prompt' => ['type' => ['string', 'null']],
+                'ambience_override' => ['type' => 'boolean'],
+                'ambience_keywords' => ['type' => 'array', 'items' => ['type' => 'string']],
+                'ambience_prompt' => ['type' => ['string', 'null']],
+                'music_override' => ['type' => 'boolean'],
+                'music_keywords' => ['type' => 'array', 'items' => ['type' => 'string']],
+                'music_prompt' => ['type' => ['string', 'null']],
             ],
-            'required' => ['index', 'is_real_world', 'keywords', 'image_request', 'is_host_narration'],
+            'required' => [
+                'index', 'is_real_world', 'keywords', 'image_request', 'is_host_narration',
+                'needs_sfx', 'sfx_keywords', 'sfx_prompt',
+                'ambience_override', 'ambience_keywords', 'ambience_prompt',
+                'music_override', 'music_keywords', 'music_prompt',
+            ],
             'additionalProperties' => false,
         ];
 

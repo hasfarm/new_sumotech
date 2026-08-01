@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers;
 
+use App\Jobs\AnalyzeStoryDirectionJob;
 use App\Jobs\RegenerateStaleSceneDirectionJob;
 use App\Jobs\ValidateStoryContinuityJob;
 use App\Models\AudioBook;
@@ -82,6 +83,7 @@ class ContinuityValidationController extends Controller
             'scenes_total' => $scenes->count(),
             'scenes_bound' => $scenesBound,
             'scenes_stale' => $scenesStale,
+            'regenerate_stale_status' => $audioBook->videoPipeline?->story_bible_regenerate_stale_status,
         ];
     }
 
@@ -102,7 +104,27 @@ class ContinuityValidationController extends Controller
      */
     public function regenerateStale(AudioBook $audioBook)
     {
+        $pipeline = $audioBook->videoPipeline;
+        $current = $pipeline?->story_bible_regenerate_stale_status;
+
+        if ($current && ($current['status'] ?? null) === 'running') {
+            return response()->json(['success' => true, 'already_running' => true]);
+        }
+
         RegenerateStaleSceneDirectionJob::dispatch($audioBook->id);
+
+        return response()->json(['success' => true, 'already_running' => false]);
+    }
+
+    /**
+     * Kicks off Phase 2 (Story Bible generation) for a book that doesn't have an active bible
+     * yet — the "🧠 Tạo Story Bible" button shown in the AI Director panel when
+     * story_bible.active_version is null. Needs Bước 1-3 (chapters summarized) to already
+     * exist; AnalyzeStoryDirectionJob itself validates that and fails gracefully if not.
+     */
+    public function generateStoryBible(AudioBook $audioBook)
+    {
+        AnalyzeStoryDirectionJob::dispatch($audioBook->id);
 
         return response()->json(['success' => true]);
     }

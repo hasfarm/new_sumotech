@@ -31,6 +31,27 @@ class AudiobookVideoScene extends Model
         'timeline_binding',
         'location_binding',
         'story_phase',
+        'needs_ambience',
+        'ambience_keywords',
+        'ambience_prompt',
+        'ambience_asset_id',
+        'ambience_status',
+        'ambience_selected_by',
+        'ambience_approved_by',
+        'ambience_approved_at',
+        'ambience_locked_by',
+        'ambience_locked_at',
+        'needs_music',
+        'music_keywords',
+        'music_prompt',
+        'music_asset_id',
+        'music_status',
+        'music_selected_by',
+        'music_approved_by',
+        'music_approved_at',
+        'music_locked_by',
+        'music_locked_at',
+        'audio_direction_version',
     ];
 
     protected $casts = [
@@ -40,6 +61,14 @@ class AudiobookVideoScene extends Model
         'resolved_score' => 'float',
         'timeline_binding' => 'array',
         'location_binding' => 'array',
+        'needs_ambience' => 'boolean',
+        'ambience_keywords' => 'array',
+        'ambience_approved_at' => 'datetime',
+        'ambience_locked_at' => 'datetime',
+        'needs_music' => 'boolean',
+        'music_keywords' => 'array',
+        'music_approved_at' => 'datetime',
+        'music_locked_at' => 'datetime',
     ];
 
     public function audioBook()
@@ -85,5 +114,53 @@ class AudiobookVideoScene extends Model
     public function sceneCharacters()
     {
         return $this->hasMany(AudiobookVideoSceneCharacter::class, 'video_scene_id');
+    }
+
+    /** This scene's baseline ambience clip, if resolved — shots inherit this by default. */
+    public function ambienceAsset()
+    {
+        return $this->belongsTo(AudiobookAudioAsset::class, 'ambience_asset_id');
+    }
+
+    /** This scene's baseline music clip, if resolved — shots inherit this by default. */
+    public function musicAsset()
+    {
+        return $this->belongsTo(AudiobookAudioAsset::class, 'music_asset_id');
+    }
+
+    public function ambienceSelectedByUser()
+    {
+        return $this->belongsTo(User::class, 'ambience_selected_by');
+    }
+
+    public function ambienceApprovedByUser()
+    {
+        return $this->belongsTo(User::class, 'ambience_approved_by');
+    }
+
+    public function ambienceLockedByUser()
+    {
+        return $this->belongsTo(User::class, 'ambience_locked_by');
+    }
+
+    public function musicSelectedByUser()
+    {
+        return $this->belongsTo(User::class, 'music_selected_by');
+    }
+
+    public function musicApprovedByUser()
+    {
+        return $this->belongsTo(User::class, 'music_approved_by');
+    }
+
+    public function musicLockedByUser()
+    {
+        return $this->belongsTo(User::class, 'music_locked_by');
+    }
+
+    /** True when this slot's status is 'locked' — bulk jobs/stale regeneration must never touch it. */
+    public function isAudioSlotLocked(string $slot): bool
+    {
+        return $this->{"{$slot}_status"} === 'locked';
     }
 }

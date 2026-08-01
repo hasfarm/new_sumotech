@@ -2,6 +2,8 @@
 
 namespace App\Services;
 
+use App\Exceptions\ContentModerationException;
+use App\Jobs\ArchiveAssetToLibraryJob;
 use App\Models\AudiobookVideoShot;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Storage;
@@ -15,6 +17,51 @@ class SceneAssetResolverService
         private readonly SeedanceAIService $seedanceService,
         private readonly VideoSceneAnalysisService $sceneAnalysisService
     ) {}
+
+    /**
+     * The single "produce an asset for this shot" step (stock download if an already-scored
+     * candidate clears the threshold, otherwise AI still image) — extracted so the on-demand
+     * resolve endpoint and the background bulk-generate job (see BulkGenerateShotImagesJob)
+     * always share the exact same behavior instead of two implementations drifting apart.
+     * Throws on failure; the caller decides how to record that (HTTP response vs. job log).
+     *
+     * @return array{mode:string,shot:AudiobookVideoShot}
+     */
+    public function resolveShotOrThrow(AudiobookVideoShot $shot, bool $forceAi): array
+    {
+        $selected = (!$forceAi && $shot->is_real_world) ? $shot->candidates()->where('is_selected', true)->first() : null;
+
+        if ($selected && $selected->score_final >= ClipScoringService::SCORE_THRESHOLD) {
+            $path = $this->downloadStockAsset($shot, $selected->toArray());
+
+            $shot->update([
+                'status' => 'ready',
+                'resolved_source' => $selected->source,
+                'resolved_asset_path' => $path,
+                'resolved_score' => $selected->score_final,
+                'error_message' => null,
+            ]);
+
+            ArchiveAssetToLibraryJob::dispatch($shot->id, $selected->source, $selected->external_id, $selected->license_label);
+
+            return ['mode' => 'stock', 'shot' => $shot->fresh()];
+        }
+
+        $shot->update(['status' => 'resolving', 'error_message' => null]);
+
+        $path = $this->generateAiImage($shot);
+
+        $shot->update([
+            'status' => 'image_ready',
+            'resolved_source' => 'ai_image',
+            'resolved_asset_path' => $path,
+            'error_message' => null,
+        ]);
+
+        ArchiveAssetToLibraryJob::dispatch($shot->id, 'ai_image', null);
+
+        return ['mode' => 'ai_image', 'shot' => $shot->fresh()];
+    }
 
     /**
      * Download the winning stock candidate's media file to local storage.
@@ -62,10 +109,40 @@ class SceneAssetResolverService
         $imageResult = $service->generateImage($this->buildImagePrompt($shot), $imageAbsolutePath, '16:9', $model);
         if (empty($imageResult['success'])) {
             $providerLabel = $provider === 'grok' ? 'Grok' : 'Flux';
-            throw new \RuntimeException("Tạo ảnh AI ({$providerLabel}) thất bại: " . ($imageResult['error'] ?? 'lỗi không xác định'));
+            $errorMessage = $imageResult['error'] ?? 'lỗi không xác định';
+
+            // Retrying with the exact same prompt text will fail the exact same way again —
+            // this is a content-policy rejection, not a transient/technical error, so it's
+            // surfaced as a distinct exception type. Callers mark the shot 'content_blocked'
+            // (not the generic 'failed') so the UI can point the user at editing the prompt
+            // instead of just offering "try again".
+            if (self::isContentModerationError($errorMessage)) {
+                throw new ContentModerationException(
+                    "Ảnh bị từ chối do chính sách kiểm duyệt nội dung của {$providerLabel}: {$errorMessage}"
+                );
+            }
+
+            throw new \RuntimeException("Tạo ảnh AI ({$providerLabel}) thất bại: {$errorMessage}");
         }
 
         return $imageRelativePath;
+    }
+
+    /**
+     * Deliberately generic substring matching (not tied to one provider's exact error taxonomy)
+     * since this must keep working as new AI image providers get added — every content-policy
+     * rejection seen so far (Grok's "imagine:content-moderated", OpenAI-style
+     * "content_policy_violation") uses some variant of these words.
+     */
+    private static function isContentModerationError(string $message): bool
+    {
+        $lower = mb_strtolower($message);
+        foreach (['content-moderated', 'content_moderated', 'content_policy', 'content policy', 'moderation', 'policy violation'] as $needle) {
+            if (str_contains($lower, $needle)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**

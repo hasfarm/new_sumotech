@@ -35,13 +35,19 @@ return new class extends Migration
                 }
             });
 
+        $driver = DB::connection()->getDriverName();
+
         try {
-            DB::statement('ALTER TABLE audiobook_chapter_chunks DROP INDEX audiobook_chapter_chunks_scene_type_index');
+            DB::statement($driver === 'pgsql'
+                ? 'DROP INDEX IF EXISTS audiobook_chapter_chunks_scene_type_index'
+                : 'ALTER TABLE audiobook_chapter_chunks DROP INDEX audiobook_chapter_chunks_scene_type_index');
         } catch (\Throwable $e) {
             // Ignore if index does not exist.
         }
 
-        DB::statement('ALTER TABLE audiobook_chapter_chunks MODIFY scene_type JSON NULL');
+        DB::statement($driver === 'pgsql'
+            ? 'ALTER TABLE audiobook_chapter_chunks ALTER COLUMN scene_type TYPE JSON USING scene_type::json'
+            : 'ALTER TABLE audiobook_chapter_chunks MODIFY scene_type JSON NULL');
     }
 
     public function down(): void
@@ -50,7 +56,10 @@ return new class extends Migration
             return;
         }
 
-        DB::statement('ALTER TABLE audiobook_chapter_chunks MODIFY scene_type VARCHAR(50) NULL');
+        $driver = DB::connection()->getDriverName();
+        DB::statement($driver === 'pgsql'
+            ? 'ALTER TABLE audiobook_chapter_chunks ALTER COLUMN scene_type TYPE VARCHAR(50) USING scene_type::text'
+            : 'ALTER TABLE audiobook_chapter_chunks MODIFY scene_type VARCHAR(50) NULL');
 
         DB::table('audiobook_chapter_chunks')
             ->whereNotNull('scene_type')
@@ -79,6 +88,8 @@ return new class extends Migration
                 }
             });
 
-        DB::statement('ALTER TABLE audiobook_chapter_chunks ADD INDEX audiobook_chapter_chunks_scene_type_index (scene_type)');
+        DB::statement($driver === 'pgsql'
+            ? 'CREATE INDEX audiobook_chapter_chunks_scene_type_index ON audiobook_chapter_chunks (scene_type)'
+            : 'ALTER TABLE audiobook_chapter_chunks ADD INDEX audiobook_chapter_chunks_scene_type_index (scene_type)');
     }
 };

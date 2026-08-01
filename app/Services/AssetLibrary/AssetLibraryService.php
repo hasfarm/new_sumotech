@@ -142,23 +142,25 @@ class AssetLibraryService
         $year = date('Y');
         $r2Path = "library/{$year}/{$uuid}.{$ext}";
 
-        $this->r2->putFile($localAssetAbsolutePath, $r2Path);
+        $keywords = $shot->keywords ?? [];
+        $description = trim((string) $shot->image_request)
+            ?: trim(($shot->scene->title ?? '') . '. ' . implode(', ', $keywords));
+
+        $contextHint = (string) ($shot->scene->audioBook->videoPipeline->context_hint ?? '');
+
+        $metadata = $this->buildAssetMetadata($shot, $mediaType, $originSource, $keywords, $description, $licenseLabel);
+
+        $this->r2->putFile($localAssetAbsolutePath, $r2Path, $metadata);
 
         $thumbnailR2Path = null;
         if ($mediaType === 'video') {
             $thumbnailLocalPath = sys_get_temp_dir() . '/' . $uuid . '_thumb.jpg';
             if ($this->extractVideoThumbnail($localAssetAbsolutePath, $thumbnailLocalPath)) {
                 $thumbnailR2Path = "library/{$year}/{$uuid}_thumb.jpg";
-                $this->r2->putFile($thumbnailLocalPath, $thumbnailR2Path);
+                $this->r2->putFile($thumbnailLocalPath, $thumbnailR2Path, $metadata);
                 @unlink($thumbnailLocalPath);
             }
         }
-
-        $keywords = $shot->keywords ?? [];
-        $description = trim((string) $shot->image_request)
-            ?: trim(($shot->scene->title ?? '') . '. ' . implode(', ', $keywords));
-
-        $contextHint = (string) ($shot->scene->audioBook->videoPipeline->context_hint ?? '');
 
         [$width, $height] = $this->probeDimensions($localAssetAbsolutePath, $mediaType);
         $duration = $mediaType === 'video' ? $this->probeDuration($localAssetAbsolutePath) : null;
@@ -196,6 +198,50 @@ class AssetLibraryService
     public function recordReuse(VideoAssetLibrary $asset): void
     {
         $asset->increment('usage_count');
+    }
+
+    /**
+     * Custom S3/R2 object metadata — makes an archived asset identifiable/searchable
+     * directly from any S3 tool/console (e.g. the R2 dashboard, `aws s3api head-object`),
+     * not just via this app's own MySQL row + Qdrant index, which was the ONLY place this
+     * context lived before (the R2 object itself was an opaque blob).
+     *
+     * Values are URL-encoded — S3 metadata becomes literal HTTP headers, which must be
+     * ASCII-safe; Vietnamese/UTF-8 book titles and descriptions would otherwise risk the
+     * upload being rejected or the bytes getting corrupted. Decode with rawurldecode() when
+     * reading a value back out.
+     *
+     * @param array<int,string> $keywords
+     * @return array<string,string>
+     */
+    private function buildAssetMetadata(AudiobookVideoShot $shot, string $mediaType, string $originSource, array $keywords, string $description, ?string $licenseLabel): array
+    {
+        $scene = $shot->scene;
+        $audioBook = $scene?->audioBook;
+
+        $characterNames = $shot->shotCharacters()->with('character')->get()
+            ->pluck('character.canonical_name')->filter()->unique()->implode(', ');
+        if ($characterNames === '' && $scene) {
+            $characterNames = $scene->sceneCharacters()->with('character')->get()
+                ->pluck('character.canonical_name')->filter()->unique()->implode(', ');
+        }
+
+        $raw = array_filter([
+            'book_id' => $audioBook?->id !== null ? (string) $audioBook->id : null,
+            'book_title' => $audioBook?->title,
+            'scene_index' => $scene?->scene_index !== null ? (string) $scene->scene_index : null,
+            'scene_title' => $scene?->title,
+            'shot_index' => (string) $shot->shot_index,
+            'shot_id' => (string) $shot->id,
+            'media_type' => $mediaType,
+            'origin_source' => $originSource,
+            'license_label' => $licenseLabel,
+            'keywords' => implode(', ', $keywords),
+            'description' => mb_substr($description, 0, 500),
+            'characters' => $characterNames !== '' ? $characterNames : null,
+        ], fn($v) => $v !== null && $v !== '');
+
+        return array_map(fn($v) => rawurlencode((string) $v), $raw);
     }
 
     private function extractVideoThumbnail(string $videoPath, string $outputJpgPath): bool

@@ -170,7 +170,17 @@ class StoryBibleAnalysisService
         $worldFactsText = $this->buildFactsText($batchResults, includeCharacters: false);
         $fullFactsText = $this->buildFactsText($batchResults, includeCharacters: true);
 
-        $world = $this->reduceWorldAndSetting($worldFactsText, $logContext);
+        // Even with characters removed, "world" (14 flat fields + timelines + locations, all
+        // in ONE strict-schema call) was observed live to make gpt-5-mini's hidden reasoning
+        // consume the entire completion budget on some real books (reproducibly — not random:
+        // two consecutive failures at the exact same ceiling, then a 900s timeout at double
+        // that ceiling with the call still unfinished). Splitting further isolates the truly
+        // complex part (timelines/locations, with their nested cultural_context claims) from
+        // the cheap part (14 flat scalar/list claims) so each call has a schema simple enough
+        // to actually finish.
+        $facts = $this->reduceWorldFacts($worldFactsText, $logContext);
+        $setting = $this->reduceWorldSetting($worldFactsText, $logContext);
+        $world = array_merge($facts, $setting);
         $characters = $this->reduceCharacters($fullFactsText, $world, $logContext);
 
         return array_merge($world, ['characters' => $characters['characters'] ?? []]);
@@ -203,12 +213,17 @@ class StoryBibleAnalysisService
             ->implode("\n\n");
     }
 
-    private function reduceWorldAndSetting(string $factsText, array $logContext = []): array
+    /**
+     * Just the 14 flat scalar/list claims (genre, tone, ..., pacing) — no arrays, no nested
+     * objects beyond the claim wrapper itself. Deliberately isolated from timelines/locations
+     * (reduceWorldSetting()) since THAT'S the structurally complex part; this half is cheap
+     * and should never need a large completion budget.
+     */
+    private function reduceWorldFacts(string $factsText, array $logContext = []): array
     {
         $prompt = "Bạn là biên tập viên phân tích tổng thể một tác phẩm, dựa TRÊN DUY NHẤT các dữ kiện đã được trích xuất "
-            . "sẵn dưới đây (không phải toàn văn) từ từng phần của tác phẩm. Nhiệm vụ: tổng hợp genre/tone/timeline "
-            . "structure/bối cảnh lịch sử-văn hóa/director treatment, và danh sách các timeline + location xuất hiện "
-            . "trong tác phẩm. KHÔNG xử lý nhân vật ở bước này.\n\n"
+            . "sẵn dưới đây (không phải toàn văn). Nhiệm vụ: tổng hợp genre/tone/timeline structure/bối cảnh lịch sử-văn "
+            . "hóa/director treatment của tác phẩm. KHÔNG xử lý nhân vật, timeline cụ thể, hay location ở bước này.\n\n"
             . "QUY TẮC BẮT BUỘC:\n"
             . "- Mọi kết luận PHẢI có confidence + (evidence hoặc rationale). Nếu dữ liệu không đủ để kết luận, dùng "
             . "confidence=\"unknown\", value=null, evidence=[], rationale=null — TUYỆT ĐỐI KHÔNG bịa thông tin.\n"
@@ -219,7 +234,38 @@ class StoryBibleAnalysisService
             . "- KHÔNG dùng nhãn chung chung như \"Eastern\"/\"Western\" nếu dữ kiện cho phép xác định cụ thể hơn (tên vùng/"
             . "nền văn hóa/thời kỳ cụ thể); nếu thực sự không đủ căn cứ để cụ thể hơn thì mới dùng mô tả chung + confidence thấp.\n"
             . "- timeline_structure: chọn đúng linear/non_linear/flashback/time_skip/multi_timeline dựa trên các TIME_SIGNAL "
-            . "đã cho — KHÔNG mặc định là linear.\n"
+            . "đã cho — KHÔNG mặc định là linear.\n\n"
+            . "DỮ KIỆN ĐÃ TRÍCH XUẤT:\n" . $factsText;
+
+        return $this->openAiService->completeJson($prompt, [
+            'reasoning_effort' => 'minimal',
+            'json_schema' => $this->worldFactsReduceSchema(),
+            'max_tokens' => 24000,
+            'timeout' => 900,
+            'purpose' => 'story_bible_reduce_world_facts',
+            'retry' => false,
+            'log_context' => $logContext,
+        ]);
+    }
+
+    /**
+     * Just timelines + locations — the structurally complex part (nested cultural_context
+     * claims, cultural_groups_present arrays) isolated on its own so it isn't ALSO juggling
+     * 14 unrelated flat fields in the same completion.
+     */
+    private function reduceWorldSetting(string $factsText, array $logContext = []): array
+    {
+        $prompt = "Bạn là biên tập viên phân tích BỐI CẢNH (timeline + location) của một tác phẩm, dựa TRÊN DUY NHẤT các "
+            . "dữ kiện đã được trích xuất sẵn dưới đây (không phải toàn văn). Nhiệm vụ: liệt kê các timeline và location "
+            . "xuất hiện trong tác phẩm. KHÔNG xử lý nhân vật hay các trường mô tả chung (genre/tone/...) ở bước này.\n\n"
+            . "QUY TẮC BẮT BUỘC:\n"
+            . "- Mọi kết luận PHẢI có confidence + (evidence hoặc rationale). Nếu dữ liệu không đủ để kết luận, dùng "
+            . "confidence=\"unknown\", value=null, evidence=[], rationale=null — TUYỆT ĐỐI KHÔNG bịa thông tin.\n"
+            . "- evidence.quote và evidence.chapter_id PHẢI copy CHÍNH XÁC từ dữ kiện được cung cấp bên dưới, không tự viết quote mới.\n"
+            . "- source_type: \"explicit_text\" nếu văn bản nói thẳng, \"inferred_from_text\" nếu suy luận hợp lý từ văn bản, "
+            . "\"unknown\" nếu không xác định được.\n"
+            . "- KHÔNG dùng nhãn chung chung như \"Eastern\"/\"Western\" nếu dữ kiện cho phép xác định cụ thể hơn (tên vùng/"
+            . "nền văn hóa/thời kỳ cụ thể); nếu thực sự không đủ căn cứ để cụ thể hơn thì mới dùng mô tả chung + confidence thấp.\n"
             . "- cultural_groups_present tại một địa điểm có thể liệt kê NHIỀU nhóm văn hóa cùng lúc (local và visiting), "
             . "kể cả các nhóm người chỉ được nhắc chung chung (vd \"thương nhân miền núi\") — KHÔNG tạo character cho các nhóm này.\n"
             . "- Nếu một địa điểm được nhắc dưới nhiều tên khác nhau ở các dữ kiện khác nhau nhưng rõ ràng là CÙNG một nơi, "
@@ -228,10 +274,10 @@ class StoryBibleAnalysisService
 
         return $this->openAiService->completeJson($prompt, [
             'reasoning_effort' => 'minimal',
-            'json_schema' => $this->worldReduceSchema(),
-            'max_tokens' => 48000,
+            'json_schema' => $this->worldSettingReduceSchema(),
+            'max_tokens' => 64000,
             'timeout' => 900,
-            'purpose' => 'story_bible_reduce_world',
+            'purpose' => 'story_bible_reduce_world_setting',
             'retry' => false,
             'log_context' => $logContext,
         ]);
@@ -813,10 +859,10 @@ class StoryBibleAnalysisService
         ];
     }
 
-    private function worldReduceSchema(): array
+    private function worldFactsReduceSchema(): array
     {
         return [
-            'name' => 'story_bible_world',
+            'name' => 'story_bible_world_facts',
             'strict' => true,
             'schema' => [
                 'type' => 'object',
@@ -835,14 +881,28 @@ class StoryBibleAnalysisService
                     'lighting' => $this->textClaimSchema(),
                     'camera_language' => $this->textClaimSchema(),
                     'pacing' => $this->textClaimSchema(),
-                    'timelines' => ['type' => 'array', 'items' => $this->timelineItemSchema()],
-                    'locations' => ['type' => 'array', 'items' => $this->locationItemSchema()],
                 ],
                 'required' => [
                     'genre', 'tone', 'timeline_structure', 'overall_time_span', 'historical_context', 'geography', 'culture',
                     'world_rules', 'forbidden_elements', 'visual_style', 'palette', 'lighting', 'camera_language', 'pacing',
-                    'timelines', 'locations',
                 ],
+                'additionalProperties' => false,
+            ],
+        ];
+    }
+
+    private function worldSettingReduceSchema(): array
+    {
+        return [
+            'name' => 'story_bible_world_setting',
+            'strict' => true,
+            'schema' => [
+                'type' => 'object',
+                'properties' => [
+                    'timelines' => ['type' => 'array', 'items' => $this->timelineItemSchema()],
+                    'locations' => ['type' => 'array', 'items' => $this->locationItemSchema()],
+                ],
+                'required' => ['timelines', 'locations'],
                 'additionalProperties' => false,
             ],
         ];

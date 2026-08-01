@@ -12,6 +12,8 @@ use App\Http\Controllers\AudioBookController;
 use App\Http\Controllers\AudioBookChapterController;
 use App\Http\Controllers\AudioBookSummaryController;
 use App\Http\Controllers\AudioBookVideoPipelineController;
+use App\Http\Controllers\AudioDirectionController;
+use App\Http\Controllers\MotionDirectionController;
 use App\Http\Controllers\ContinuityValidationController;
 use App\Http\Controllers\BookInsightStudioController;
 use App\Http\Controllers\MediaCenterController;
@@ -350,13 +352,24 @@ Route::middleware('auth')->prefix('audiobooks')->name('audiobooks.')->group(func
     Route::post('{audioBook}/video-pipeline/retry-failed-chunks', [AudioBookVideoPipelineController::class, 'retryFailedChunks'])->name('video.pipeline.retry-failed-chunks');
     Route::post('{audioBook}/video-pipeline/image-style', [AudioBookVideoPipelineController::class, 'updateImageStyle'])->name('video.pipeline.image-style');
     Route::post('{audioBook}/video-pipeline/image-provider', [AudioBookVideoPipelineController::class, 'updateImageProvider'])->name('video.pipeline.image-provider');
+    Route::post('{audioBook}/video-pipeline/tts-settings', [AudioBookVideoPipelineController::class, 'updateTtsSettings'])->name('video.pipeline.tts-settings');
+    Route::post('{audioBook}/video-pipeline/avatar-tts-settings', [AudioBookVideoPipelineController::class, 'updateAvatarTtsSettings'])->name('video.pipeline.avatar-tts-settings');
     Route::post('{audioBook}/video-pipeline/scenes/{scene}/shots/{shot}/active-target', [AudioBookVideoPipelineController::class, 'setActiveTarget'])->name('video.pipeline.shots.active-target');
     Route::post('video-pipeline-extension-token', [AudioBookVideoPipelineController::class, 'issueExtensionToken'])->name('video-pipeline-extension-token');
     Route::post('{audioBook}/video-pipeline/scenes/{scene}/shots/{shot}/search', [AudioBookVideoPipelineController::class, 'searchShot'])->name('video.pipeline.shots.search');
     Route::post('{audioBook}/video-pipeline/scenes/{scene}/shots/{shot}/candidates/{candidate}/select', [AudioBookVideoPipelineController::class, 'selectCandidate'])->name('video.pipeline.shots.select');
     Route::post('{audioBook}/video-pipeline/scenes/{scene}/shots/{shot}/resolve', [AudioBookVideoPipelineController::class, 'resolveShot'])->name('video.pipeline.shots.resolve');
+    Route::post('{audioBook}/video-pipeline/scenes/{scene}/shots/{shot}/image-request', [AudioBookVideoPipelineController::class, 'updateImageRequest'])->name('video.pipeline.shots.image-request');
+    Route::post('{audioBook}/video-pipeline/bulk-generate-ai', [AudioBookVideoPipelineController::class, 'bulkGenerateAi'])->name('video.pipeline.bulk-generate-ai');
+    Route::post('{audioBook}/video-pipeline/bulk-generate-narration-tts', [AudioBookVideoPipelineController::class, 'bulkGenerateNarrationTts'])->name('video.pipeline.bulk-generate-narration-tts');
+    Route::post('{audioBook}/video-pipeline/bulk-generate-avatar-tts', [AudioBookVideoPipelineController::class, 'bulkGenerateAvatarTts'])->name('video.pipeline.bulk-generate-avatar-tts');
     Route::post('{audioBook}/video-pipeline/scenes/{scene}/shots/{shot}/animate', [AudioBookVideoPipelineController::class, 'animateShot'])->name('video.pipeline.shots.animate');
+    Route::post('{audioBook}/video-pipeline/scenes/{scene}/shots/{shot}/approve', [AudioBookVideoPipelineController::class, 'approveShot'])->name('video.pipeline.shots.approve');
     Route::post('{audioBook}/video-pipeline/scenes/{scene}/shots/{shot}/avatar', [AudioBookVideoPipelineController::class, 'generateAvatar'])->name('video.pipeline.shots.avatar');
+    Route::post('{audioBook}/video-pipeline/scenes/{scene}/shots/{shot}/avatar-tts', [AudioBookVideoPipelineController::class, 'generateAvatarTts'])->name('video.pipeline.shots.avatar-tts');
+    Route::get('{audioBook}/video-pipeline/avatar-library', [AudioBookVideoPipelineController::class, 'avatarLibrary'])->name('video.pipeline.avatar-library');
+    Route::post('{audioBook}/video-pipeline/scenes/{scene}/shots/{shot}/avatar-image/select', [AudioBookVideoPipelineController::class, 'selectAvatarImage'])->name('video.pipeline.shots.avatar-image.select');
+    Route::post('{audioBook}/video-pipeline/scenes/{scene}/shots/{shot}/avatar-image/upload', [AudioBookVideoPipelineController::class, 'uploadAvatarImage'])->name('video.pipeline.shots.avatar-image.upload');
     Route::get('{audioBook}/video-pipeline/download', [AudioBookVideoPipelineController::class, 'downloadResources'])->name('video.pipeline.download');
 
     // Phase 4: continuity validation report + actions
@@ -367,6 +380,45 @@ Route::middleware('auth')->prefix('audiobooks')->name('audiobooks.')->group(func
     Route::post('{audioBook}/video-pipeline/continuity/issues/{issue}/accept', [ContinuityValidationController::class, 'accept'])->name('video.pipeline.continuity.accept');
     Route::post('{audioBook}/video-pipeline/story-bible/regenerate-stale', [ContinuityValidationController::class, 'regenerateStale'])->name('video.pipeline.story-bible.regenerate-stale');
     Route::get('{audioBook}/video-pipeline/story-bible/details', [ContinuityValidationController::class, 'storyBibleDetails'])->name('video.pipeline.story-bible.details');
+    Route::post('{audioBook}/video-pipeline/story-bible/generate', [ContinuityValidationController::class, 'generateStoryBible'])->name('video.pipeline.story-bible.generate');
+
+    // Audio Direction Pipeline — approval-first candidate review + select/generate/regenerate/
+    // reject/approve/lock/unlock, for scene-level ambience/music and shot-level sfx/overrides.
+    Route::get('{audioBook}/video-pipeline/scenes/{scene}/audio/{slot}/candidates', [AudioDirectionController::class, 'sceneCandidates'])->whereIn('slot', ['ambience', 'music'])->name('video.pipeline.scenes.audio.candidates');
+    Route::post('{audioBook}/video-pipeline/scenes/{scene}/audio/{slot}/select', [AudioDirectionController::class, 'sceneSelect'])->whereIn('slot', ['ambience', 'music'])->name('video.pipeline.scenes.audio.select');
+    Route::post('{audioBook}/video-pipeline/scenes/{scene}/audio/{slot}/generate', [AudioDirectionController::class, 'sceneGenerate'])->whereIn('slot', ['ambience', 'music'])->name('video.pipeline.scenes.audio.generate');
+    Route::post('{audioBook}/video-pipeline/scenes/{scene}/audio/{slot}/reject', [AudioDirectionController::class, 'sceneReject'])->whereIn('slot', ['ambience', 'music'])->name('video.pipeline.scenes.audio.reject');
+    Route::post('{audioBook}/video-pipeline/scenes/{scene}/audio/{slot}/approve', [AudioDirectionController::class, 'sceneApprove'])->whereIn('slot', ['ambience', 'music'])->name('video.pipeline.scenes.audio.approve');
+    Route::post('{audioBook}/video-pipeline/scenes/{scene}/audio/{slot}/lock', [AudioDirectionController::class, 'sceneLock'])->whereIn('slot', ['ambience', 'music'])->name('video.pipeline.scenes.audio.lock');
+    Route::post('{audioBook}/video-pipeline/scenes/{scene}/audio/{slot}/unlock', [AudioDirectionController::class, 'sceneUnlock'])->whereIn('slot', ['ambience', 'music'])->name('video.pipeline.scenes.audio.unlock');
+
+    Route::get('{audioBook}/video-pipeline/scenes/{scene}/shots/{shot}/audio/{slot}/candidates', [AudioDirectionController::class, 'shotCandidates'])->whereIn('slot', ['sfx', 'ambience', 'music'])->name('video.pipeline.shots.audio.candidates');
+    Route::post('{audioBook}/video-pipeline/scenes/{scene}/shots/{shot}/audio/{slot}/select', [AudioDirectionController::class, 'shotSelect'])->whereIn('slot', ['sfx', 'ambience', 'music'])->name('video.pipeline.shots.audio.select');
+    Route::post('{audioBook}/video-pipeline/scenes/{scene}/shots/{shot}/audio/{slot}/generate', [AudioDirectionController::class, 'shotGenerate'])->whereIn('slot', ['sfx', 'ambience', 'music'])->name('video.pipeline.shots.audio.generate');
+    Route::post('{audioBook}/video-pipeline/scenes/{scene}/shots/{shot}/audio/{slot}/reject', [AudioDirectionController::class, 'shotReject'])->whereIn('slot', ['sfx', 'ambience', 'music'])->name('video.pipeline.shots.audio.reject');
+    Route::post('{audioBook}/video-pipeline/scenes/{scene}/shots/{shot}/audio/{slot}/approve', [AudioDirectionController::class, 'shotApprove'])->whereIn('slot', ['sfx', 'ambience', 'music'])->name('video.pipeline.shots.audio.approve');
+    Route::post('{audioBook}/video-pipeline/scenes/{scene}/shots/{shot}/audio/{slot}/lock', [AudioDirectionController::class, 'shotLock'])->whereIn('slot', ['sfx', 'ambience', 'music'])->name('video.pipeline.shots.audio.lock');
+    Route::post('{audioBook}/video-pipeline/scenes/{scene}/shots/{shot}/audio/{slot}/unlock', [AudioDirectionController::class, 'shotUnlock'])->whereIn('slot', ['sfx', 'ambience', 'music'])->name('video.pipeline.shots.audio.unlock');
+    Route::post('{audioBook}/video-pipeline/scenes/{scene}/audio/{slot}/active-target', [AudioDirectionController::class, 'setActiveAudioTargetForScene'])->whereIn('slot', ['ambience', 'music'])->name('video.pipeline.scenes.audio.active-target');
+    Route::post('{audioBook}/video-pipeline/scenes/{scene}/shots/{shot}/audio/{slot}/active-target', [AudioDirectionController::class, 'setActiveAudioTargetForShot'])->whereIn('slot', ['sfx', 'ambience', 'music'])->name('video.pipeline.shots.audio.active-target');
+    Route::post('{audioBook}/video-pipeline/bulk-generate-audio', [AudioDirectionController::class, 'bulkGenerateAudio'])->name('video.pipeline.bulk-generate-audio');
+
+    // Motion & Transition Direction — AI-selected Ken Burns motion (still images only) +
+    // shot-transition (every shot boundary), same approval-first shape as the audio slots above,
+    // but scoped to a single shot with only 2 slots and no candidates/library concept.
+    Route::post('{audioBook}/video-pipeline/scenes/{scene}/shots/{shot}/motion/generate', [MotionDirectionController::class, 'generateMotion'])->name('video.pipeline.shots.motion.generate');
+    Route::post('{audioBook}/video-pipeline/scenes/{scene}/shots/{shot}/motion/regenerate', [MotionDirectionController::class, 'regenerateMotion'])->name('video.pipeline.shots.motion.regenerate');
+    Route::post('{audioBook}/video-pipeline/scenes/{scene}/shots/{shot}/motion/reject', [MotionDirectionController::class, 'rejectMotion'])->name('video.pipeline.shots.motion.reject');
+    Route::post('{audioBook}/video-pipeline/scenes/{scene}/shots/{shot}/motion/approve', [MotionDirectionController::class, 'approveMotion'])->name('video.pipeline.shots.motion.approve');
+    Route::post('{audioBook}/video-pipeline/scenes/{scene}/shots/{shot}/motion/lock', [MotionDirectionController::class, 'lockMotion'])->name('video.pipeline.shots.motion.lock');
+    Route::post('{audioBook}/video-pipeline/scenes/{scene}/shots/{shot}/motion/unlock', [MotionDirectionController::class, 'unlockMotion'])->name('video.pipeline.shots.motion.unlock');
+
+    Route::post('{audioBook}/video-pipeline/scenes/{scene}/shots/{shot}/transition/generate', [MotionDirectionController::class, 'generateTransition'])->name('video.pipeline.shots.transition.generate');
+    Route::post('{audioBook}/video-pipeline/scenes/{scene}/shots/{shot}/transition/regenerate', [MotionDirectionController::class, 'regenerateTransition'])->name('video.pipeline.shots.transition.regenerate');
+    Route::post('{audioBook}/video-pipeline/scenes/{scene}/shots/{shot}/transition/reject', [MotionDirectionController::class, 'rejectTransition'])->name('video.pipeline.shots.transition.reject');
+    Route::post('{audioBook}/video-pipeline/scenes/{scene}/shots/{shot}/transition/approve', [MotionDirectionController::class, 'approveTransition'])->name('video.pipeline.shots.transition.approve');
+    Route::post('{audioBook}/video-pipeline/scenes/{scene}/shots/{shot}/transition/lock', [MotionDirectionController::class, 'lockTransition'])->name('video.pipeline.shots.transition.lock');
+    Route::post('{audioBook}/video-pipeline/scenes/{scene}/shots/{shot}/transition/unlock', [MotionDirectionController::class, 'unlockTransition'])->name('video.pipeline.shots.transition.unlock');
 
     // Scrape chapters from book URL
     Route::post('scrape-chapters', [AudioBookController::class, 'scrapeChapters'])->name('scrape.chapters');

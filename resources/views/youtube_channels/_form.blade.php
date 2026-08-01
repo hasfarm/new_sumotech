@@ -451,6 +451,72 @@
     </div>
 </div>
 
+{{-- MC / Avatar Management — mỗi MC có 1 ảnh đại diện chính + nhiều ảnh avatar phụ --}}
+<div class="mt-8 border-t border-gray-200 pt-6">
+    <div class="mb-4 p-3 bg-indigo-50 rounded-lg border border-indigo-100">
+        <p class="text-xs font-medium text-indigo-800 mb-1">🎭 MC / Avatar kênh</p>
+        <p class="text-xs text-indigo-700">Mỗi MC có thể có 1 ảnh đại diện chính và nhiều ảnh avatar phụ — dùng khi tạo
+            video (ảnh nền, HeyGen lip-sync, v.v.)</p>
+    </div>
+
+    @if (!$channel)
+        <div class="p-4 bg-amber-50 border border-amber-200 rounded-lg text-sm text-amber-700">
+            ⚠️ Lưu kênh trước, sau đó quay lại trang chỉnh sửa để thêm MC / avatar.
+        </div>
+    @else
+        <input type="hidden" id="spkChannelId" value="{{ $channel->id }}">
+        <input type="hidden" id="spkIndexUrl" value="{{ route('youtube-channels.speakers.index', $channel) }}">
+        <input type="hidden" id="spkStoreUrl" value="{{ route('youtube-channels.speakers.store', $channel) }}">
+        <input type="hidden" id="spkUpdateUrlBase" value="{{ url('youtube-channels/' . $channel->id . '/speakers') }}">
+
+        <div class="mb-6 p-4 border border-gray-200 rounded-lg bg-gray-50">
+            <h4 class="text-sm font-semibold text-gray-900 mb-3">Thêm MC mới</h4>
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">Tên MC *</label>
+                    <input type="text" id="spkName"
+                        class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-transparent">
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">Giới tính *</label>
+                    <select id="spkGender"
+                        class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-transparent">
+                        <option value="female">Nữ</option>
+                        <option value="male">Nam</option>
+                    </select>
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">Ảnh đại diện chính</label>
+                    <input type="file" id="spkAvatar" accept="image/*"
+                        class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-transparent">
+                    <p class="text-xs text-gray-400 mt-1">Tối đa 5MB/ảnh.</p>
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">Ảnh avatar phụ (chọn nhiều
+                        ảnh)</label>
+                    <input type="file" id="spkAdditionalImages" accept="image/*" multiple
+                        class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-transparent">
+                    <p class="text-xs text-gray-400 mt-1">Tối đa 5MB/ảnh.</p>
+                </div>
+                <div class="md:col-span-2">
+                    <label class="block text-sm font-medium text-gray-700 mb-2">Mô tả</label>
+                    <textarea id="spkDescription" rows="2"
+                        class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-transparent"></textarea>
+                </div>
+            </div>
+            <button type="button" id="spkAddBtn"
+                class="mt-3 bg-indigo-600 hover:bg-indigo-700 text-white font-semibold py-2 px-4 rounded-lg transition duration-200">
+                + Thêm MC
+            </button>
+            <span id="spkAddStatus" class="ml-3 text-sm text-gray-600"></span>
+        </div>
+
+        <div id="spkList" class="space-y-4">
+            <div class="text-sm text-gray-500">Đang tải danh sách MC...</div>
+        </div>
+    @endif
+</div>
+
 @push('scripts')
     <script>
         document.addEventListener('DOMContentLoaded', function() {
@@ -741,6 +807,338 @@
                     fetchChannelVideos(1, null, true);
                 });
             }
+        });
+    </script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            const indexUrl = document.getElementById('spkIndexUrl')?.value;
+            if (!indexUrl) return; // no channel yet (create mode) — section not rendered
+
+            const storeUrl = document.getElementById('spkStoreUrl').value;
+            const updateUrlBase = document.getElementById('spkUpdateUrlBase').value;
+            const listEl = document.getElementById('spkList');
+            const addBtn = document.getElementById('spkAddBtn');
+            const addStatus = document.getElementById('spkAddStatus');
+            const nameInput = document.getElementById('spkName');
+            const genderInput = document.getElementById('spkGender');
+            const avatarInput = document.getElementById('spkAvatar');
+            const additionalInput = document.getElementById('spkAdditionalImages');
+            const descriptionInput = document.getElementById('spkDescription');
+            const csrfToken = document.querySelector('meta[name="csrf-token"]').content;
+
+            const escapeHtml = (s) => (s || '').replace(/[&<>"']/g, (c) => ({
+                '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+            })[c]);
+
+            // This app's error responses come in two different shapes depending on which
+            // layer produced them: Laravel's own 422 validation response uses "message"
+            // (plus an "errors" object), while the app's custom exception handler
+            // (app/Exceptions/Handler.php) wraps everything else as {success:false,
+            // error:"..."} for any JSON-expecting request. Reading only "message" silently
+            // swallowed the real reason (e.g. file too large) behind a generic fallback.
+            const extractErrorMessage = (data, fallback) => {
+                if (data?.errors) {
+                    const first = Object.values(data.errors)[0];
+                    if (Array.isArray(first) && first.length) return first[0];
+                }
+                return data?.message || data?.error || fallback;
+            };
+
+            async function loadSpeakers() {
+                listEl.innerHTML = '<div class="text-sm text-gray-500">Đang tải danh sách MC...</div>';
+                try {
+                    const resp = await fetch(indexUrl, { headers: { Accept: 'application/json' } });
+                    const data = await resp.json();
+                    renderSpeakers(data.speakers || []);
+                } catch (e) {
+                    listEl.innerHTML = '<div class="text-sm text-red-600">Không tải được danh sách MC.</div>';
+                }
+            }
+
+            function renderSpeakers(speakers) {
+                if (!speakers.length) {
+                    listEl.innerHTML = '<div class="text-sm text-gray-500">Chưa có MC nào.</div>';
+                    return;
+                }
+
+                listEl.innerHTML = '';
+                speakers.forEach((spk) => {
+                    const card = document.createElement('div');
+                    card.className = 'p-4 border border-gray-200 rounded-lg' + (spk.is_active ? '' :
+                        ' opacity-60');
+
+                    const imagesHtml = (spk.additional_images_urls || []).map((url, idx) => `
+                        <div class="relative group">
+                            <img src="${escapeHtml(url)}" class="w-16 h-16 object-cover rounded border" />
+                            <button type="button" data-remove-image data-speaker-id="${spk.id}" data-image-path="${escapeHtml((spk.additional_images || [])[idx] || '')}"
+                                class="absolute -top-1.5 -right-1.5 w-5 h-5 rounded-full bg-red-600 text-white text-xs leading-5 opacity-0 group-hover:opacity-100 transition">×</button>
+                        </div>`).join('');
+
+                    card.innerHTML = `
+                        <div class="flex items-start gap-3">
+                            <img src="${spk.avatar_url ? escapeHtml(spk.avatar_url) : 'https://placehold.co/64x64?text=?'}"
+                                class="w-16 h-16 rounded-full object-cover border flex-shrink-0" />
+                            <div class="min-w-0 flex-1">
+                                <div class="flex items-center gap-2">
+                                    <span class="text-sm font-semibold text-gray-900">${escapeHtml(spk.name)}</span>
+                                    <span class="text-xs px-2 py-0.5 rounded-full ${spk.gender === 'male' ? 'bg-blue-100 text-blue-700' : 'bg-pink-100 text-pink-700'}">${spk.gender === 'male' ? 'Nam' : 'Nữ'}</span>
+                                    ${spk.is_active ? '' : '<span class="text-xs px-2 py-0.5 rounded-full bg-gray-200 text-gray-600">Đã ẩn</span>'}
+                                    ${spk.audiobooks_count ? `<span class="text-xs text-gray-400">${spk.audiobooks_count} audiobook đang dùng</span>` : ''}
+                                </div>
+                                ${spk.description ? `<p class="text-xs text-gray-500 mt-1">${escapeHtml(spk.description)}</p>` : ''}
+                                <div class="flex flex-wrap gap-2 mt-2">${imagesHtml}</div>
+                                <label class="inline-block mt-2 text-xs text-indigo-600 hover:text-indigo-800 cursor-pointer">
+                                    + Thêm ảnh avatar
+                                    <input type="file" accept="image/*" multiple class="hidden" data-add-image data-speaker-id="${spk.id}">
+                                </label>
+                            </div>
+                            <div class="flex flex-col gap-1 flex-shrink-0">
+                                <button type="button" data-toggle data-speaker-id="${spk.id}"
+                                    class="text-xs px-3 py-1.5 rounded-lg bg-gray-100 hover:bg-gray-200 text-gray-700">${spk.is_active ? 'Ẩn' : 'Hiện'}</button>
+                                <button type="button" data-delete data-speaker-id="${spk.id}"
+                                    class="text-xs px-3 py-1.5 rounded-lg bg-red-50 hover:bg-red-100 text-red-700">Xóa</button>
+                            </div>
+                        </div>`;
+
+                    listEl.appendChild(card);
+                });
+
+                listEl.querySelectorAll('button[data-remove-image]').forEach((btn) => {
+                    btn.addEventListener('click', () => removeImage(btn.dataset.speakerId, btn.dataset
+                        .imagePath));
+                });
+                listEl.querySelectorAll('button[data-toggle]').forEach((btn) => {
+                    btn.addEventListener('click', () => toggleSpeaker(btn.dataset.speakerId));
+                });
+                listEl.querySelectorAll('button[data-delete]').forEach((btn) => {
+                    btn.addEventListener('click', () => deleteSpeaker(btn.dataset.speakerId));
+                });
+                listEl.querySelectorAll('input[data-add-image]').forEach((input) => {
+                    input.addEventListener('change', () => addImages(input.dataset.speakerId, input.files));
+                });
+            }
+
+            const MAX_IMAGE_BYTES = 5 * 1024 * 1024; // must match 'max:5120' (KB) in the backend validation
+            const MAX_IMAGE_DIMENSION = 1920; // long edge, px — plenty for an avatar/thumbnail, keeps file size down
+
+            const findOversizedFile = (files) => Array.from(files || []).find((f) => f.size > MAX_IMAGE_BYTES);
+
+            // Downscales/re-compresses an oversized image client-side so it clears the
+            // backend's 5MB limit automatically instead of the upload just failing. Non-image
+            // files and images already within both the dimension and size budget pass through
+            // untouched (re-encoding a file that's already fine only loses quality for nothing).
+            async function resizeImageFile(file, maxDimension = MAX_IMAGE_DIMENSION) {
+                if (!file || !file.type.startsWith('image/') || file.type === 'image/svg+xml') return file;
+
+                const dataUrl = await new Promise((resolve, reject) => {
+                    const reader = new FileReader();
+                    reader.onload = () => resolve(reader.result);
+                    reader.onerror = () => reject(new Error('Không đọc được file ảnh: ' + file.name));
+                    reader.readAsDataURL(file);
+                });
+
+                const img = await new Promise((resolve, reject) => {
+                    const el = new Image();
+                    el.onload = () => resolve(el);
+                    el.onerror = () => reject(new Error('Không đọc được ảnh: ' + file.name));
+                    el.src = dataUrl;
+                });
+
+                if (img.width <= maxDimension && img.height <= maxDimension && file.size <= MAX_IMAGE_BYTES) {
+                    return file;
+                }
+
+                const scale = Math.min(1, maxDimension / Math.max(img.width, img.height));
+                const width = Math.max(1, Math.round(img.width * scale));
+                const height = Math.max(1, Math.round(img.height * scale));
+
+                const canvas = document.createElement('canvas');
+                canvas.width = width;
+                canvas.height = height;
+                canvas.getContext('2d').drawImage(img, 0, 0, width, height);
+
+                const toBlob = (type, quality) => new Promise((resolve) => canvas.toBlob(resolve, type, quality));
+
+                // PNG ignores the quality argument — a downscaled PNG that's still too big
+                // (e.g. a large screenshot) needs re-encoding as JPEG to actually shrink further.
+                let outputType = file.type === 'image/png' ? 'image/png' : 'image/jpeg';
+                let quality = 0.85;
+                let blob = await toBlob(outputType, quality);
+
+                if (blob && blob.size > MAX_IMAGE_BYTES && outputType === 'image/png') {
+                    outputType = 'image/jpeg';
+                    blob = await toBlob(outputType, quality);
+                }
+
+                let attempts = 0;
+                while (blob && blob.size > MAX_IMAGE_BYTES && quality > 0.35 && attempts < 5) {
+                    quality -= 0.15;
+                    blob = await toBlob(outputType, quality);
+                    attempts++;
+                }
+
+                if (!blob) return file; // canvas export failed for some reason — let the server validate as-is
+
+                const newName = file.name.replace(/\.\w+$/, '') + (outputType === 'image/png' ? '.png' :
+                    '.jpg');
+                return new File([blob], newName, { type: outputType, lastModified: Date.now() });
+            }
+
+            async function addSpeaker() {
+                const name = nameInput.value.trim();
+                if (!name) {
+                    alert('Vui lòng nhập tên MC');
+                    return;
+                }
+
+                addBtn.disabled = true;
+                addStatus.textContent = 'Đang xử lý ảnh...';
+
+                try {
+                    const avatarFile = avatarInput.files[0] ? await resizeImageFile(avatarInput.files[0]) :
+                        null;
+                    const additionalFiles = [];
+                    for (const f of Array.from(additionalInput.files || [])) {
+                        additionalFiles.push(await resizeImageFile(f));
+                    }
+
+                    const oversized = findOversizedFile([avatarFile, ...additionalFiles].filter(Boolean));
+                    if (oversized) {
+                        throw new Error(
+                            `Ảnh "${oversized.name}" vẫn vượt quá 5MB sau khi tự động thu nhỏ. Vui lòng chọn ảnh khác.`
+                        );
+                    }
+
+                    const formData = new FormData();
+                    formData.append('name', name);
+                    formData.append('gender', genderInput.value);
+                    formData.append('description', descriptionInput.value || '');
+                    if (avatarFile) formData.append('avatar', avatarFile);
+                    additionalFiles.forEach((file) => formData.append('additional_images[]', file));
+
+                    addStatus.textContent = 'Đang lưu...';
+                    const resp = await fetch(storeUrl, {
+                        method: 'POST',
+                        headers: { 'X-CSRF-TOKEN': csrfToken, Accept: 'application/json' },
+                        body: formData,
+                    });
+                    const data = await resp.json();
+                    if (!resp.ok || !data.success) {
+                        throw new Error(extractErrorMessage(data, 'Không thể thêm MC'));
+                    }
+
+                    nameInput.value = '';
+                    avatarInput.value = '';
+                    additionalInput.value = '';
+                    descriptionInput.value = '';
+                    addStatus.textContent = '✅ Đã thêm.';
+                    await loadSpeakers();
+                } catch (e) {
+                    addStatus.textContent = '';
+                    alert(e.message || 'Có lỗi xảy ra');
+                } finally {
+                    addBtn.disabled = false;
+                    setTimeout(() => { addStatus.textContent = ''; }, 3000);
+                }
+            }
+
+            async function addImages(speakerId, files) {
+                if (!files || !files.length) return;
+
+                // updateSpeaker() requires name/gender to already be valid — refetch current
+                // speaker values first so this "just add more images" action doesn't blank them out.
+                try {
+                    const resizedFiles = [];
+                    for (const f of Array.from(files)) {
+                        resizedFiles.push(await resizeImageFile(f));
+                    }
+
+                    const oversized = findOversizedFile(resizedFiles);
+                    if (oversized) {
+                        throw new Error(
+                            `Ảnh "${oversized.name}" vẫn vượt quá 5MB sau khi tự động thu nhỏ. Vui lòng chọn ảnh khác.`
+                        );
+                    }
+
+                    const formData = new FormData();
+                    formData.append('_method', 'PUT');
+                    resizedFiles.forEach((file) => formData.append('additional_images[]', file));
+
+                    const resp = await fetch(indexUrl, { headers: { Accept: 'application/json' } });
+                    const data = await resp.json();
+                    const spk = (data.speakers || []).find((s) => String(s.id) === String(speakerId));
+                    if (!spk) throw new Error('Không tìm thấy MC');
+
+                    formData.set('name', spk.name);
+                    formData.set('gender', spk.gender);
+
+                    const updateResp = await fetch(`${updateUrlBase}/${speakerId}`, {
+                        method: 'POST',
+                        headers: { 'X-CSRF-TOKEN': csrfToken, Accept: 'application/json' },
+                        body: formData,
+                    });
+                    const updateData = await updateResp.json();
+                    if (!updateResp.ok || !updateData.success) {
+                        throw new Error(extractErrorMessage(updateData, 'Không thể thêm ảnh'));
+                    }
+                    await loadSpeakers();
+                } catch (e) {
+                    alert(e.message || 'Có lỗi xảy ra');
+                }
+            }
+
+            async function removeImage(speakerId, imagePath) {
+                if (!imagePath) return;
+                try {
+                    const resp = await fetch(`${updateUrlBase}/${speakerId}/delete-image`, {
+                        method: 'POST',
+                        headers: {
+                            'X-CSRF-TOKEN': csrfToken,
+                            Accept: 'application/json',
+                            'Content-Type': 'application/json',
+                        },
+                        body: JSON.stringify({ image_path: imagePath }),
+                    });
+                    const data = await resp.json();
+                    if (!resp.ok || !data.success) throw new Error(extractErrorMessage(data, 'Không thể xóa ảnh'));
+                    await loadSpeakers();
+                } catch (e) {
+                    alert(e.message || 'Có lỗi xảy ra');
+                }
+            }
+
+            async function toggleSpeaker(speakerId) {
+                try {
+                    const resp = await fetch(`${updateUrlBase}/${speakerId}/toggle-status`, {
+                        method: 'POST',
+                        headers: { 'X-CSRF-TOKEN': csrfToken, Accept: 'application/json' },
+                    });
+                    const data = await resp.json();
+                    if (!resp.ok || !data.success) throw new Error(extractErrorMessage(data, 'Không thể cập nhật'));
+                    await loadSpeakers();
+                } catch (e) {
+                    alert(e.message || 'Có lỗi xảy ra');
+                }
+            }
+
+            async function deleteSpeaker(speakerId) {
+                if (!confirm('Xóa MC này? Hành động không thể hoàn tác.')) return;
+                try {
+                    const resp = await fetch(`${updateUrlBase}/${speakerId}`, {
+                        method: 'DELETE',
+                        headers: { 'X-CSRF-TOKEN': csrfToken, Accept: 'application/json' },
+                    });
+                    const data = await resp.json();
+                    if (!resp.ok || !data.success) throw new Error(extractErrorMessage(data, 'Không thể xóa MC'));
+                    await loadSpeakers();
+                } catch (e) {
+                    alert(e.message || 'Có lỗi xảy ra');
+                }
+            }
+
+            addBtn.addEventListener('click', addSpeaker);
+            loadSpeakers();
         });
     </script>
 @endpush

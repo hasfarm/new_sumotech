@@ -30,7 +30,7 @@ class GenerateAvatarSegmentJob implements ShouldQueue
         $shot->update(['status' => 'resolving', 'error_message' => null]);
 
         try {
-            $path = $avatarService->generateSegment($shot);
+            $path = $avatarService->generateLipsync($shot);
 
             $shot->update([
                 'status' => 'ready',

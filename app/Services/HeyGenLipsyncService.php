@@ -10,22 +10,23 @@ class HeyGenLipsyncService
 {
     private $apiKey;
     private $baseUrl;
-    private $createEndpoint;
-    private $statusEndpoint;
 
     public function __construct()
     {
         $this->apiKey = env('HEYGEN_API_KEY');
         $this->baseUrl = env('HEYGEN_BASE_URL', 'https://api.heygen.com');
-        $this->createEndpoint = env('HEYGEN_CREATE_ENDPOINT', '/v1/video.generate');
-        $this->statusEndpoint = env('HEYGEN_STATUS_ENDPOINT', '/v1/video.status');
     }
 
     /**
-     * Generate lip-sync video from audio and image using HeyGen
+     * Generate lip-sync video from a photo + audio using HeyGen's v3 API (POST /v3/videos,
+     * type: "image"). The old v1/v2 endpoints this originally targeted were never real paths
+     * (404'd on first real use) — v2's actual equivalent additionally required a separate
+     * "talking photo" upload step to get a talking_photo_id before video creation; v3's
+     * type:"image" flow accepts a direct image URL instead, no upload step needed, which is
+     * also the path HeyGen's own API steers new integrations toward (v1/v2 sunset 2026-10-31).
      *
-     * @param string $audioPath Full path to audio file
-     * @param string $imagePath Full path to image file or URL
+     * @param string $audioPath Storage path or public URL to the audio file
+     * @param string $imagePath Storage path or public URL to the avatar image
      * @param array $options Additional options
      * @return array ['video_url' => string, 'video_id' => string]
      */
@@ -41,20 +42,20 @@ class HeyGenLipsyncService
         $payload = $this->buildPayload($audioUrl, $imageUrl, $options);
 
         Log::info('Creating HeyGen video', [
-            'endpoint' => $this->baseUrl . $this->createEndpoint,
+            'endpoint' => $this->baseUrl . '/v3/videos',
         ]);
 
         $response = Http::withHeaders([
-            'X-Api-Key' => $this->apiKey,
+            'x-api-key' => $this->apiKey,
             'Content-Type' => 'application/json',
-        ])->post($this->baseUrl . $this->createEndpoint, $payload);
+        ])->post($this->baseUrl . '/v3/videos', $payload);
 
         if (!$response->successful()) {
             throw new \Exception('Failed to create HeyGen video: ' . $response->body());
         }
 
         $data = $response->json();
-        $videoId = $data['data']['video_id'] ?? $data['video_id'] ?? null;
+        $videoId = $data['data']['video_id'] ?? null;
 
         if (!$videoId) {
             throw new \Exception('HeyGen response missing video_id: ' . $response->body());
@@ -95,39 +96,21 @@ class HeyGenLipsyncService
 
     private function buildPayload($audioUrl, $imageUrl, $options)
     {
-        $characterType = $options['character_type'] ?? 'talking_photo';
-        $dimension = [
-            'width' => $options['width'] ?? 1280,
-            'height' => $options['height'] ?? 720,
-        ];
-
-        $character = [
-            'type' => $characterType,
-        ];
-
-        if ($characterType === 'talking_photo') {
-            $character['talking_photo_url'] = $imageUrl;
-        }
-
-        if (!empty($options['avatar_id'])) {
-            $character['avatar_id'] = $options['avatar_id'];
-        }
-
-        $videoInput = [
-            'character' => $character,
-            'voice' => [
-                'type' => 'audio',
-                'audio_url' => $audioUrl,
-            ],
-        ];
-
         $payload = [
-            'video_inputs' => [$videoInput],
-            'dimension' => $dimension,
+            'type' => 'image',
+            'image' => [
+                'type' => 'url',
+                'url' => $imageUrl,
+            ],
+            'audio_url' => $audioUrl,
+            'output_format' => 'mp4',
         ];
 
-        if (isset($options['test'])) {
-            $payload['test'] = (bool) $options['test'];
+        if (!empty($options['resolution'])) {
+            $payload['resolution'] = $options['resolution'];
+        }
+        if (!empty($options['aspect_ratio'])) {
+            $payload['aspect_ratio'] = $options['aspect_ratio'];
         }
 
         return $payload;
@@ -139,17 +122,15 @@ class HeyGenLipsyncService
 
         for ($i = 0; $i < $maxAttempts; $i++) {
             $response = Http::withHeaders([
-                'X-Api-Key' => $this->apiKey,
-            ])->get($this->baseUrl . $this->statusEndpoint, [
-                'video_id' => $videoId,
-            ]);
+                'x-api-key' => $this->apiKey,
+            ])->get($this->baseUrl . '/v3/videos/' . $videoId);
 
             if (!$response->successful()) {
                 throw new \Exception('Failed to check HeyGen status: ' . $response->body());
             }
 
             $data = $response->json();
-            $status = $data['data']['status'] ?? $data['status'] ?? null;
+            $status = $data['data']['status'] ?? null;
 
             Log::info('HeyGen status', [
                 'video_id' => $videoId,
@@ -157,21 +138,21 @@ class HeyGenLipsyncService
                 'attempt' => $i + 1,
             ]);
 
-            if ($status === 'completed' || $status === 'done') {
-                $videoUrl = $data['data']['video_url'] ?? $data['video_url'] ?? null;
+            if ($status === 'completed') {
+                $videoUrl = $data['data']['video_url'] ?? null;
                 if (!$videoUrl) {
                     throw new \Exception('HeyGen completed but missing video_url');
                 }
 
                 return [
                     'video_url' => $videoUrl,
-                    'duration' => $data['data']['duration'] ?? $data['duration'] ?? null,
+                    'duration' => $data['data']['duration'] ?? null,
                 ];
             }
 
-            if ($status === 'failed' || $status === 'error') {
-                $error = $data['data']['error'] ?? $data['error'] ?? 'Unknown error';
-                throw new \Exception('HeyGen video generation failed: ' . $error);
+            if ($status === 'failed') {
+                $error = $data['data']['error'] ?? 'Unknown error';
+                throw new \Exception('HeyGen video generation failed: ' . (is_array($error) ? json_encode($error) : $error));
             }
 
             sleep($pollInterval);

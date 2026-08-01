@@ -107,6 +107,13 @@ class SplitVideoScenesJob implements ShouldQueue
                         'is_avatar_segment' => false,
                         'is_emotional_climax' => $meta['is_emotional_climax'],
                         'status' => 'analyzed',
+                        'needs_ambience' => $meta['needs_ambience'],
+                        'ambience_keywords' => $meta['ambience_keywords'],
+                        'ambience_prompt' => $meta['ambience_prompt'],
+                        'needs_music' => $meta['needs_music'],
+                        'music_keywords' => $meta['music_keywords'],
+                        'music_prompt' => $meta['music_prompt'],
+                        'audio_direction_version' => VideoSceneAnalysisService::AUDIO_PROMPT_VERSION,
                     ]
                 );
 

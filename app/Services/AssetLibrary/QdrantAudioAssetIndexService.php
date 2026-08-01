@@ -1,0 +1,280 @@
+<?php
+
+namespace App\Services\AssetLibrary;
+
+use App\Models\AudiobookAudioAsset;
+use Illuminate\Http\Client\Response;
+use Illuminate\Support\Facades\Http;
+use RuntimeException;
+
+/**
+ * Same HTTP/embedding plumbing as QdrantAssetIndexService, pointed at a SEPARATE Qdrant
+ * collection for reusable audio clips (SFX/ambience/music) instead of video/image assets —
+ * kept as its own class rather than parameterizing the video one because the two hydrate
+ * different Eloquent models with different payload shapes; duplicating this thin HTTP layer
+ * is cheaper than forcing one class to be generic over both.
+ */
+class QdrantAudioAssetIndexService
+{
+    private ?int $ensuredVectorSize = null;
+    private bool $collectionChecked = false;
+
+    public function collectionName(): string
+    {
+        return (string) config('services.qdrant.audio_asset_collection', 'audio_asset_library');
+    }
+
+    /**
+     * @param array<string,mixed> $filters e.g. ['audio_category' => 'sfx']
+     * @return array<int,array{id:mixed,score:float,payload:array<string,mixed>}>
+     */
+    public function searchAssets(string $queryText, int $limit = 8, array $filters = []): array
+    {
+        $queryText = trim($queryText);
+        if ($queryText === '') {
+            return [];
+        }
+
+        if (!$this->collectionExists($this->collectionName())) {
+            return [];
+        }
+
+        $embedding = $this->createEmbedding($queryText);
+
+        $payload = [
+            'vector' => $embedding,
+            'limit' => max(1, min(30, $limit)),
+            'with_payload' => true,
+            'with_vector' => false,
+        ];
+
+        if (!empty($filters)) {
+            $must = [];
+            foreach ($filters as $key => $value) {
+                if ($value === null || $value === '') {
+                    continue;
+                }
+                $must[] = ['key' => (string) $key, 'match' => ['value' => $value]];
+            }
+            if (!empty($must)) {
+                $payload['filter'] = ['must' => $must];
+            }
+        }
+
+        $response = $this->qdrantRequest(
+            'POST',
+            '/collections/' . rawurlencode($this->collectionName()) . '/points/search',
+            $payload
+        );
+
+        if (!$response->successful()) {
+            throw new RuntimeException('Failed to search audio asset library in Qdrant: ' . $this->extractError($response));
+        }
+
+        $results = data_get($response->json(), 'result', []);
+        if (!is_array($results)) {
+            return [];
+        }
+
+        $mapped = [];
+        foreach ($results as $item) {
+            if (!is_array($item)) {
+                continue;
+            }
+            $mapped[] = [
+                'id' => $item['id'] ?? null,
+                'score' => isset($item['score']) ? (float) $item['score'] : 0.0,
+                'payload' => is_array($item['payload'] ?? null) ? $item['payload'] : [],
+            ];
+        }
+
+        return $mapped;
+    }
+
+    /**
+     * @return array{status:string, vector_size?:int}
+     */
+    public function indexAsset(AudiobookAudioAsset $asset): array
+    {
+        $text = trim($asset->prompt . ' ' . implode(', ', $asset->keywords ?? []));
+        if ($text === '') {
+            return ['status' => 'skipped'];
+        }
+
+        $embedding = $this->createEmbedding($text);
+        $vectorSize = count($embedding);
+
+        if ($vectorSize <= 0) {
+            throw new RuntimeException('Embedding vector is empty.');
+        }
+
+        $this->ensureCollection($vectorSize);
+        $this->upsertPoint($asset, $embedding);
+
+        return ['status' => 'indexed', 'vector_size' => $vectorSize];
+    }
+
+    private function ensureCollection(int $vectorSize): void
+    {
+        if ($this->collectionChecked && $this->ensuredVectorSize === $vectorSize) {
+            return;
+        }
+
+        $collection = $this->collectionName();
+        if (!$this->collectionExists($collection)) {
+            $this->createCollection($collection, $vectorSize);
+        }
+
+        $this->collectionChecked = true;
+        $this->ensuredVectorSize = $vectorSize;
+    }
+
+    private function collectionExists(string $collection): bool
+    {
+        $response = $this->qdrantRequest('GET', '/collections/' . rawurlencode($collection));
+
+        if ($response->status() === 404) {
+            return false;
+        }
+
+        if (!$response->successful()) {
+            throw new RuntimeException('Failed to check Qdrant collection: ' . $this->extractError($response));
+        }
+
+        return true;
+    }
+
+    private function createCollection(string $collection, int $vectorSize): void
+    {
+        $payload = [
+            'vectors' => [
+                'size' => $vectorSize,
+                'distance' => (string) config('services.qdrant.distance', 'Cosine'),
+            ],
+        ];
+
+        $response = $this->qdrantRequest('PUT', '/collections/' . rawurlencode($collection), $payload);
+        if (!$response->successful()) {
+            throw new RuntimeException('Failed to create Qdrant audio asset collection: ' . $this->extractError($response));
+        }
+
+        // Qdrant refuses to filter on a payload field ('audio_category' — see searchAssets())
+        // unless a keyword index exists for it first; unlike an unfiltered search (the video
+        // asset library's collection never filters), every audio search filters by category.
+        $indexResponse = $this->qdrantRequest('PUT', '/collections/' . rawurlencode($collection) . '/index', [
+            'field_name' => 'audio_category',
+            'field_schema' => 'keyword',
+        ]);
+        if (!$indexResponse->successful()) {
+            throw new RuntimeException('Failed to create Qdrant audio_category payload index: ' . $this->extractError($indexResponse));
+        }
+    }
+
+    /**
+     * @param array<int,float> $embedding
+     */
+    private function upsertPoint(AudiobookAudioAsset $asset, array $embedding): void
+    {
+        $payload = [
+            'points' => [
+                [
+                    'id' => (int) $asset->id,
+                    'vector' => $embedding,
+                    'payload' => [
+                        'asset_id' => (int) $asset->id,
+                        'audio_category' => (string) $asset->audio_category,
+                        'provider' => (string) $asset->provider,
+                        'origin_source' => (string) $asset->origin_source,
+                        'prompt' => (string) $asset->prompt,
+                        'keywords' => $asset->keywords ?? [],
+                        'updated_at' => optional($asset->updated_at)->toIso8601String(),
+                    ],
+                ],
+            ],
+        ];
+
+        $response = $this->qdrantRequest(
+            'PUT',
+            '/collections/' . rawurlencode($this->collectionName()) . '/points?wait=true',
+            $payload
+        );
+
+        if (!$response->successful()) {
+            throw new RuntimeException('Failed to upsert audio asset to Qdrant: ' . $this->extractError($response));
+        }
+    }
+
+    /**
+     * @return array<int,float>
+     */
+    private function createEmbedding(string $text): array
+    {
+        $apiKey = (string) config('services.openai.api_key', '');
+        if (!$apiKey) {
+            throw new RuntimeException('Missing OPENAI_API_KEY for embeddings.');
+        }
+
+        $baseUrl = rtrim((string) config('services.openai.base_url', 'https://api.openai.com/v1'), '/');
+        $model = (string) config('services.openai.embedding_model', 'text-embedding-3-small');
+
+        $response = Http::acceptJson()
+            ->withToken($apiKey)
+            ->timeout((int) config('services.qdrant.openai_timeout', 60))
+            ->post($baseUrl . '/embeddings', [
+                'model' => $model,
+                'input' => $text,
+                'encoding_format' => 'float',
+            ]);
+
+        if (!$response->successful()) {
+            throw new RuntimeException('Failed to create embedding: ' . $this->extractError($response));
+        }
+
+        $embedding = data_get($response->json(), 'data.0.embedding');
+        if (!is_array($embedding) || empty($embedding)) {
+            throw new RuntimeException('OpenAI embedding response is missing vector data.');
+        }
+
+        return array_map(static fn($v) => (float) $v, $embedding);
+    }
+
+    private function qdrantRequest(string $method, string $path, array $json = []): Response
+    {
+        $url = rtrim((string) config('services.qdrant.url', ''), '/') . $path;
+        $request = Http::acceptJson()->timeout((int) config('services.qdrant.timeout', 30));
+
+        $apiKey = (string) config('services.qdrant.api_key', '');
+        if ($apiKey !== '') {
+            $request = $request->withHeaders(['api-key' => $apiKey]);
+        }
+
+        $options = [];
+        if (!empty($json)) {
+            $options['json'] = $json;
+        }
+
+        return $request->send(strtoupper($method), $url, $options);
+    }
+
+    private function extractError(Response $response): string
+    {
+        $json = $response->json();
+        if (is_array($json)) {
+            $error = data_get($json, 'status.error')
+                ?? data_get($json, 'result.error')
+                ?? data_get($json, 'error')
+                ?? data_get($json, 'message');
+
+            if (is_string($error) && trim($error) !== '') {
+                return $error . ' (HTTP ' . $response->status() . ')';
+            }
+        }
+
+        $body = trim((string) $response->body());
+        if ($body !== '') {
+            return $body . ' (HTTP ' . $response->status() . ')';
+        }
+
+        return 'HTTP ' . $response->status();
+    }
+}

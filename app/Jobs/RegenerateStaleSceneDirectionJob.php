@@ -4,9 +4,11 @@ namespace App\Jobs;
 
 use App\Models\AudioBook;
 use App\Models\AudiobookStoryBible;
+use App\Models\AudiobookVideoPipeline;
 use App\Models\AudiobookVideoScene;
 use App\Services\VideoSceneAnalysisService;
 use Illuminate\Bus\Queueable;
+use Illuminate\Contracts\Queue\ShouldBeUnique;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
@@ -23,14 +25,28 @@ use Illuminate\Queue\SerializesModels;
  * duplicating the staleness predicate, since assignSceneContext() makes real OpenAI calls
  * and can't run inline in an HTTP request without risking a timeout on a book with many
  * stale scenes.
+ *
+ * Writes live progress to story_bible_regenerate_stale_status (same resumable-ledger shape as
+ * BulkGenerateNarrationTtsJob etc) — previously this job reported nothing while running, so the
+ * "Regenerate stale scenes" button looked done the instant the request was dispatched even
+ * though real OpenAI calls were still in flight per stale scene.
  */
-class RegenerateStaleSceneDirectionJob implements ShouldQueue
+class RegenerateStaleSceneDirectionJob implements ShouldQueue, ShouldBeUnique
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
 
     public int $tries = 1;
+    public int $timeout = 3600;
+    // Must stay >= $timeout — see BulkGenerateShotImagesJob::$uniqueFor for why (a queue
+    // "job considered lost, let another worker grab it" race can otherwise duplicate work).
+    public int $uniqueFor = 3600;
 
     public function __construct(private readonly int $audioBookId) {}
+
+    public function uniqueId(): string
+    {
+        return (string) $this->audioBookId;
+    }
 
     /**
      * @return array{status:string, reassigned?:int, total?:int, stale_chunk_indices?:array<int,int>}
@@ -48,20 +64,26 @@ class RegenerateStaleSceneDirectionJob implements ShouldQueue
         }
 
         $scenes = AudiobookVideoScene::where('audio_book_id', $this->audioBookId)->orderBy('scene_index')->get();
-        $pipeline = $audioBook->videoPipeline;
+        $pipeline = AudiobookVideoPipeline::firstOrCreate(['audio_book_id' => $this->audioBookId]);
         $shotChunks = collect($pipeline->shot_chunks ?? []);
+
+        $staleScenes = $scenes->filter(function ($scene) use ($activeBible) {
+            return $scene->story_bible_version_used !== $activeBible->bible_version
+                || $scene->scene_direction_version !== VideoSceneAnalysisService::SCENE_DIRECTION_VERSION;
+        })->values();
+
+        $pipeline->update(['story_bible_regenerate_stale_status' => [
+            'status' => 'running',
+            'total' => $staleScenes->count(),
+            'processed' => 0,
+            'started_at' => now()->toIso8601String(),
+            'last_progress_at' => now()->toIso8601String(),
+        ]]);
 
         $staleShotIds = [];
         $reassignedScenes = 0;
 
-        foreach ($scenes as $scene) {
-            $isStale = $scene->story_bible_version_used !== $activeBible->bible_version
-                || $scene->scene_direction_version !== VideoSceneAnalysisService::SCENE_DIRECTION_VERSION;
-
-            if (!$isStale) {
-                continue;
-            }
-
+        foreach ($staleScenes as $scene) {
             $assignment = $service->assignSceneContext($scene, $activeBible, [
                 'book_id' => $this->audioBookId,
                 'scene_id' => $scene->id,
@@ -72,13 +94,15 @@ class RegenerateStaleSceneDirectionJob implements ShouldQueue
             foreach ($scene->shots()->pluck('id') as $shotId) {
                 $staleShotIds[] = $shotId;
             }
+
+            $pipeline->refresh();
+            $pipeline->update(['story_bible_regenerate_stale_status' => array_merge($pipeline->story_bible_regenerate_stale_status ?? [], [
+                'processed' => $reassignedScenes,
+                'last_progress_at' => now()->toIso8601String(),
+            ])]);
         }
 
         $result = ['status' => 'ok', 'reassigned' => $reassignedScenes, 'total' => $scenes->count(), 'stale_chunk_indices' => []];
-
-        if (empty($staleShotIds)) {
-            return $result;
-        }
 
         $staleShotIdsFlipped = array_flip($staleShotIds);
         $staleChunkIndices = $shotChunks
@@ -92,6 +116,13 @@ class RegenerateStaleSceneDirectionJob implements ShouldQueue
         if (!empty($staleChunkIndices)) {
             EnrichVideoShotsJob::dispatch($this->audioBookId, $staleChunkIndices);
         }
+
+        $pipeline->refresh();
+        $pipeline->update(['story_bible_regenerate_stale_status' => array_merge($pipeline->story_bible_regenerate_stale_status ?? [], [
+            'status' => 'done',
+            'last_progress_at' => now()->toIso8601String(),
+            'stale_chunks_dispatched' => count($staleChunkIndices),
+        ])]);
 
         return $result;
     }
